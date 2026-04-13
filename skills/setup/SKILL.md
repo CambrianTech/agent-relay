@@ -25,7 +25,10 @@ Do everything yourself — don't ask the user to run commands.
    relay send <peer> "connected"
    ```
 
-4. If no arguments (or no `@` in arguments), this machine is the host. Read the config to build the join command and show it to the user:
+4. If no arguments (or no `@` in arguments), this machine is the host. Start the monitor so you can receive messages when the other side joins, then show the join command:
+   ```
+   Monitor(persistent=true, command="relay monitor")
+   ```
    ```bash
    name=$(python3 -c "import json; print(json.load(open('$HOME/.agent-relay/config.json'))['name'])")
    host=$(python3 -c "import json; print(json.load(open('$HOME/.agent-relay/config.json'))['host'])")
