@@ -24,7 +24,7 @@ get_name() {
 }
 
 get_host() {
-  # Prefer Tailscale hostname (globally reachable), fall back to local hostname
+  # Prefer Tailscale IP (always reachable across tailnet), fall back to local hostname
   local ts_bin=""
   if command -v tailscale >/dev/null 2>&1; then
     ts_bin="tailscale"
@@ -32,18 +32,10 @@ get_host() {
     ts_bin="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
   fi
   if [ -n "$ts_bin" ]; then
-    local ts_name
-    ts_name=$("$ts_bin" status --self --json 2>/dev/null | python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-dns=d.get('Self',{}).get('DNSName','').rstrip('.')
-suffix=d.get('MagicDNSSuffix','')
-if dns and suffix and dns.endswith('.'+suffix):
-    print(dns[:-(len(suffix)+1)])
-elif dns:
-    print(dns)
-" 2>/dev/null || true)
-    [ -n "$ts_name" ] && echo "$ts_name" && return
+    # Use IPv4 Tailscale address — works regardless of MagicDNS config
+    local ts_ip
+    ts_ip=$("$ts_bin" ip -4 2>/dev/null || true)
+    [ -n "$ts_ip" ] && echo "$ts_ip" && return
   fi
   hostname
 }
