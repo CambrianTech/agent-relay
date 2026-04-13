@@ -83,6 +83,43 @@ if ! grep -qF "$pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
   ok "Added relay key to authorized_keys"
 fi
 
+# ── Ensure SSH daemon is running ────────────────────────────────────────
+
+if ! nc -z localhost 22 2>/dev/null || ! ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
+  info "Enabling SSH (Remote Login)..."
+  if [ "$(uname)" = "Darwin" ]; then
+    sudo -n launchctl kickstart -k system/com.openssh.sshd 2>/dev/null \
+      || { sudo -n launchctl bootout system/com.openssh.sshd 2>/dev/null; \
+           sudo -n launchctl bootstrap system /System/Library/LaunchDaemons/ssh.plist 2>/dev/null; } \
+      || { sudo -n launchctl unload /System/Library/LaunchDaemons/ssh.plist 2>/dev/null; \
+           sudo -n launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null; } \
+      || sudo -n systemsetup -setremotelogin on 2>/dev/null \
+      || sudo -n /usr/sbin/sshd 2>/dev/null \
+      || true
+    sleep 1
+    if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
+      ok "SSH is working"
+    else
+      info "Could not enable SSH automatically."
+      open "x-apple.systempreferences:com.apple.Sharing-Settings.extension" 2>/dev/null || true
+      info "Please enable Remote Login in System Settings, then re-run this installer."
+    fi
+  else
+    sudo -n systemctl start sshd 2>/dev/null \
+      || sudo -n service ssh start 2>/dev/null \
+      || sudo -n /usr/sbin/sshd 2>/dev/null \
+      || true
+    sleep 1
+    if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
+      ok "SSH is working"
+    else
+      info "Could not start sshd. Run: sudo systemctl start sshd"
+    fi
+  fi
+else
+  ok "SSH is working"
+fi
+
 # ── Done ────────────────────────────────────────────────────────────────
 
 echo ""
