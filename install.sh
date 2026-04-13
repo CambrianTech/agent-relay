@@ -88,26 +88,24 @@ fi
 if ! nc -z localhost 22 2>/dev/null || ! ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
   info "Enabling SSH (Remote Login)..."
   if [ "$(uname)" = "Darwin" ]; then
-    sudo launchctl kickstart -k system/com.openssh.sshd 2>/dev/null \
-      || { sudo launchctl bootout system/com.openssh.sshd 2>/dev/null; \
-           sudo launchctl bootstrap system /System/Library/LaunchDaemons/ssh.plist 2>/dev/null; } \
-      || { sudo launchctl unload /System/Library/LaunchDaemons/ssh.plist 2>/dev/null; \
-           sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null; } \
-      || sudo systemsetup -setremotelogin on 2>/dev/null \
-      || sudo /usr/sbin/sshd 2>/dev/null \
-      || true
-    sleep 1
-    if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
+    # Try each method, test after each, stop when SSH works
+    local ssh_ok=false
+    for method in \
+      "sudo launchctl kickstart -k system/com.openssh.sshd" \
+      "sudo launchctl bootout system/com.openssh.sshd; sudo launchctl bootstrap system /System/Library/LaunchDaemons/ssh.plist" \
+      "sudo launchctl unload /System/Library/LaunchDaemons/ssh.plist; sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist" \
+      "sudo /usr/sbin/sshd"; do
+      eval "$method" 2>/dev/null || true
+      sleep 2
+      if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
+        ssh_ok=true
+        break
+      fi
+    done
+    if [ "$ssh_ok" = true ]; then
       ok "SSH is working"
     else
-      # Ghost listener — toggle off/on with force flag
-      sudo systemsetup -f -setremotelogin off 2>/dev/null; sleep 2
-      sudo systemsetup -f -setremotelogin on 2>/dev/null; sleep 2
-      if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
-        ok "SSH is working (toggled Remote Login)"
-      else
-        info "SSH still not responding. Please check System Settings > Remote Login."
-      fi
+      info "SSH still not responding. Please toggle Remote Login off/on in System Settings."
     fi
   else
     sudo -n systemctl start sshd 2>/dev/null \
