@@ -82,6 +82,27 @@ cmd_start() {
   local name="${1:-}"
   [ -z "$name" ] && die "Usage: relay start <your-name>"
 
+  local PRIMARY_HOME="$HOME/.agent-relay"
+
+  # If primary already exists with this name, auto-increment for a new session
+  if [ -f "$PRIMARY_HOME/config.json" ]; then
+    local existing_name
+    existing_name=$(python3 -c "import json; print(json.load(open('$PRIMARY_HOME/config.json'))['name'])" 2>/dev/null)
+    if [ "$existing_name" = "$name" ] || echo "$existing_name" | grep -qE "^${name}(-[0-9]+)?$"; then
+      # Find next available number
+      local n=1
+      while [ -d "$HOME/.agent-relay-${name}-${n}" ]; do
+        n=$((n + 1))
+      done
+      name="${name}-${n}"
+      RELAY_HOME="$HOME/.agent-relay-${name}"
+      CONFIG="$RELAY_HOME/config.json"
+      IDENTITY_DIR="$RELAY_HOME/identity"
+      PEERS_DIR="$RELAY_HOME/peers"
+      MESSAGES="$RELAY_HOME/messages.jsonl"
+    fi
+  fi
+
   mkdir -p "$RELAY_HOME" "$IDENTITY_DIR" "$PEERS_DIR"
 
   # Generate Ed25519 signing keypair if needed
@@ -117,6 +138,37 @@ EOF
 
   touch "$MESSAGES"
 
+  # Share message log with primary instance for local multi-agent
+  if [ "$RELAY_HOME" != "$PRIMARY_HOME" ] && [ -f "$PRIMARY_HOME/messages.jsonl" ]; then
+    # Use the primary's message log so all local agents see each other
+    rm -f "$MESSAGES"
+    ln -sf "$PRIMARY_HOME/messages.jsonl" "$MESSAGES"
+    # Copy peers from primary
+    for f in "$PRIMARY_HOME/peers/"*.json "$PRIMARY_HOME/peers/"*.pub; do
+      [ -f "$f" ] && cp "$f" "$PEERS_DIR/" 2>/dev/null
+    done
+    # Register as local peer of primary
+    cat > "$PRIMARY_HOME/peers/${name}.json" << PEER
+{
+  "name": "$name",
+  "host": "$(whoami)@$(get_host)",
+  "paired": "$(timestamp)"
+}
+PEER
+    cp "$IDENTITY_DIR/public.pem" "$PRIMARY_HOME/peers/${name}.pub" 2>/dev/null
+    # Register primary as our peer
+    local primary_name
+    primary_name=$(python3 -c "import json; print(json.load(open('$PRIMARY_HOME/config.json'))['name'])" 2>/dev/null)
+    cat > "$PEERS_DIR/${primary_name}.json" << PEER
+{
+  "name": "$primary_name",
+  "host": "$(whoami)@$(get_host)",
+  "paired": "$(timestamp)"
+}
+PEER
+    cp "$PRIMARY_HOME/identity/public.pem" "$PEERS_DIR/${primary_name}.pub" 2>/dev/null
+  fi
+
   local host
   host=$(get_host)
   local user
@@ -124,10 +176,16 @@ EOF
 
   echo ""
   echo "  Relay initialized as '$name'"
-  echo ""
-  echo "  On the other machine, run:"
-  echo ""
-  echo "    relay join ${name}@${user}@${host}"
+  if [ "$RELAY_HOME" != "$PRIMARY_HOME" ]; then
+    echo "  (local session — sharing messages with primary instance)"
+    echo ""
+    echo "  Use with:  AGENT_RELAY_HOME=$RELAY_HOME relay send <peer> <msg>"
+  else
+    echo ""
+    echo "  On the other machine, run:"
+    echo ""
+    echo "    relay join ${name}@${user}@${host}"
+  fi
   echo ""
 }
 
