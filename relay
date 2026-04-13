@@ -50,9 +50,40 @@ sign_message() {
 }
 
 ensure_sshd() {
-  # Check if port 22 is accepting connections locally
+  # Check if port 22 is accepting connections AND sshd is actually working
   if nc -z localhost 22 2>/dev/null; then
-    return 0
+    # Port open — but is sshd actually responding? (macOS ghost listener bug)
+    if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" 2>/dev/null; then
+      return 0
+    fi
+    # Port open but handshake fails — ghost sshd. Restart it.
+    echo "  SSH port 22 is open but not responding (ghost listener)."
+    echo "  Restarting SSH daemon..."
+    if [ "$(uname)" = "Darwin" ]; then
+      sudo -n launchctl unload /System/Library/LaunchDaemons/ssh.plist 2>/dev/null
+      sudo -n launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null
+      sleep 1
+      if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" 2>/dev/null; then
+        echo "  SSH daemon restarted."
+        return 0
+      fi
+      # sudo failed — need user to toggle
+      echo "  Could not restart automatically."
+      echo "  Toggle Remote Login OFF then ON in System Settings."
+      open "x-apple.systempreferences:com.apple.Sharing-Settings.extension" 2>/dev/null \
+        || open "x-apple.systempreferences:com.apple.preference.sharing" 2>/dev/null \
+        || true
+      local attempts=0
+      while ! ssh -o ConnectTimeout=2 -o StrictHostKeyChecking=accept-new localhost "echo ok" 2>/dev/null; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -ge 30 ] && echo "  Timed out waiting for SSH." && return 1
+        sleep 2
+      done
+      echo "  SSH is working!"
+      return 0
+    else
+      sudo -n systemctl restart sshd 2>/dev/null && return 0
+    fi
   fi
 
   echo "  SSH (Remote Login) is not running."

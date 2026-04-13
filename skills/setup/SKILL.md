@@ -19,7 +19,9 @@ If not running:
 - macOS: try `sudo systemsetup -setremotelogin on`. If that fails, open settings for the user: `open "x-apple.systempreferences:com.apple.Sharing-Settings.extension"` and tell them to enable **Remote Login**. Wait until `nc -z localhost 22` succeeds.
 - Linux: `sudo systemctl start sshd` or `sudo service ssh start`
 
-Do NOT proceed until SSH is confirmed working.
+**Ghost listener bug (macOS):** if port 22 is open but `ssh localhost "echo ok"` fails with "connection reset," sshd is not actually running. Fix: `sudo launchctl unload /System/Library/LaunchDaemons/ssh.plist && sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist`. If no sudo, tell the user to toggle Remote Login OFF then ON in System Settings.
+
+Do NOT proceed until `ssh localhost "echo ok"` actually succeeds.
 
 ## Step 2: Install relay if needed
 
