@@ -30,19 +30,19 @@ get_config_val() {
   python3 -c "import json; print(json.load(open('$CONFIG')).get('$1','$2'))" 2>/dev/null || echo "$2"
 }
 
-ts_bin() {
-  if command -v tailscale >/dev/null 2>&1; then
-    echo "tailscale"
-  elif [ -x "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ]; then
-    echo "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
-  else
-    die "Tailscale is required. Install from https://tailscale.com"
-  fi
-}
-
 get_host() {
-  local ts; ts=$(ts_bin)
-  $ts ip -4 2>/dev/null || die "Tailscale not connected. Run: tailscale up"
+  # Prefer Tailscale IP, fall back to hostname
+  local ts_bin=""
+  if command -v tailscale >/dev/null 2>&1; then
+    ts_bin="tailscale"
+  elif [ -x "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ]; then
+    ts_bin="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+  fi
+  if [ -n "$ts_bin" ]; then
+    local ts_ip; ts_ip=$("$ts_bin" ip -4 2>/dev/null || true)
+    [ -n "$ts_ip" ] && echo "$ts_ip" && return
+  fi
+  hostname
 }
 
 timestamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -54,9 +54,13 @@ sign_message() {
   rm -f "$tmpfile"
 }
 
-ts_ssh() {
-  local ts; ts=$(ts_bin)
-  $ts ssh -o StrictHostKeyChecking=accept-new "$@"
+relay_ssh() {
+  local ssh_key="$IDENTITY_DIR/ssh_key"
+  if [ -f "$ssh_key" ]; then
+    ssh -i "$ssh_key" -o StrictHostKeyChecking=accept-new "$@"
+  else
+    ssh -o StrictHostKeyChecking=accept-new "$@"
+  fi
 }
 
 init_identity() {
@@ -66,6 +70,15 @@ init_identity() {
     openssl genpkey -algorithm Ed25519 -out "$IDENTITY_DIR/private.pem" 2>/dev/null
     openssl pkey -in "$IDENTITY_DIR/private.pem" -pubout -out "$IDENTITY_DIR/public.pem" 2>/dev/null
     chmod 600 "$IDENTITY_DIR/private.pem"
+  fi
+  if [ ! -f "$IDENTITY_DIR/ssh_key" ]; then
+    ssh-keygen -t ed25519 -f "$IDENTITY_DIR/ssh_key" -N "" -C "agent-relay-${name}" -q
+    mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+    local pubkey; pubkey=$(cat "$IDENTITY_DIR/ssh_key.pub")
+    grep -qF "$pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
+      echo "$pubkey" >> "$HOME/.ssh/authorized_keys"
+      chmod 600 "$HOME/.ssh/authorized_keys"
+    }
   fi
   touch "$MESSAGES"
 }
@@ -78,7 +91,7 @@ monitor() {
   while true; do
     local lines=""
     if [ -n "$host_target" ]; then
-      lines=$(ts_ssh "$host_target" "tail -n +$((last+1)) ~/.agent-relay/messages.jsonl 2>/dev/null" 2>/dev/null) || true
+      lines=$(relay_ssh "$host_target" "tail -n +$((last+1)) ~/.agent-relay/messages.jsonl 2>/dev/null" 2>/dev/null) || true
     else
       lines=$(tail -n +$((last+1)) "$MESSAGES" 2>/dev/null) || true
     fi
@@ -102,17 +115,20 @@ monitor() {
 cmd_connect() {
   local target="${1:-}"
 
-  # Verify Tailscale
-  local ts; ts=$(ts_bin)
-  $ts ip -4 >/dev/null 2>&1 || die "Tailscale not connected. Run: tailscale up"
-
   if [ -n "$target" ] && echo "$target" | grep -q '@'; then
     # ── JOIN MODE ──────────────────────────────────────────────────
+    # Parse name@user@host#base64-ssh-pubkey
+    local host_ssh_pubkey_b64=""
+    if echo "$target" | grep -q '#'; then
+      host_ssh_pubkey_b64="${target##*#}"
+      target="${target%%#*}"
+    fi
+
     local peer_name ssh_target
     peer_name="${target%%@*}"
     ssh_target="${target#*@}"
 
-    [ -z "$peer_name" ] || [ -z "$ssh_target" ] && die "Format: relay connect name@user@host"
+    [ -z "$peer_name" ] || [ -z "$ssh_target" ] && die "Format: relay connect name@user@host#key"
 
     local my_name
     my_name=$(hostname | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-16)
@@ -127,10 +143,23 @@ cmd_connect() {
 }
 EOF
 
-    # Register with host via Tailscale SSH
+    # Authorize host's SSH pubkey (so host can reach us if needed)
+    if [ -n "$host_ssh_pubkey_b64" ]; then
+      local host_ssh_pubkey
+      host_ssh_pubkey=$(echo "$host_ssh_pubkey_b64" | base64 -d 2>/dev/null || echo "$host_ssh_pubkey_b64" | base64 -D 2>/dev/null || true)
+      if [ -n "$host_ssh_pubkey" ]; then
+        mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+        grep -qF "$host_ssh_pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
+          echo "$host_ssh_pubkey" >> "$HOME/.ssh/authorized_keys"
+          chmod 600 "$HOME/.ssh/authorized_keys"
+        }
+      fi
+    fi
+
+    # Register with host via SSH
     echo "  Connecting to $ssh_target..."
     local ssh_output
-    ssh_output=$(ts_ssh "$ssh_target" "
+    ssh_output=$(relay_ssh "$ssh_target" "
       mkdir -p ~/.agent-relay/peers
       echo '{\"name\":\"${my_name}\",\"host\":\"$(whoami)@$(get_host)\",\"paired\":\"$(timestamp)\"}' > ~/.agent-relay/peers/${my_name}.json
       cat > ~/.agent-relay/peers/${my_name}.pub << SIGNKEY
@@ -148,10 +177,9 @@ SIGNKEY
       echo "  FAILED to connect to $ssh_target"
       echo "  $ssh_output"
       echo ""
-      echo "  Make sure:"
-      echo "    - Host is running 'relay connect'"
-      echo "    - Both machines are on the same Tailscale network"
-      echo "    - Tailscale SSH is enabled (tailscale up --ssh)"
+      echo "  Make sure the host is running 'relay connect' and you have SSH access."
+      echo "  Your pubkey (have the host add to ~/.ssh/authorized_keys):"
+      echo "    $(cat "$IDENTITY_DIR/ssh_key.pub" 2>/dev/null)"
       exit 1
     fi
 
@@ -172,12 +200,13 @@ EOF
 
     local host; host=$(get_host)
     local user; user=$(whoami)
+    local ssh_pubkey_b64; ssh_pubkey_b64=$(base64 < "$IDENTITY_DIR/ssh_key.pub" | tr -d '\n')
 
     echo ""
     echo "  Hosting as '$name'"
     echo ""
     echo "  On the other machine:"
-    echo "    relay connect ${name}@${user}@${host}"
+    echo "    relay connect ${name}@${user}@${host}#${ssh_pubkey_b64}"
     echo ""
     echo "  Monitoring for messages..."
     monitor
@@ -206,7 +235,7 @@ cmd_send() {
   host_target=$(get_config_val host_target "")
 
   if [ -n "$host_target" ]; then
-    ts_ssh "$host_target" "echo '$full_msg' >> ~/.agent-relay/messages.jsonl" 2>/dev/null \
+    relay_ssh "$host_target" "echo '$full_msg' >> ~/.agent-relay/messages.jsonl" 2>/dev/null \
       || die "Failed to deliver to host ($host_target)"
   else
     echo "$full_msg" >> "$MESSAGES"
@@ -227,9 +256,8 @@ cmd_send_file() {
   local target_host="$host_target"
   [ -z "$target_host" ] && target_host="localhost"
 
-  ts_ssh "$target_host" "mkdir -p ~/.agent-relay/files/${my_name}" 2>/dev/null
-  local ts; ts=$(ts_bin)
-  $ts file cp "$filepath" "${target_host}:" 2>/dev/null \
+  relay_ssh "$target_host" "mkdir -p ~/.agent-relay/files/${my_name}" 2>/dev/null
+  scp -o StrictHostKeyChecking=accept-new -q "$filepath" "${target_host}:~/.agent-relay/files/${my_name}/${filename}" 2>/dev/null \
     || die "Failed to transfer $filename"
 
   local filesize; filesize=$(stat -f%z "$filepath" 2>/dev/null || stat -c%s "$filepath" 2>/dev/null || echo "0")
@@ -259,7 +287,7 @@ cmd_logs() {
 
   local raw
   if [ -n "$host_target" ]; then
-    raw=$(ts_ssh "$host_target" "tail -${count} ~/.agent-relay/messages.jsonl 2>/dev/null" 2>/dev/null) || true
+    raw=$(relay_ssh "$host_target" "tail -${count} ~/.agent-relay/messages.jsonl 2>/dev/null" 2>/dev/null) || true
   else
     raw=$(tail -"$count" "$MESSAGES" 2>/dev/null) || true
   fi
