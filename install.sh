@@ -100,9 +100,9 @@ if ! nc -z localhost 22 2>/dev/null || ! ssh -o ConnectTimeout=3 -o StrictHostKe
     if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
       ok "SSH is working"
     else
-      # We have sudo here — keep trying
-      sudo systemsetup -setremotelogin off 2>/dev/null; sleep 1
-      sudo systemsetup -setremotelogin on 2>/dev/null; sleep 1
+      # Ghost listener — toggle off/on with force flag
+      sudo systemsetup -f -setremotelogin off 2>/dev/null; sleep 2
+      sudo systemsetup -f -setremotelogin on 2>/dev/null; sleep 2
       if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
         ok "SSH is working (toggled Remote Login)"
       else
