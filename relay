@@ -87,6 +87,7 @@ monitor() {
   local my_name host_target last=0
   my_name=$(get_name)
   host_target=$(get_config_val host_target "")
+  local last_activity; last_activity=$(date +%s)
 
   while true; do
     local lines=""
@@ -98,6 +99,7 @@ monitor() {
     if [ -n "$lines" ]; then
       local count; count=$(echo "$lines" | wc -l)
       last=$((last + count))
+      last_activity=$(date +%s)
       echo "$lines" | while IFS= read -r line; do
         [ -z "$line" ] && continue
         local msg_from
@@ -106,8 +108,56 @@ monitor() {
         echo "$line"
       done
     fi
+
+    # Reminder nudge if no activity
+    local reminder_file="$RELAY_HOME/reminder"
+    if [ -f "$reminder_file" ]; then
+      local interval; interval=$(cat "$reminder_file" 2>/dev/null)
+      if [ -n "$interval" ] && [ "$interval" -gt 0 ] 2>/dev/null; then
+        local now; now=$(date +%s)
+        local silent=$(( now - last_activity ))
+        if [ "$silent" -ge "$interval" ]; then
+          echo "{\"from\":\"relay\",\"ts\":\"$(timestamp)\",\"msg\":\"Reminder: no messages for ${silent}s. 'relay reminder off' to disable.\"}"
+          last_activity=$now
+        fi
+      fi
+    fi
+
     sleep 5
   done
+}
+
+cmd_reminder() {
+  ensure_init
+  local arg="${1:-status}"
+  local reminder_file="$RELAY_HOME/reminder"
+
+  case "$arg" in
+    off|0)
+      rm -f "$reminder_file"
+      echo "  Reminders off."
+      ;;
+    pause)
+      echo "0" > "$reminder_file"
+      echo "  Reminders paused. 'relay reminder <seconds>' to resume."
+      ;;
+    status)
+      if [ -f "$reminder_file" ]; then
+        local val; val=$(cat "$reminder_file")
+        if [ "$val" = "0" ]; then
+          echo "  Reminders paused."
+        else
+          echo "  Reminder every ${val}s."
+        fi
+      else
+        echo "  Reminders off."
+      fi
+      ;;
+    *)
+      echo "$arg" > "$reminder_file"
+      echo "  Reminder every ${arg}s if no messages."
+      ;;
+  esac
 }
 
 # ── Commands ────────────────────────────────────────────────────────────
@@ -386,15 +436,17 @@ case "${1:-help}" in
   connect|setup|start|join) shift; cmd_connect "$@" ;;
   send)      shift; cmd_send "$@" ;;
   send-file) shift; cmd_send_file "$@" ;;
+  reminder)  shift; cmd_reminder "$@" ;;
   peers)     cmd_peers ;;
   logs)      shift; cmd_logs "$@" ;;
   monitor)   shift; monitor "$@" ;;
   help|--help|-h)
-    echo "Agent Relay — secure messaging between AI agents (requires Tailscale)"
+    echo "Agent Relay — secure messaging between AI agents"
     echo ""
     echo "  relay connect                    Host — wait for peers"
     echo "  relay connect <name@user@host>   Join a host"
     echo "  relay send <peer> <message>      Send a message"
+    echo "  relay reminder <seconds>         Nudge if silent (off/pause/300)"
     echo "  relay peers                      List connected peers"
     ;;
   *) die "Unknown command: $1. Try: relay help" ;;
