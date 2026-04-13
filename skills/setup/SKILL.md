@@ -19,7 +19,14 @@ If not running:
 - macOS: try `sudo systemsetup -setremotelogin on`. If that fails, open settings for the user: `open "x-apple.systempreferences:com.apple.Sharing-Settings.extension"` and tell them to enable **Remote Login**. Wait until `nc -z localhost 22` succeeds.
 - Linux: `sudo systemctl start sshd` or `sudo service ssh start`
 
-**Ghost listener bug (macOS):** if port 22 is open but `ssh localhost "echo ok"` fails with "connection reset," sshd is not actually running. Fix: `sudo launchctl unload /System/Library/LaunchDaemons/ssh.plist && sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist`. If no sudo, tell the user to toggle Remote Login OFF then ON in System Settings.
+**Ghost listener bug (macOS):** if port 22 is open but `ssh localhost "echo ok"` fails with "connection reset," sshd is dead. Try these in order until one works:
+```bash
+sudo launchctl kickstart -k system/com.openssh.sshd
+sudo launchctl bootout system/com.openssh.sshd && sudo launchctl bootstrap system /System/Library/LaunchDaemons/ssh.plist
+sudo launchctl unload /System/Library/LaunchDaemons/ssh.plist && sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist
+sudo /usr/sbin/sshd
+```
+After each, test with `ssh localhost "echo ok"`. If none work and you don't have sudo, open settings: `open "x-apple.systempreferences:com.apple.Sharing-Settings.extension"` and tell the user to toggle Remote Login OFF, wait 3 seconds, then ON.
 
 Do NOT proceed until `ssh localhost "echo ok"` actually succeeds.
 
