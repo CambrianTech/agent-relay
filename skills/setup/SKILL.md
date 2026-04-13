@@ -10,12 +10,22 @@ argument-hint: "<peer@user@host#key>"
 
 Do everything yourself — don't ask the user to run commands.
 
-1. If `relay` is not on PATH, install it:
+1. **First, ensure SSH is working on this machine.** Check if port 22 is open:
+   ```bash
+   nc -z localhost 22 && echo "SSH OK" || echo "SSH NOT RUNNING"
+   ```
+   If not running:
+   - macOS: try `sudo systemsetup -setremotelogin on`. If that fails (no sudo), open the settings pane for the user: `open "x-apple.systempreferences:com.apple.Sharing-Settings.extension"` and tell them to enable **Remote Login**. Wait until `nc -z localhost 22` succeeds.
+   - Linux: `sudo systemctl start sshd` or `sudo service ssh start`
+   
+   Do NOT proceed until SSH is confirmed working.
+
+2. If `relay` is not on PATH, install it:
    ```bash
    curl -fsSL https://raw.githubusercontent.com/CambrianTech/agent-relay/main/install.sh | bash
    ```
 
-2. If `$ARGUMENTS` contains an `@`, it's a join target. Pass the ENTIRE argument including the `#key` portion — that's the host's SSH public key:
+3. If `$ARGUMENTS` contains an `@`, it's a join target. Pass the ENTIRE argument including the `#key` portion — that's the host's SSH public key:
    ```bash
    relay join $ARGUMENTS
    ```
@@ -36,7 +46,7 @@ Do everything yourself — don't ask the user to run commands.
    relay send <peer> "connected"
    ```
 
-3. If no arguments (or no `@` in arguments), this machine is the host:
+4. If no arguments (or no `@` in arguments), this machine is the host:
    - Run `relay start <name>` — picks a name from local hostname if not specified.
    - Start the monitor:
    ```
