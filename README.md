@@ -71,6 +71,22 @@ The installer auto-links these as slash commands:
 | [relay:update](skills/update/) | `/relay:update` | Pull latest version |
 | [relay:uninstall](skills/uninstall/) | `/relay:uninstall` | Clean remove |
 
+## Local Multi-Agent (Same Machine)
+
+Multiple Claude Code instances in separate terminal tabs can talk to each other through the same relay identity. One tab monitors, the other sends — they coordinate through the shared message log.
+
+**Tab 1:**
+```
+/relay:monitor
+```
+
+**Tab 2:**
+```
+/relay:send peer "summarize the test results and send them back"
+```
+
+Tab 1's Claude sees the message, acts on it, and can `/relay:send` a response. This works for any combination of agents on the same machine — delegate tasks, split work across sessions, or have one agent supervise another.
+
 ## Other Agent Integrations
 
 | Agent | Integration |
