@@ -51,7 +51,11 @@ elif dns:
 timestamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 sign_message() {
-  printf '%s' "$1" | openssl pkeyutl -sign -inkey "$IDENTITY_DIR/private.pem" 2>/dev/null | base64
+  local tmpfile
+  tmpfile=$(mktemp)
+  printf '%s' "$1" > "$tmpfile"
+  openssl pkeyutl -sign -inkey "$IDENTITY_DIR/private.pem" -in "$tmpfile" 2>/dev/null | base64
+  rm -f "$tmpfile"
 }
 
 relay_ssh() {
@@ -163,16 +167,14 @@ cmd_join() {
 
   echo "Connecting to $ssh_target..."
 
-  # First: push our SSH public key to the peer's authorized_keys so future connections work both ways
-  # This initial connection may prompt for a password — that's expected on first pair
-  ssh -o StrictHostKeyChecking=accept-new "$ssh_target" "
+  # Push our SSH public key to the peer's authorized_keys so future connections work both ways
+  relay_ssh "$ssh_target" "
     mkdir -p ~/.ssh && chmod 700 ~/.ssh
     KEY='$(cat "${ssh_key}.pub")'
     grep -qF \"\$KEY\" ~/.ssh/authorized_keys 2>/dev/null || echo \"\$KEY\" >> ~/.ssh/authorized_keys
     chmod 600 ~/.ssh/authorized_keys
-  " 2>/dev/null || die "Can't reach $ssh_target. Check SSH access (password may be required on first connect)."
+  " 2>/dev/null || die "Can't reach $ssh_target. Check SSH access."
 
-  # Now use our key for the rest
   # Fetch peer's public signing key
   local remote_pubkey
   remote_pubkey=$(relay_ssh "$ssh_target" "cat ~/.agent-relay/identity/public.pem" 2>/dev/null) \
