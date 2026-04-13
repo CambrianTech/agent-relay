@@ -88,20 +88,23 @@ fi
 if ! nc -z localhost 22 2>/dev/null || ! ssh -i "$ssh_key" -o IdentitiesOnly=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
   info "Enabling SSH (Remote Login)..."
   if [ "$(uname)" = "Darwin" ]; then
-    # Unload launchd's ssh plist (frees port 22), then start sshd directly
-    sudo launchctl unload /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
-    sleep 1
-    sudo /usr/sbin/sshd 2>&1 || true
-    sleep 1
-    if ssh -i "$ssh_key" -o IdentitiesOnly=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
-      ok "SSH is working"
-    else
-      info "SSH still not responding. Diagnostics:"
-      info "  Port 22: $(nc -z localhost 22 2>&1 && echo 'open' || echo 'closed')"
-      info "  sshd process: $(pgrep -x sshd >/dev/null 2>&1 && echo 'running' || echo 'not running')"
-      info "  sshd config test: $(sudo /usr/sbin/sshd -t 2>&1 || echo 'FAILED')"
-      info "  Listening on 22: $(sudo lsof -i :22 -sTCP:LISTEN 2>/dev/null | tail -1 || echo 'nothing')"
-    fi
+    # Try to get sshd working — check why launchd won't spawn it
+    info "Checking sshd config..."
+    sudo /usr/sbin/sshd -t 2>&1 && ok "sshd config OK" || info "sshd config error (see above)"
+    info "Checking system log for sshd..."
+    log show --predicate 'process == "sshd"' --last 2m --style compact 2>/dev/null | tail -5 || true
+    # Try triggering sshd spawn by connecting
+    ssh -i "$ssh_key" -o IdentitiesOnly=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1 && { ok "SSH is working"; } || {
+      info "sshd not spawning. Trying direct start on port 2222 as fallback..."
+      sudo /usr/sbin/sshd -p 2222 2>&1 || true
+      if ssh -i "$ssh_key" -o IdentitiesOnly=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new -p 2222 localhost "echo ok" >/dev/null 2>&1; then
+        ok "SSH working on port 2222 (sshd started manually)"
+        info "NOTE: relay will need port 2222 — adding to config"
+      else
+        info "SSH not working. System log:"
+        log show --predicate 'process == "sshd"' --last 1m --style compact 2>/dev/null | tail -10 || true
+      fi
+    }
   else
     sudo -n systemctl start sshd 2>/dev/null \
       || sudo -n service ssh start 2>/dev/null \
