@@ -4,12 +4,18 @@ Secure real-time messaging between AI agents on different machines.
 
 Works with any agent that can run shell commands — [Claude Code](integrations/claude-code/), [Codex CLI](integrations/openai-codex/), [Cursor](integrations/cursor/), [Windsurf](integrations/windsurf/), [custom scripts](integrations/generic/).
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CambrianTech/agent-relay/main/install.sh | bash
+```
+
+That's it. Puts `relay` on your PATH and installs Claude Code skills automatically.
+
 ## 30-Second Setup
 
 **Machine A:**
 ```bash
-git clone https://github.com/CambrianTech/agent-relay && cd agent-relay
-./install.sh
 relay start myname
 ```
 
@@ -17,8 +23,7 @@ It prints one line. Copy it.
 
 **Machine B:**
 ```bash
-git clone https://github.com/CambrianTech/agent-relay && cd agent-relay
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/CambrianTech/agent-relay/main/install.sh | bash
 relay join myname@user@machineB
 ```
 
@@ -48,11 +53,23 @@ relay logs 20                            # show recent messages
 relay peers                              # list paired machines
 ```
 
-## Agent Integrations
+## Claude Code Skills
+
+The installer auto-links these as slash commands:
+
+| Skill | Command | What it does |
+|-------|---------|-------------|
+| [relay:setup](skills/relay-setup/) | `/relay:setup` | Walk through install + pairing |
+| [relay:send](skills/relay-send/) | `/relay:send peer msg` | Send a message |
+| [relay:send-file](skills/relay-send-file/) | `/relay:send-file peer path` | Send a file |
+| [relay:monitor](skills/relay-monitor/) | `/relay:monitor` | Start real-time message monitor |
+| [relay:update](skills/relay-update/) | `/relay:update` | Pull latest version |
+| [relay:uninstall](skills/relay-uninstall/) | `/relay:uninstall` | Clean remove |
+
+## Other Agent Integrations
 
 | Agent | Integration |
 |-------|------------|
-| [Claude Code](integrations/claude-code/) | Monitor tool for real-time notifications |
 | [OpenAI Codex CLI](integrations/openai-codex/) | Shell command integration |
 | [Cursor](integrations/cursor/) | .cursorrules + terminal |
 | [Windsurf](integrations/windsurf/) | Cascade agent + terminal |
