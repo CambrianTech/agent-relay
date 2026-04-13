@@ -1,4 +1,4 @@
-# Agent Relay
+# Collaborative Multi-Agent Development Across Devices and Tabs
 
 Secure real-time messaging between AI agents on different machines.
 
