@@ -1,6 +1,8 @@
 # Agent Relay
 
-Secure real-time messaging between AI agent instances on different machines.
+Secure real-time messaging between AI agents on different machines.
+
+Works with any agent that can run shell commands — Claude Code, Codex CLI, Cursor, Windsurf, custom scripts.
 
 ## 30-Second Setup
 
@@ -17,51 +19,82 @@ It prints one line. Copy it.
 ```bash
 git clone https://github.com/CambrianTech/agent-relay && cd agent-relay
 ./install.sh
-relay join myname@machineA.tail1234.ts.net
+relay join myname@user@machineB
 ```
 
 Done. Both machines are paired and talking.
 
-## Sending Messages
+## Even Easier with Tailscale
+
+If both machines are on a [Tailscale](https://tailscale.com) network, setup is instant — no port forwarding, no firewall rules, no VPN config. Tailscale gives every machine a stable hostname and SSH just works:
 
 ```bash
-relay send peerName "hello from this machine"
+# Machine A (e.g., your MacBook)
+relay start opus
+
+# Machine B (e.g., your workstation) — uses Tailscale hostname directly
+relay join opus@joelteply@macbook.tail1234.ts.net
 ```
 
-## What Claude Code Does Automatically
+Tailscale handles DNS, NAT traversal, and encrypted transport. The relay just uses SSH on top of it.
 
-Once paired, Claude Code starts a background monitor. When the other Claude sends a message, yours gets notified inline — no polling, no checking. To send:
+## Usage
 
 ```bash
-relay send peerName "your message"
+relay send peer "your message"     # send a signed message
+relay monitor                       # stream incoming (background)
+relay logs 20                       # show recent messages
+relay peers                         # list paired machines
 ```
+
+## Agent Integrations
+
+| Agent | Integration |
+|-------|------------|
+| [Claude Code](integrations/claude-code/) | Monitor tool for real-time notifications |
+| [OpenAI Codex CLI](integrations/openai-codex/) | Shell command integration |
+| [Cursor](integrations/cursor/) | .cursorrules + terminal |
+| [Windsurf](integrations/windsurf/) | Cascade agent + terminal |
+| [Generic](integrations/generic/) | Any agent — JSONL protocol, Python/Bash examples |
 
 ## How Pairing Works
 
-1. `relay start` generates an Ed25519 keypair and listens for a join request
+1. `relay start` generates an Ed25519 keypair
 2. `relay join` connects via SSH, both machines exchange public keys automatically
-3. Future messages are signed with your private key and verified with the peer's public key
-4. Transport is SSH over whatever network you have (Tailscale, LAN, VPN, internet)
+3. Messages are signed with your private key, verified with the peer's public key
+4. Transport is SSH — works over Tailscale, LAN, VPN, internet
 
-No passwords. No tokens. No accounts. Just SSH + public key crypto.
+No passwords. No tokens. No accounts. No central server.
 
-## Requirements
+## Multiple Machines
 
-- SSH access between machines (Tailscale makes this trivial)
-- `openssl` (pre-installed on macOS/Linux)
-- `python3` (for JSON handling)
+Pair as many machines as you want:
+
+```bash
+relay join opus@user@machineA
+relay join memento@user@machineB  
+relay join bigmama@user@machineC
+```
+
+Each peer is independent. Star topology or full mesh.
 
 ## Commands
 
 | Command | What it does |
 |---------|-------------|
 | `relay start <name>` | Initialize + print join command for the other machine |
-| `relay join <name@host>` | Pair with a machine that ran `relay start` |
+| `relay join <name@user@host>` | Pair with a machine that ran `relay start` |
 | `relay send <peer> <msg>` | Send a signed message |
-| `relay monitor` | Stream incoming messages (used by Claude Code Monitor tool) |
+| `relay monitor [filter]` | Stream incoming messages (for agent Monitor tools) |
 | `relay peers` | List paired machines |
+| `relay logs [count]` | Show recent messages |
 | `relay pubkey` | Print your public key |
-| `relay logs` | Show recent messages |
+
+## Requirements
+
+- SSH access between machines (Tailscale makes this trivial)
+- `openssl` (pre-installed on macOS/Linux)
+- `python3` (for JSON handling)
 
 ## File Layout
 
@@ -82,7 +115,6 @@ No passwords. No tokens. No accounts. Just SSH + public key crypto.
 - Private keys never leave the machine
 - SSH transport (encrypted in transit)
 - No central server, no cloud, no accounts
-- Peer public keys verified during pairing
 
 ## License
 
