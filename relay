@@ -54,6 +54,24 @@ sign_message() {
   printf '%s' "$1" | openssl pkeyutl -sign -inkey "$IDENTITY_DIR/private.pem" 2>/dev/null | base64
 }
 
+relay_ssh() {
+  local ssh_key="$IDENTITY_DIR/ssh_key"
+  if [ -f "$ssh_key" ]; then
+    ssh -i "$ssh_key" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes "$@"
+  else
+    ssh -o StrictHostKeyChecking=accept-new "$@"
+  fi
+}
+
+relay_scp() {
+  local ssh_key="$IDENTITY_DIR/ssh_key"
+  if [ -f "$ssh_key" ]; then
+    scp -i "$ssh_key" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes "$@"
+  else
+    scp -o StrictHostKeyChecking=accept-new "$@"
+  fi
+}
+
 # ── Commands ────────────────────────────────────────────────────────────
 
 cmd_start() {
@@ -62,11 +80,26 @@ cmd_start() {
 
   mkdir -p "$RELAY_HOME" "$IDENTITY_DIR" "$PEERS_DIR"
 
-  # Generate Ed25519 keypair if needed
+  # Generate Ed25519 signing keypair if needed
   if [ ! -f "$IDENTITY_DIR/private.pem" ]; then
     openssl genpkey -algorithm Ed25519 -out "$IDENTITY_DIR/private.pem" 2>/dev/null
     openssl pkey -in "$IDENTITY_DIR/private.pem" -pubout -out "$IDENTITY_DIR/public.pem" 2>/dev/null
     chmod 600 "$IDENTITY_DIR/private.pem"
+  fi
+
+  # Generate SSH keypair for relay connections
+  local ssh_key="$IDENTITY_DIR/ssh_key"
+  if [ ! -f "$ssh_key" ]; then
+    ssh-keygen -t ed25519 -f "$ssh_key" -N "" -C "agent-relay-${name}" -q
+    # Authorize this key for incoming connections
+    mkdir -p "$HOME/.ssh"
+    chmod 700 "$HOME/.ssh"
+    local pubkey
+    pubkey=$(cat "${ssh_key}.pub")
+    if ! grep -qF "$pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
+      echo "$pubkey" >> "$HOME/.ssh/authorized_keys"
+      chmod 600 "$HOME/.ssh/authorized_keys"
+    fi
   fi
 
   # Write config
@@ -116,12 +149,43 @@ cmd_join() {
   ensure_init
   mkdir -p "$PEERS_DIR"
 
+  # Ensure we have an SSH key
+  local ssh_key="$IDENTITY_DIR/ssh_key"
+  if [ ! -f "$ssh_key" ]; then
+    ssh-keygen -t ed25519 -f "$ssh_key" -N "" -C "agent-relay-$(get_name)" -q
+    mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+    local pubkey; pubkey=$(cat "${ssh_key}.pub")
+    grep -qF "$pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
+      echo "$pubkey" >> "$HOME/.ssh/authorized_keys"
+      chmod 600 "$HOME/.ssh/authorized_keys"
+    }
+  fi
+
   echo "Connecting to $ssh_target..."
 
-  # Fetch peer's public key
+  # First: push our SSH public key to the peer's authorized_keys so future connections work both ways
+  # This initial connection may prompt for a password — that's expected on first pair
+  ssh -o StrictHostKeyChecking=accept-new "$ssh_target" "
+    mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    KEY='$(cat "${ssh_key}.pub")'
+    grep -qF \"\$KEY\" ~/.ssh/authorized_keys 2>/dev/null || echo \"\$KEY\" >> ~/.ssh/authorized_keys
+    chmod 600 ~/.ssh/authorized_keys
+  " 2>/dev/null || die "Can't reach $ssh_target. Check SSH access (password may be required on first connect)."
+
+  # Now use our key for the rest
+  # Fetch peer's public signing key
   local remote_pubkey
-  remote_pubkey=$(ssh "$ssh_target" "cat ~/.agent-relay/identity/public.pem" 2>/dev/null) \
-    || die "Can't reach $ssh_target. Check SSH access."
+  remote_pubkey=$(relay_ssh "$ssh_target" "cat ~/.agent-relay/identity/public.pem" 2>/dev/null) \
+    || die "Peer not initialized. Run 'relay start <name>' on $ssh_target first."
+
+  # Fetch peer's SSH public key and authorize it locally
+  local remote_ssh_pubkey
+  remote_ssh_pubkey=$(relay_ssh "$ssh_target" "cat ~/.agent-relay/identity/ssh_key.pub" 2>/dev/null)
+  if [ -n "$remote_ssh_pubkey" ]; then
+    grep -qF "$remote_ssh_pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
+      echo "$remote_ssh_pubkey" >> "$HOME/.ssh/authorized_keys"
+    }
+  fi
 
   # Save peer
   echo "$remote_pubkey" > "$PEERS_DIR/${peer_name}.pub"
@@ -133,15 +197,15 @@ cmd_join() {
 }
 EOF
 
-  # Push our key to peer
+  # Push our signing key + peer info to remote
   local my_name
   my_name=$(get_name)
-  ssh "$ssh_target" "mkdir -p ~/.agent-relay/peers" 2>/dev/null
-  cat "$IDENTITY_DIR/public.pem" | ssh "$ssh_target" "cat > ~/.agent-relay/peers/${my_name}.pub" 2>/dev/null
+  relay_ssh "$ssh_target" "mkdir -p ~/.agent-relay/peers" 2>/dev/null
+  cat "$IDENTITY_DIR/public.pem" | relay_ssh "$ssh_target" "cat > ~/.agent-relay/peers/${my_name}.pub" 2>/dev/null
 
   local my_host
   my_host="$(whoami)@$(get_host)"
-  ssh "$ssh_target" "cat > ~/.agent-relay/peers/${my_name}.json" << EOF
+  relay_ssh "$ssh_target" "cat > ~/.agent-relay/peers/${my_name}.json" << EOF
 {
   "name": "$my_name",
   "host": "$my_host",
@@ -183,7 +247,7 @@ cmd_send() {
   local full_msg="{\"from\":\"$my_name\",\"ts\":\"$ts\",\"msg\":\"$escaped_msg\",\"sig\":\"$sig\"}"
 
   # Deliver via SSH
-  ssh "$peer_host" "echo '$full_msg' >> ~/.agent-relay/messages.jsonl" 2>/dev/null \
+  relay_ssh "$peer_host" "echo '$full_msg' >> ~/.agent-relay/messages.jsonl" 2>/dev/null \
     || die "Failed to deliver to $peer_host"
 
   # Log locally
@@ -207,10 +271,10 @@ cmd_send_file() {
   filesize=$(stat -f%z "$filepath" 2>/dev/null || stat -c%s "$filepath" 2>/dev/null || echo "0")
 
   # Create files dir on peer
-  ssh "$peer_host" "mkdir -p ~/.agent-relay/files/${my_name}" 2>/dev/null
+  relay_ssh "$peer_host" "mkdir -p ~/.agent-relay/files/${my_name}" 2>/dev/null
 
   # Transfer via scp
-  scp -q "$filepath" "${peer_host}:~/.agent-relay/files/${my_name}/${filename}" 2>/dev/null \
+  relay_scp -q "$filepath" "${peer_host}:~/.agent-relay/files/${my_name}/${filename}" 2>/dev/null \
     || die "Failed to transfer $filename to $peer_host"
 
   # Notify peer via message
@@ -221,7 +285,7 @@ cmd_send_file() {
   sig=$(sign_message "$payload")
   local full_msg="{\"from\":\"$my_name\",\"ts\":\"$ts\",\"type\":\"file\",\"msg\":\"Sent file: $escaped_name ($filesize bytes)\",\"file\":{\"name\":\"$escaped_name\",\"size\":$filesize,\"path\":\"files/${my_name}/${escaped_name}\"},\"sig\":\"$sig\"}"
 
-  ssh "$peer_host" "echo '$full_msg' >> ~/.agent-relay/messages.jsonl" 2>/dev/null
+  relay_ssh "$peer_host" "echo '$full_msg' >> ~/.agent-relay/messages.jsonl" 2>/dev/null
   echo "$full_msg" >> "$MESSAGES"
 
   echo "Sent $filename ($filesize bytes) to $peer_name"
