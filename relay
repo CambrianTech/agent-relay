@@ -167,6 +167,7 @@ cmd_reminder() {
 
 cmd_connect() {
   local target="${1:-}"
+  local reminder_interval="${2:-300}"  # default 5min, host can override
 
   if [ -n "$target" ] && echo "$target" | grep -q '@'; then
     # ── JOIN MODE ──────────────────────────────────────────────────
@@ -251,9 +252,17 @@ print(data.decode().strip())
       }
     fi
 
+    # Pick up reminder setting from host
+    local host_reminder
+    host_reminder=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('reminder',300))" 2>/dev/null || echo "300")
+    if [ "$host_reminder" -gt 0 ] 2>/dev/null; then
+      echo "$host_reminder" > "$RELAY_HOME/reminder"
+      date +%s > "$RELAY_HOME/last_sent"
+    fi
+
     # Verify SSH works
     if relay_ssh "$ssh_target" "echo ok" 2>/dev/null; then
-      echo "  Connected to '$peer_name' (SSH verified)"
+      echo "  Connected to '$peer_name' (SSH verified, reminder: ${host_reminder}s)"
     else
       echo "  Connected to '$peer_name' (SSH not verified — messages may need retry)"
     fi
@@ -280,8 +289,14 @@ EOF
     local user; user=$(whoami)
     local ssh_pubkey_b64; ssh_pubkey_b64=$(base64 < "$IDENTITY_DIR/ssh_key.pub" | tr -d '\n')
 
+    # Set reminder interval from host
+    if [ "$reminder_interval" -gt 0 ] 2>/dev/null; then
+      echo "$reminder_interval" > "$RELAY_HOME/reminder"
+      date +%s > "$RELAY_HOME/last_sent"
+    fi
+
     echo ""
-    echo "  Hosting as '$name'"
+    echo "  Hosting as '$name' (reminder: ${reminder_interval}s)"
     echo ""
     echo "  On the other machine:"
     echo "    relay connect ${name}@${user}@${host}#${ssh_pubkey_b64}"
@@ -330,7 +345,7 @@ if joiner.get('sign_pub'):
 
 # Send back host's SSH pubkey
 host_pub = open(os.path.expanduser('$IDENTITY_DIR/ssh_key.pub')).read().strip()
-response = json.dumps({'ssh_pub': host_pub, 'name': '$name'})
+response = json.dumps({'ssh_pub': host_pub, 'name': '$name', 'reminder': $reminder_interval})
 conn.sendall((response + '\n').encode())
 conn.close()
 sock.close()
