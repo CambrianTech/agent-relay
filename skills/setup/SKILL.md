@@ -10,25 +10,15 @@ argument-hint: "<peer@user@host#key>"
 
 Do everything yourself — don't ask the user to run commands.
 
-## Step 1: Ensure SSH is working on THIS machine
+## Step 1 (HOST ONLY): SSH is required for hosting
 
-```bash
-nc -z localhost 22 && echo "SSH OK" || echo "SSH NOT RUNNING"
-```
-If not running:
-- macOS: try `sudo systemsetup -setremotelogin on`. If that fails, open settings for the user: `open "x-apple.systempreferences:com.apple.Sharing-Settings.extension"` and tell them to enable **Remote Login**. Wait until `nc -z localhost 22` succeeds.
-- Linux: `sudo systemctl start sshd` or `sudo service ssh start`
+SSH is only needed if you're the host (no `@` in arguments). Skip this step if joining.
 
-**Ghost listener bug (macOS):** if port 22 is open but `ssh localhost "echo ok"` fails with "connection reset," sshd is dead. Try these in order until one works:
-```bash
-sudo launchctl kickstart -k system/com.openssh.sshd
-sudo launchctl bootout system/com.openssh.sshd && sudo launchctl bootstrap system /System/Library/LaunchDaemons/ssh.plist
-sudo launchctl unload /System/Library/LaunchDaemons/ssh.plist && sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist
-sudo /usr/sbin/sshd
-```
-After each, test with `ssh localhost "echo ok"`. If none work and you don't have sudo, open settings: `open "x-apple.systempreferences:com.apple.Sharing-Settings.extension"` and tell the user to toggle Remote Login OFF, wait 3 seconds, then ON.
+`relay connect` checks SSH automatically. If it fails, it prints exactly what command to run. You can't run sudo yourself — tell the user:
 
-Do NOT proceed until `ssh localhost "echo ok"` actually succeeds.
+"SSH isn't working on this machine. Please type this in your terminal:" then show them the command from the error output. In Claude Code they can prefix with `!` to run it in the session, e.g.: `! sudo launchctl kickstart -k system/com.openssh.sshd`
+
+After they run it, retry `relay connect`.
 
 ## Step 2: Install relay if needed
 
