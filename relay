@@ -167,7 +167,7 @@ cmd_start() {
   fi
 
   mkdir -p "$RELAY_HOME" "$IDENTITY_DIR" "$PEERS_DIR"
-  ensure_sshd
+  ensure_sshd || die "SSH is not working on this machine. Cannot proceed."
 
   # Generate Ed25519 signing keypair
   if [ ! -f "$IDENTITY_DIR/private.pem" ]; then
@@ -273,7 +273,7 @@ cmd_join() {
     my_name=$(hostname | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-16)
     # Inline init — no listener, no blocking
     mkdir -p "$RELAY_HOME" "$IDENTITY_DIR" "$PEERS_DIR"
-    ensure_sshd
+    ensure_sshd || die "SSH is not working on this machine. Cannot proceed."
     if [ ! -f "$IDENTITY_DIR/private.pem" ]; then
       openssl genpkey -algorithm Ed25519 -out "$IDENTITY_DIR/private.pem" 2>/dev/null
       openssl pkey -in "$IDENTITY_DIR/private.pem" -pubout -out "$IDENTITY_DIR/public.pem" 2>/dev/null
@@ -301,7 +301,7 @@ EOF
   fi
 
   ensure_init
-  ensure_sshd
+  ensure_sshd || die "SSH is not working on this machine. Cannot proceed."
 
   # Authorize host's SSH public key locally (so host can send us messages)
   if [ -n "$host_ssh_pubkey_b64" ]; then
