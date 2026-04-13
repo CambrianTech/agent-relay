@@ -364,9 +364,8 @@ EOF
       fi
     fi
     echo ""
-    echo "  Send a message:  relay send $peer_name 'hello'"
-    echo "  Start monitor:   relay monitor"
-    echo ""
+    echo "  Starting monitor..."
+    cmd_monitor &
   else
     # SSH failed — save what we can, tell user how to complete
     mkdir -p "$PEERS_DIR"
@@ -389,6 +388,8 @@ EOF
     echo ""
     echo "    relay accept ${my_name}@${my_host}#${my_ssh_pubkey_b64}"
     echo ""
+    echo "  Starting monitor..."
+    cmd_monitor &
   fi
 }
 
