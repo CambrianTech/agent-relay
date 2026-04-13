@@ -88,24 +88,15 @@ fi
 if ! nc -z localhost 22 2>/dev/null || ! ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
   info "Enabling SSH (Remote Login)..."
   if [ "$(uname)" = "Darwin" ]; then
-    # Try each method, test after each, stop when SSH works
-    local ssh_ok=false
-    for method in \
-      "sudo launchctl kickstart -k system/com.openssh.sshd" \
-      "sudo launchctl bootout system/com.openssh.sshd; sudo launchctl bootstrap system /System/Library/LaunchDaemons/ssh.plist" \
-      "sudo launchctl unload /System/Library/LaunchDaemons/ssh.plist; sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist" \
-      "sudo /usr/sbin/sshd"; do
-      eval "$method" 2>/dev/null || true
-      sleep 2
-      if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
-        ssh_ok=true
-        break
-      fi
-    done
-    if [ "$ssh_ok" = true ]; then
+    # Kill ghost listener, start sshd fresh
+    sudo kill -9 $(sudo lsof -t -i :22) 2>/dev/null || true
+    sleep 1
+    sudo /usr/sbin/sshd 2>/dev/null || true
+    sleep 1
+    if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
       ok "SSH is working"
     else
-      info "SSH still not responding. Please toggle Remote Login off/on in System Settings."
+      info "SSH still not responding. Enable Remote Login in System Settings > General > Sharing."
     fi
   else
     sudo -n systemctl start sshd 2>/dev/null \
