@@ -91,12 +91,16 @@ if ! nc -z localhost 22 2>/dev/null || ! ssh -o ConnectTimeout=3 -o StrictHostKe
     # Kill ghost listener, start sshd fresh
     sudo kill -9 $(sudo lsof -t -i :22) 2>/dev/null || true
     sleep 1
-    sudo /usr/sbin/sshd 2>/dev/null || true
+    sudo /usr/sbin/sshd 2>&1 || true
     sleep 1
     if ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new localhost "echo ok" >/dev/null 2>&1; then
       ok "SSH is working"
     else
-      info "SSH still not responding. Enable Remote Login in System Settings > General > Sharing."
+      info "SSH still not responding. Diagnostics:"
+      info "  Port 22: $(nc -z localhost 22 2>&1 && echo 'open' || echo 'closed')"
+      info "  sshd process: $(pgrep -x sshd >/dev/null 2>&1 && echo 'running' || echo 'not running')"
+      info "  sshd config test: $(sudo /usr/sbin/sshd -t 2>&1 || echo 'FAILED')"
+      info "  Listening on 22: $(sudo lsof -i :22 -sTCP:LISTEN 2>/dev/null | tail -1 || echo 'nothing')"
     fi
   else
     sudo -n systemctl start sshd 2>/dev/null \
