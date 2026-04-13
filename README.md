@@ -1,4 +1,4 @@
-# Collaborative Multi-Agent Development Across Devices and Tabs
+# Collaborative Multi-Agent Development Across Domains
 
 Secure real-time messaging between AI agents on different machines.
 
