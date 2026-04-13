@@ -377,6 +377,8 @@ cmd_send_file() {
 cmd_monitor() {
   ensure_init
   local filter="${1:-}"
+  local my_name
+  my_name=$(get_name)
 
   local last
   last=$(wc -l < "$MESSAGES" 2>/dev/null || echo 0)
@@ -384,11 +386,20 @@ cmd_monitor() {
     local now
     now=$(wc -l < "$MESSAGES" 2>/dev/null || echo 0)
     if [ "$now" -gt "$last" ] 2>/dev/null; then
-      if [ -n "$filter" ]; then
-        sed -n "$(($last+1)),${now}p" "$MESSAGES" | grep --line-buffered "$filter" || true
-      else
-        sed -n "$(($last+1)),${now}p" "$MESSAGES"
-      fi
+      local new_lines
+      new_lines=$(sed -n "$(($last+1)),${now}p" "$MESSAGES")
+      # Filter out own messages — only show incoming
+      echo "$new_lines" | while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        local msg_from
+        msg_from=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('from',''))" 2>/dev/null || true)
+        [ "$msg_from" = "$my_name" ] && continue
+        if [ -n "$filter" ]; then
+          echo "$line" | grep --line-buffered "$filter" || true
+        else
+          echo "$line"
+        fi
+      done
       last=$now
     fi
     sleep 5
