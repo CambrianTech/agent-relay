@@ -63,6 +63,26 @@ if [ -d "$CLONE_DIR/skills" ]; then
   done
 fi
 
+# ── SSH key for relay connections ───────────────────────────────────────
+
+RELAY_HOME="$HOME/.agent-relay"
+IDENTITY_DIR="$RELAY_HOME/identity"
+mkdir -p "$RELAY_HOME" "$IDENTITY_DIR" "$RELAY_HOME/peers"
+
+ssh_key="$IDENTITY_DIR/ssh_key"
+if [ ! -f "$ssh_key" ]; then
+  ssh-keygen -t ed25519 -f "$ssh_key" -N "" -C "agent-relay" -q
+  ok "Generated SSH key"
+fi
+
+mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+pubkey=$(cat "${ssh_key}.pub")
+if ! grep -qF "$pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
+  echo "$pubkey" >> "$HOME/.ssh/authorized_keys"
+  chmod 600 "$HOME/.ssh/authorized_keys"
+  ok "Added relay key to authorized_keys"
+fi
+
 # ── Done ────────────────────────────────────────────────────────────────
 
 echo ""
