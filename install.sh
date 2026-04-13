@@ -47,6 +47,12 @@ fi
 
 if [ -d "$CLONE_DIR/skills" ]; then
   mkdir -p "$SKILLS_TARGET"
+
+  # Clean up old relay-prefixed symlinks from previous installs
+  for old in "$SKILLS_TARGET"/relay-*; do
+    [ -L "$old" ] && rm "$old" && info "Removed old symlink: $(basename "$old")"
+  done
+
   for skill_dir in "$CLONE_DIR"/skills/*/; do
     [ -d "$skill_dir" ] || continue
     skill_name="$(basename "$skill_dir")"

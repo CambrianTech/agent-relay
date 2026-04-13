@@ -8,12 +8,12 @@ argument-hint: ""
 
 # Uninstall Agent Relay
 
+Run the uninstall script yourself:
+
 ```bash
 ~/.agent-relay-src/uninstall.sh
 ```
 
-Ask the user if they also want to remove the clone directory and relay data:
+Then ask the user if they also want to remove data. Only delete after they confirm:
 - `rm -rf ~/.agent-relay-src` — removes the source
 - `rm -rf ~/.agent-relay` — removes keys, peers, and message history
-
-Confirm before deleting data.

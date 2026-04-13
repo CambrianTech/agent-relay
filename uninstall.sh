@@ -14,7 +14,7 @@ SKILLS_TARGET="$HOME/.claude/skills"
 info()  { printf '  \033[1;34m->\033[0m %s\n' "$*"; }
 ok()    { printf '  \033[1;32m->\033[0m %s\n' "$*"; }
 
-# Remove skill symlinks
+# Remove skill symlinks (current names and old relay-prefixed names)
 if [ -d "$CLONE_DIR/skills" ]; then
   for skill_dir in "$CLONE_DIR"/skills/*/; do
     [ -d "$skill_dir" ] || continue
@@ -26,6 +26,9 @@ if [ -d "$CLONE_DIR/skills" ]; then
     fi
   done
 fi
+for old in "$SKILLS_TARGET"/relay-*; do
+  [ -L "$old" ] && rm "$old" && ok "Removed old skill: $(basename "$old")"
+done
 
 # Remove relay binary symlink
 if [ -L "$BIN_DIR/relay" ]; then

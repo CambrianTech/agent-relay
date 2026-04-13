@@ -8,10 +8,10 @@ argument-hint: ""
 
 # Update Agent Relay
 
-Pull the latest version and re-link skills.
+Run these commands yourself — don't ask the user to do it.
 
 ```bash
 cd ~/.agent-relay-src && git pull --ff-only && ./install.sh
 ```
 
-Report what changed (new skills, bug fixes) by checking `git log --oneline -5`.
+Then report what changed by running `git -C ~/.agent-relay-src log --oneline -5`.

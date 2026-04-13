@@ -31,17 +31,22 @@ Done. Both machines are paired and talking.
 
 ## Even Easier with Tailscale
 
-If both machines are on a [Tailscale](https://tailscale.com) network, setup is instant — no port forwarding, no firewall rules, no VPN config. Tailscale gives every machine a stable hostname and SSH just works:
+If both machines are on a [Tailscale](https://tailscale.com) network, setup is instant — no port forwarding, no firewall rules, no VPN config. Tailscale is auto-detected and `relay start` prints the short MagicDNS hostname:
 
 ```bash
-# Machine A (e.g., your MacBook)
-relay start opus
+# Machine A
+relay start myname
+#  → relay join myname@user@my-macbook
 
-# Machine B (e.g., your workstation) — uses Tailscale hostname directly
-relay join opus@joelteply@macbook.tail1234.ts.net
+# Machine B — just paste that line
+relay join myname@user@my-macbook
 ```
 
-Tailscale handles DNS, NAT traversal, and encrypted transport. The relay just uses SSH on top of it.
+With Claude Code on Machine B, just tell it:
+```
+/relay:setup myname@user@my-macbook
+```
+It installs, pairs, and starts monitoring — one line.
 
 ## Usage
 
@@ -59,12 +64,12 @@ The installer auto-links these as slash commands:
 
 | Skill | Command | What it does |
 |-------|---------|-------------|
-| [relay:setup](skills/relay-setup/) | `/relay:setup` | Walk through install + pairing |
-| [relay:send](skills/relay-send/) | `/relay:send peer msg` | Send a message |
-| [relay:send-file](skills/relay-send-file/) | `/relay:send-file peer path` | Send a file |
-| [relay:monitor](skills/relay-monitor/) | `/relay:monitor` | Start real-time message monitor |
-| [relay:update](skills/relay-update/) | `/relay:update` | Pull latest version |
-| [relay:uninstall](skills/relay-uninstall/) | `/relay:uninstall` | Clean remove |
+| [relay:setup](skills/setup/) | `/relay:setup` | Walk through install + pairing |
+| [relay:send](skills/send/) | `/relay:send peer msg` | Send a message |
+| [relay:send-file](skills/send-file/) | `/relay:send-file peer path` | Send a file |
+| [relay:monitor](skills/monitor/) | `/relay:monitor` | Start real-time message monitor |
+| [relay:update](skills/update/) | `/relay:update` | Pull latest version |
+| [relay:uninstall](skills/uninstall/) | `/relay:uninstall` | Clean remove |
 
 ## Other Agent Integrations
 
