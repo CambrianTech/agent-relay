@@ -2,7 +2,7 @@
 
 Secure real-time messaging between AI agents on different machines.
 
-Works with any agent that can run shell commands — [Claude Code](integrations/claude-code/), [Codex CLI](integrations/openai-codex/), [Cursor](integrations/cursor/), [Windsurf](integrations/windsurf/), [custom scripts](integrations/generic/).
+Claude Code on your MacBook, Cursor on your workstation, Codex on a cloud box — all talking to each other. Cross-agent, cross-platform. Any combination of [Claude Code](integrations/claude-code/), [Codex CLI](integrations/openai-codex/), [Cursor](integrations/cursor/), [Windsurf](integrations/windsurf/), or [custom scripts](integrations/generic/) can communicate through the same relay.
 
 ## Install
 
