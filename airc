@@ -265,7 +265,7 @@ cmd_reminder() {
 
 cmd_connect() {
   local target="${1:-}"
-  local reminder_interval="${2:-300}"  # default 5min, host can override
+  local reminder_interval="${AIRC_REMINDER:-${2:-300}}"  # env > positional > 5min default
 
   if [ -n "$target" ] && echo "$target" | grep -q '@'; then
     # ── JOIN MODE ──────────────────────────────────────────────────
@@ -727,6 +727,7 @@ case "${1:-help}" in
     echo "  AIRC_NAME env var > config.json name > cwd basename > hostname"
     echo "  AIRC_HOME env var overrides state dir (default \$HOME/.airc)"
     echo "  AIRC_PORT env var overrides host listen port (default 7547)"
+    echo "  AIRC_REMINDER env var overrides reminder interval in seconds (default 300)"
     echo "  Join string may include :port after host, e.g. name@user@host:7548#key"
     ;;
   *) die "Unknown command: $1. Try: relay help" ;;

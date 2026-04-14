@@ -189,6 +189,62 @@ scenario_scope() {
 MODE="${1:-all}"
 trap cleanup_all EXIT INT TERM
 
+scenario_reminder() {
+  section "reminder: heartbeat fires after interval of silence; controls work"
+  cleanup_all
+
+  # Host with a short reminder interval (2s) so the test doesn't wait a year.
+  # Monitor polls every 5s, so we need to allow one poll cycle + interval elapsed.
+  local home=/tmp/airc-it-r
+  mkdir -p "$home"
+  ( cd "$home" && AIRC_HOME="$home/state" AIRC_NAME=hb-host AIRC_PORT=7548 AIRC_REMINDER=2 \
+      "$AIRC" connect > "$home/out.log" 2>&1 & )
+  local i
+  for i in 1 2 3 4 5; do sleep 1; grep -q 'Hosting as' "$home/out.log" 2>/dev/null && break; done
+
+  # 1) Interval was actually applied on host start
+  grep -q 'reminder: 2s' "$home/out.log" && pass "AIRC_REMINDER env set interval to 2s at host start" \
+                                         || fail "host didn't honor AIRC_REMINDER=2 (log says: $(grep 'Hosting as' "$home/out.log" | head -1))"
+
+  # 2) Interval is persisted to the reminder file
+  local persisted
+  persisted=$(cat "$home/state/reminder" 2>/dev/null)
+  [ "$persisted" = "2" ] && pass "reminder interval persisted to state/reminder ($persisted)" \
+                         || fail "reminder file wrong: expected '2', got '$persisted'"
+
+  # 3) Seed last_sent so the heartbeat guard ([ last_sent -gt 0 ]) passes.
+  #    Set it 3s in the past so by the next monitor poll we'll already be silent-for-3s.
+  local seeded=$(( $(date +%s) - 3 ))
+  echo "$seeded" > "$home/state/last_sent"
+  rm -f "$home/state/reminded"   # allow firing
+
+  # 4) Wait up to ~12s for monitor to poll and emit the heartbeat.
+  local fired=0
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    sleep 1
+    grep -q 'Reminder: you haven.t sent a message' "$home/out.log" 2>/dev/null && { fired=1; break; }
+  done
+  [ "$fired" = "1" ] && pass "heartbeat fired within 12s of silence" \
+                     || fail "heartbeat did NOT fire within 12s (state/reminded=$([ -f "$home/state/reminded" ] && echo yes || echo no))"
+
+  # 5) 'reminded' marker set so it won't re-fire
+  [ -f "$home/state/reminded" ] && pass "reminded marker set after firing (won't spam)" \
+                                || fail "reminded marker missing — heartbeat would re-fire every poll"
+
+  # 6) 'airc reminder off' removes the reminder file
+  AIRC_HOME="$home/state" "$AIRC" reminder off >/dev/null 2>&1
+  [ ! -f "$home/state/reminder" ] && pass "'airc reminder off' removed the reminder file" \
+                                  || fail "'airc reminder off' did NOT disable reminders"
+
+  # 7) 'airc reminder <n>' re-enables with the new interval
+  AIRC_HOME="$home/state" "$AIRC" reminder 42 >/dev/null 2>&1
+  local updated; updated=$(cat "$home/state/reminder" 2>/dev/null)
+  [ "$updated" = "42" ] && pass "'airc reminder 42' set new interval" \
+                        || fail "'airc reminder 42' failed (reminder=$updated)"
+
+  cleanup_all
+}
+
 scenario_teardown() {
   section "teardown: airc teardown kills processes, preserves state (without --flush)"
   cleanup_all
@@ -220,8 +276,9 @@ case "$MODE" in
   tabs)      scenario_tabs  ;;
   scope)     scenario_scope ;;
   teardown)  scenario_teardown ;;
-  all)       scenario_tabs; scenario_scope; scenario_teardown ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|all]"; exit 2 ;;
+  reminder)  scenario_reminder ;;
+  all)       scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|all]"; exit 2 ;;
 esac
 
 echo
