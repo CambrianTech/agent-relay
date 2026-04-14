@@ -575,6 +575,9 @@ cmd_send() {
     out=$(relay_ssh "$host_target" "echo '$full_msg' >> $rhome/messages.jsonl && echo __APPENDED__" 2>/dev/null)
     echo "$out" | grep -q '^__APPENDED__$' \
       || die "Failed to deliver to host ($host_target)"
+    # Mirror the outbound to our local log so `airc logs` shows it and the
+    # user has a local audit trail. Monitor's self-echo filter skips from=me.
+    echo "$full_msg" >> "$MESSAGES"
   else
     echo "$full_msg" >> "$MESSAGES"
   fi

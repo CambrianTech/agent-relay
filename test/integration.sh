@@ -135,6 +135,12 @@ scenario_tabs() {
     fail "beta send failed: $send_err"
   fi
 
+  # Joiner's outbound must ALSO appear in its own local messages.jsonl so
+  # `airc logs` has an audit trail — not only on the remote host.
+  grep -q '"m1-from-beta"' /tmp/airc-it-j/state/messages.jsonl 2>/dev/null && \
+    pass "joiner outbound mirrored to local messages.jsonl (audit trail)" \
+    || fail "joiner outbound NOT written locally — airc logs wouldn't show the send"
+
   send_err=$(as_home /tmp/airc-it-h send beta "m2-from-alpha" 2>&1 >/dev/null)
   if [ $? -eq 0 ]; then
     pass "alpha → beta send returns OK"
