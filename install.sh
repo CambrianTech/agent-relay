@@ -29,7 +29,9 @@ fi
 # ── airc on PATH ───────────────────────────────────────────────────────
 
 mkdir -p "$BIN_DIR"
-ln -sf "$CLONE_DIR/relay" "$BIN_DIR/relay"
+ln -sf "$CLONE_DIR/airc" "$BIN_DIR/airc"
+# Clean up legacy `relay` symlink from pre-rename installs
+[ -L "$BIN_DIR/relay" ] && rm "$BIN_DIR/relay"
 
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
   for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
