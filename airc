@@ -8,12 +8,14 @@
 
 set -euo pipefail
 
-# One-time migration from pre-rename ~/.agent-relay → ~/.airc. Only fires when
-# user is on vanilla defaults (no AIRC_HOME override) and the old dir exists but
-# the new one doesn't. Preserves identity, peers, messages, reminder state.
-if [ -z "${AIRC_HOME:-}" ] && [ ! -e "$HOME/.airc" ] && [ -d "$HOME/.agent-relay" ]; then
+# One-time migration from pre-rename ~/.agent-relay → ~/.airc. Fires when user
+# is on vanilla defaults, the old dir exists as a real dir (not a symlink we
+# already left), and ~/.airc doesn't. Leaves a symlink ~/.agent-relay → ~/.airc
+# so running monitors + tails pointing at the old path keep working.
+if [ -z "${AIRC_HOME:-}" ] && [ -d "$HOME/.agent-relay" ] && [ ! -L "$HOME/.agent-relay" ] && [ ! -e "$HOME/.airc" ]; then
   mv "$HOME/.agent-relay" "$HOME/.airc" 2>/dev/null && \
-    echo "  Migrated $HOME/.agent-relay → $HOME/.airc (renamed from the old 'agent-relay' project)" >&2
+    ln -s "$HOME/.airc" "$HOME/.agent-relay" 2>/dev/null && \
+    echo "  Migrated $HOME/.agent-relay → $HOME/.airc (symlink left for back-compat)" >&2
 fi
 
 # Two-tier state. Opt-in local: create $PWD/.airc/ for per-project identity.
