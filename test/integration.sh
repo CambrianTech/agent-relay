@@ -101,15 +101,10 @@ scenario_tabs() {
   spawn_joiner /tmp/airc-it-j beta "$join" || { fail "beta join failed"; return; }
   pass "beta joined alpha"
 
-  local peer_file; peer_file="/tmp/airc-it-j/state/peers/alpha.json"
-  [ -f "$peer_file" ] && pass "beta's peer record of alpha written" \
-                      || fail "no peer record for alpha"
-
-  grep -q '"airc_home":' "$peer_file" && pass "peer record includes airc_home field" \
-                                      || fail "peer record missing airc_home"
-
-  # Sends must travel over SSH; wait a beat after pairing so monitor is stable.
-  sleep 2
+  # Let pair-handshake fs writes settle. Peer-record correctness is proven
+  # transitively below: if sends, monitor reads, and rename propagation all
+  # work, the peer record + airc_home field were written correctly.
+  sleep 3
   local send_err
   send_err=$(as_home /tmp/airc-it-j send alpha "m1-from-beta" 2>&1 >/dev/null)
   if [ $? -eq 0 ]; then
@@ -140,6 +135,16 @@ scenario_tabs() {
 
   as_home /tmp/airc-it-j peers 2>/dev/null | grep -q gamma && pass "beta peers shows gamma" \
                                                            || fail "beta peers still shows alpha"
+
+  # Final invariants on beta's state: peer record exists, has non-empty airc_home
+  # (proves the handshake's relay_home exchange works end-to-end).
+  local peer_file="/tmp/airc-it-j/state/peers/gamma.json"
+  [ -f "$peer_file" ] && pass "peer record for renamed peer is on disk" \
+                      || fail "no peer record for gamma (rename didn't persist)"
+  local peer_home
+  peer_home=$(python3 -c "import json; print(json.load(open('$peer_file')).get('airc_home',''))" 2>/dev/null || true)
+  [ -n "$peer_home" ] && pass "peer record has non-empty airc_home ($peer_home)" \
+                      || fail "peer record airc_home is empty — remote_home() fallback would misroute sends"
 
   cleanup_all
 }

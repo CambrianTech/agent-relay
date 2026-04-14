@@ -8,6 +8,14 @@
 
 set -euo pipefail
 
+# One-time migration from pre-rename ~/.agent-relay → ~/.airc. Only fires when
+# user is on vanilla defaults (no AIRC_HOME override) and the old dir exists but
+# the new one doesn't. Preserves identity, peers, messages, reminder state.
+if [ -z "${AIRC_HOME:-}" ] && [ ! -e "$HOME/.airc" ] && [ -d "$HOME/.agent-relay" ]; then
+  mv "$HOME/.agent-relay" "$HOME/.airc" 2>/dev/null && \
+    echo "  Migrated $HOME/.agent-relay → $HOME/.airc (renamed from the old 'agent-relay' project)" >&2
+fi
+
 # Two-tier state. Opt-in local: create $PWD/.airc/ for per-project identity.
 # Otherwise $HOME/.airc/ is the one-identity-per-machine default (vanilla).
 # AIRC_HOME collapses everything to one explicit tier (explicit override).
