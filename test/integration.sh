@@ -145,6 +145,33 @@ scenario_tabs() {
     pass "send-file payload landed on host at files/beta/send-file-probe.txt" \
     || fail "send-file ran but no payload on host"
 
+  # Resilience: if the wire fails, the outbound MUST still be in local log
+  # with a [SEND FAILED] marker. Simulate by sending with a bogus host_target
+  # via a temp config override. Prevents silent loss.
+  local fake_home=/tmp/airc-it-fail-test
+  mkdir -p "$fake_home/state/peers" "$fake_home/state/identity"
+  cp /tmp/airc-it-j/state/identity/* "$fake_home/state/identity/" 2>/dev/null
+  cp /tmp/airc-it-j/state/config.json "$fake_home/state/config.json"
+  # Point host_target at an unreachable host
+  python3 -c "
+import json
+c = json.load(open('$fake_home/state/config.json'))
+c['host_target'] = 'nobody@127.0.0.99'
+c['host_airc_home'] = '/tmp/nowhere'
+json.dump(c, open('$fake_home/state/config.json', 'w'))
+"
+  # Write a fake peer so resolution doesn't fail
+  echo '{"name":"ghost","host":"nobody@127.0.0.99","airc_home":"/tmp/nowhere"}' > "$fake_home/state/peers/ghost.json"
+  AIRC_HOME=$fake_home/state "$AIRC" send ghost "this-should-fail-but-still-mirror" >/dev/null 2>&1
+  # Exit should be non-zero (we die()), but local must have both the attempt AND the failure marker
+  grep -q '"this-should-fail-but-still-mirror"' "$fake_home/state/messages.jsonl" 2>/dev/null && \
+    pass "failed send: outbound still mirrored to local log (no silent loss)" \
+    || fail "failed send: outbound NOT in local log (silent loss regression)"
+  grep -q 'SEND FAILED' "$fake_home/state/messages.jsonl" 2>/dev/null && \
+    pass "failed send: [SEND FAILED] marker present in local log" \
+    || fail "failed send: no [SEND FAILED] marker — user can't tell it failed"
+  rm -rf "$fake_home"
+
   send_err=$(as_home /tmp/airc-it-h send beta "m2-from-alpha" 2>&1 >/dev/null)
   if [ $? -eq 0 ]; then
     pass "alpha → beta send returns OK"

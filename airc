@@ -95,10 +95,14 @@ sign_message() {
 
 relay_ssh() {
   local ssh_key="$IDENTITY_DIR/ssh_key"
+  # ConnectTimeout 10 so unreachable hosts fail fast instead of hanging ~60s
+  # for the system-wide SSH default. ServerAliveInterval keeps long-lived
+  # monitor tails from stalling on dead TCP state.
+  local opts="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=30"
   if [ -f "$ssh_key" ]; then
-    ssh -i "$ssh_key" -o StrictHostKeyChecking=accept-new "$@"
+    ssh -i "$ssh_key" $opts "$@"
   else
-    ssh -o StrictHostKeyChecking=accept-new "$@"
+    ssh $opts "$@"
   fi
 }
 
@@ -568,16 +572,32 @@ cmd_send() {
 
   if [ -n "$host_target" ]; then
     local rhome; rhome=$(remote_home)
-    # Trust the append, not the ssh exit code: some shells bubble a non-zero
-    # up for benign stderr warnings ("Permanently added..."). Have the remote
-    # confirm with __APPENDED__; if we see it on stdout, the write happened.
-    local out
-    out=$(relay_ssh "$host_target" "echo '$full_msg' >> $rhome/messages.jsonl && echo __APPENDED__" 2>/dev/null)
-    echo "$out" | grep -q '^__APPENDED__$' \
-      || die "Failed to deliver to host ($host_target)"
-    # Mirror the outbound to our local log so `airc logs` shows it and the
-    # user has a local audit trail. Monitor's self-echo filter skips from=me.
+    # Always mirror locally FIRST so we have an audit trail regardless of
+    # what the wire does. If send succeeds: local + remote both have it.
+    # If send fails: local has it (user can see it + retry), remote doesn't.
+    # This prevents silent loss where both sides forget a message that
+    # never arrived.
     echo "$full_msg" >> "$MESSAGES"
+
+    # Attempt the wire. Trust the remote's __APPENDED__ marker — some shells
+    # bubble benign ssh stderr warnings up as non-zero exit, but the append
+    # itself succeeded. We check stdout for the marker, not the exit code.
+    # `|| true` prevents set -e from aborting when ssh itself fails (exit 255
+    # on unreachable host); we want to reach the failure-marker branch below.
+    local out err
+    err=$(mktemp -t airc-send-err.XXXXXX)
+    out=$(relay_ssh "$host_target" "echo '$full_msg' >> $rhome/messages.jsonl && echo __APPENDED__" 2>"$err" || true)
+    if ! echo "$out" | grep -q '^__APPENDED__$'; then
+      # Wire failed. Append a failure marker next to the mirrored line so the
+      # user's `airc logs` shows the message AND the failure reason.
+      local stderr; stderr=$(tr '\n' ' ' < "$err" | sed 's/"/\\"/g' | cut -c1-200)
+      rm -f "$err"
+      local fail_marker; fail_marker=$(printf '{"from":"airc","ts":"%s","msg":"[SEND FAILED to %s] %s"}' \
+        "$(timestamp)" "$peer_name" "${stderr:-no stderr}")
+      echo "$fail_marker" >> "$MESSAGES"
+      die "Failed to deliver to host ($host_target): ${stderr:-no stderr}"
+    fi
+    rm -f "$err"
   else
     echo "$full_msg" >> "$MESSAGES"
   fi
