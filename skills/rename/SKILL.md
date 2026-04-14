@@ -1,5 +1,5 @@
 ---
-name: relay:rename
+name: airc:rename
 description: Rename this relay peer. Broadcasts the change so paired peers auto-update their records.
 user-invocable: true
 allowed-tools: Bash
@@ -12,13 +12,13 @@ Run this yourself — don't ask the user to do it.
 
 ## Parse `$ARGUMENTS`
 
-- `--home=<path>` → sets `AGENT_RELAY_HOME=<path>`. If omitted, use vanilla default.
+- `--home=<path>` → sets `AIRC_HOME=<path>`. If omitted, use vanilla default.
 - First non-flag arg is the new name. Must be lowercase alphanumeric + `-`, max 24 chars. The relay binary sanitizes for you.
 
 ## Execute
 
 ```bash
-<env-prefix> relay rename <new-name>
+<env-prefix> airc rename <new-name>
 ```
 
 On success, the relay prints `Renamed: <old> → <new>` and sends a `[rename]` marker to every paired peer. Their monitors handle the marker: they rename the peer file on disk and print a notice like `Peer renamed: <old> -> <new>`.

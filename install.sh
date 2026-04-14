@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 #
-# Agent Relay installer
+# AIRC installer
 #
-# curl -fsSL https://raw.githubusercontent.com/CambrianTech/agent-relay/main/install.sh | bash
+# curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
 #
-# Clones the repo, puts `relay` on PATH, symlinks skills into ~/.claude/skills/
+# Clones the repo, puts `airc` on PATH, symlinks skills into ~/.claude/skills/
 
 set -euo pipefail
 
-REPO_URL="https://github.com/CambrianTech/agent-relay.git"
-CLONE_DIR="${AGENT_RELAY_DIR:-$HOME/.agent-relay-src}"
+REPO_URL="https://github.com/CambrianTech/airc.git"
+CLONE_DIR="${AIRC_DIR:-$HOME/.airc-src}"
 BIN_DIR="$HOME/.local/bin"
 SKILLS_TARGET="$HOME/.claude/skills"
 
@@ -22,19 +22,19 @@ if [ -d "$CLONE_DIR/.git" ]; then
   info "Updating existing install"
   git -C "$CLONE_DIR" pull --ff-only --quiet
 else
-  info "Installing agent-relay"
+  info "Installing AIRC"
   git clone --quiet "$REPO_URL" "$CLONE_DIR"
 fi
 
-# ── relay on PATH ───────────────────────────────────────────────────────
+# ── airc on PATH ───────────────────────────────────────────────────────
 
 mkdir -p "$BIN_DIR"
 ln -sf "$CLONE_DIR/relay" "$BIN_DIR/relay"
 
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
   for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
-    if [ -f "$rc" ] && ! grep -q 'agent-relay' "$rc"; then
-      echo 'export PATH="$HOME/.local/bin:$PATH"  # agent-relay' >> "$rc"
+    if [ -f "$rc" ] && ! grep -q 'airc' "$rc"; then
+      echo 'export PATH="$HOME/.local/bin:$PATH"  # airc' >> "$rc"
       ok "Added ~/.local/bin to PATH in $(basename "$rc")"
       break
     fi
@@ -58,7 +58,7 @@ if [ -d "$CLONE_DIR/skills" ]; then
     target="$SKILLS_TARGET/$skill_name"
     [ -L "$target" ] && rm "$target"
     ln -sf "$skill_dir" "$target"
-    ok "Skill: /relay:$skill_name"
+    ok "Skill: /airc:$skill_name"
   done
 fi
 
@@ -67,7 +67,7 @@ fi
 echo ""
 ok "Installed. Requires Tailscale: https://tailscale.com"
 echo ""
-echo "  relay connect                    # host — wait for peers"
-echo "  relay connect <name@user@host>   # join a host"
-echo "  relay send <peer> <message>      # send a message"
+echo "  airc connect                    # host — wait for peers"
+echo "  airc connect <name@user@host>   # join a host"
+echo "  airc send <peer> <message>      # send a message"
 echo ""

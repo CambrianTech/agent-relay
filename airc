@@ -1,19 +1,19 @@
 #!/bin/bash
-# Agent Relay — secure messaging between AI agent instances.
+# AIRC — Agentic Internet Relay Chat. Peer messaging between AI agent instances.
 # Requires Tailscale: https://tailscale.com
 #
-# relay connect              → host, wait for peers
-# relay connect name@host    → join a host
-# relay send peer "message"  → send a message
+# airc connect              → host, wait for peers
+# airc connect name@host    → join a host
+# airc send peer "message"  → send a message
 
 set -euo pipefail
 
-# Two-tier state. Opt-in local: create $PWD/.agent-relay/ for per-project identity.
-# Otherwise $HOME/.agent-relay/ is the one-identity-per-machine default (vanilla).
-# AGENT_RELAY_HOME collapses everything to one explicit tier (explicit override).
-HOME_TIER="${AGENT_RELAY_HOME:-$HOME/.agent-relay}"
+# Two-tier state. Opt-in local: create $PWD/.airc/ for per-project identity.
+# Otherwise $HOME/.airc/ is the one-identity-per-machine default (vanilla).
+# AIRC_HOME collapses everything to one explicit tier (explicit override).
+HOME_TIER="${AIRC_HOME:-$HOME/.airc}"
 LOCAL_TIER=""
-[ -z "${AGENT_RELAY_HOME:-}" ] && [ -d "$PWD/.agent-relay" ] && LOCAL_TIER="$PWD/.agent-relay"
+[ -z "${AIRC_HOME:-}" ] && [ -d "$PWD/.airc" ] && LOCAL_TIER="$PWD/.airc"
 
 # Resolver: give it a subpath, get the effective file path.
 # Reads: returns the tier that owns the file (local wins).
@@ -48,7 +48,7 @@ MESSAGES="$(relay_path messages.jsonl)"
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 ensure_init() {
-  [ -f "$CONFIG" ] || die "Not initialized. Run: relay connect"
+  [ -f "$CONFIG" ] || die "Not initialized. Run: airc connect"
 }
 
 get_name() {
@@ -92,23 +92,23 @@ relay_ssh() {
   fi
 }
 
-# Return the remote's RELAY_HOME path (from config), or ~/.agent-relay as fallback.
+# Return the remote's RELAY_HOME path (from config), or ~/.airc as fallback.
 # Used for constructing SSH paths when talking to the host we joined.
 remote_home() {
   local h
   h=$(get_config_val host_relay_home "")
-  [ -z "$h" ] && h='$HOME/.agent-relay'
+  [ -z "$h" ] && h='$HOME/.airc'
   echo "$h"
 }
 
 # Resolve this session's peer name.
-# Priority: AGENT_RELAY_NAME env > config.json name > cwd basename > hostname.
+# Priority: AIRC_NAME env > config.json name > cwd basename > hostname.
 # Multiple sessions on one machine get distinct names by using different RELAY_HOMEs
-# with cwd-derived defaults, or by setting AGENT_RELAY_NAME explicitly.
+# with cwd-derived defaults, or by setting AIRC_NAME explicitly.
 resolve_name() {
   local name=""
-  if [ -n "${AGENT_RELAY_NAME:-}" ]; then
-    name="$AGENT_RELAY_NAME"
+  if [ -n "${AIRC_NAME:-}" ]; then
+    name="$AIRC_NAME"
   elif [ -f "$CONFIG" ]; then
     name=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('name',''))" 2>/dev/null)
   fi
@@ -132,7 +132,7 @@ init_identity() {
     chmod 600 "$IDENTITY_DIR/private.pem"
   fi
   if [ ! -f "$IDENTITY_DIR/ssh_key" ]; then
-    ssh-keygen -t ed25519 -f "$IDENTITY_DIR/ssh_key" -N "" -C "agent-relay-${name}" -q
+    ssh-keygen -t ed25519 -f "$IDENTITY_DIR/ssh_key" -N "" -C "airc-${name}" -q
     mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
     local pubkey; pubkey=$(cat "$IDENTITY_DIR/ssh_key.pub")
     grep -qF "$pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
@@ -199,7 +199,7 @@ monitor() {
         [ -f "$RELAY_HOME/last_sent" ] && last_sent=$(cat "$RELAY_HOME/last_sent" 2>/dev/null)
         local silent=$(( now - last_sent ))
         if [ "$last_sent" -gt 0 ] && [ "$silent" -ge "$interval" ]; then
-          echo "{\"from\":\"relay\",\"ts\":\"$(timestamp)\",\"msg\":\"Reminder: you haven't sent a message in ${silent}s. 'relay reminder off' to disable.\"}"
+          echo "{\"from\":\"relay\",\"ts\":\"$(timestamp)\",\"msg\":\"Reminder: you haven't sent a message in ${silent}s. 'airc reminder off' to disable.\"}"
           touch "$reminded_file"  # Don't fire again until next send
         fi
       fi
@@ -221,7 +221,7 @@ cmd_reminder() {
       ;;
     pause)
       echo "0" > "$reminder_file"
-      echo "  Reminders paused. 'relay reminder <seconds>' to resume."
+      echo "  Reminders paused. 'airc reminder <seconds>' to resume."
       ;;
     status)
       if [ -f "$reminder_file" ]; then
@@ -266,7 +266,7 @@ cmd_connect() {
       ssh_target="${ssh_target%:*}"
     fi
 
-    [ -z "$peer_name" ] || [ -z "$ssh_target" ] && die "Format: relay connect name@user@host"
+    [ -z "$peer_name" ] || [ -z "$ssh_target" ] && die "Format: airc connect name@user@host"
 
     local my_name
     my_name=$(resolve_name)
@@ -324,7 +324,7 @@ while True:
     data += chunk
 sock.close()
 print(data.decode().strip())
-" 2>&1) || die "Can't reach $peer_host_only:$peer_port. Is the host running 'relay connect'?"
+" 2>&1) || die "Can't reach $peer_host_only:$peer_port. Is the host running 'airc connect'?"
 
     # Authorize host's SSH pubkey
     local host_ssh_pub
@@ -398,9 +398,9 @@ EOF
     local host; host=$(get_host)
     local user; user=$(whoami)
     local ssh_pubkey_b64; ssh_pubkey_b64=$(base64 < "$IDENTITY_DIR/ssh_key.pub" | tr -d '\n')
-    # Port override: AGENT_RELAY_PORT env var, default 7547. Only include
+    # Port override: AIRC_PORT env var, default 7547. Only include
     # :port in the join string when non-default, keeping strings compact.
-    local host_port="${AGENT_RELAY_PORT:-7547}"
+    local host_port="${AIRC_PORT:-7547}"
     local port_suffix=""
     [ "$host_port" != "7547" ] && port_suffix=":$host_port"
 
@@ -414,7 +414,7 @@ EOF
     echo "  Hosting as '$name' (reminder: ${reminder_interval}s)"
     echo ""
     echo "  On the other machine:"
-    echo "    relay connect ${name}@${user}@${host}${port_suffix}#${ssh_pubkey_b64}"
+    echo "    airc connect ${name}@${user}@${host}${port_suffix}#${ssh_pubkey_b64}"
     echo ""
     echo "  Waiting for peers on port $host_port..."
     # Background: accept peer registrations via TCP (public keys only)
@@ -487,10 +487,10 @@ print(f'  Peer joined: {jname}')
 
 cmd_rename() {
   local new_name="${1:-}"
-  [ -z "$new_name" ] && die "Usage: relay rename <new-name>"
+  [ -z "$new_name" ] && die "Usage: airc rename <new-name>"
   new_name=$(echo "$new_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-24)
   [ -z "$new_name" ] && die "Invalid name (must be a-z 0-9 -)"
-  [ ! -f "$CONFIG" ] && die "Not initialized — run 'relay connect' first"
+  [ ! -f "$CONFIG" ] && die "Not initialized — run 'airc connect' first"
 
   local old_name
   old_name=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('name',''))" 2>/dev/null)
@@ -521,7 +521,7 @@ cmd_send() {
   local peer_name="${1:-}"
   shift 2>/dev/null || true
   local msg="$*"
-  [ -z "$peer_name" ] || [ -z "$msg" ] && die "Usage: relay send <peer> <message>"
+  [ -z "$peer_name" ] || [ -z "$msg" ] && die "Usage: airc send <peer> <message>"
   ensure_init
 
   local my_name ts_val
@@ -553,7 +553,7 @@ cmd_send() {
 
 cmd_send_file() {
   local peer_name="${1:-}" filepath="${2:-}"
-  [ -z "$peer_name" ] || [ -z "$filepath" ] && die "Usage: relay send-file <peer> <path>"
+  [ -z "$peer_name" ] || [ -z "$filepath" ] && die "Usage: airc send-file <peer> <path>"
   [ -f "$filepath" ] || die "File not found: $filepath"
   ensure_init
 
@@ -627,19 +627,19 @@ case "${1:-help}" in
   logs)      shift; cmd_logs "$@" ;;
   monitor)   shift; monitor "$@" ;;
   help|--help|-h)
-    echo "Agent Relay — secure messaging between AI agents"
+    echo "AIRC — Agentic Internet Relay Chat for AI peers"
     echo ""
-    echo "  relay connect                    Host — wait for peers"
-    echo "  relay connect <name@user@host>   Join a host"
-    echo "  relay send <peer> <message>      Send a message"
-    echo "  relay rename <new-name>          Rename this session (notifies peers)"
-    echo "  relay reminder <seconds>         Nudge if silent (off/pause/300)"
-    echo "  relay peers                      List connected peers"
+    echo "  airc connect                    Host — wait for peers"
+    echo "  airc connect <name@user@host>   Join a host"
+    echo "  airc send <peer> <message>      Send a message"
+    echo "  airc rename <new-name>          Rename this session (notifies peers)"
+    echo "  airc reminder <seconds>         Nudge if silent (off/pause/300)"
+    echo "  airc peers                      List connected peers"
     echo ""
     echo "Identity resolution (highest priority first):"
-    echo "  AGENT_RELAY_NAME env var > config.json name > cwd basename > hostname"
-    echo "  AGENT_RELAY_HOME env var overrides state dir (default \$HOME/.agent-relay)"
-    echo "  AGENT_RELAY_PORT env var overrides host listen port (default 7547)"
+    echo "  AIRC_NAME env var > config.json name > cwd basename > hostname"
+    echo "  AIRC_HOME env var overrides state dir (default \$HOME/.airc)"
+    echo "  AIRC_PORT env var overrides host listen port (default 7547)"
     echo "  Join string may include :port after host, e.g. name@user@host:7548#key"
     ;;
   *) die "Unknown command: $1. Try: relay help" ;;
