@@ -133,6 +133,18 @@ scenario_tabs() {
     pass "joiner outbound mirrored to local messages.jsonl (audit trail)" \
     || fail "joiner outbound NOT written locally — airc logs wouldn't show the send"
 
+  # send-file uses scp. Broken if airc doesn't pass the isolated identity
+  # key to scp (system ssh_config falls back to ~/.ssh/id_* which doesn't
+  # exist in isolated homes). Surfaced by m5-test's real-world test.
+  local payload=/tmp/airc-it-j/send-file-probe.txt
+  printf 'airc send-file round-trip probe — %s\n' "$(date -u +%s)" > "$payload"
+  as_home /tmp/airc-it-j send-file alpha "$payload" >/dev/null 2>&1 && \
+    pass "send-file to alpha returns OK" || fail "send-file failed (scp auth?)"
+  sleep 2
+  [ -f /tmp/airc-it-h/state/files/beta/send-file-probe.txt ] && \
+    pass "send-file payload landed on host at files/beta/send-file-probe.txt" \
+    || fail "send-file ran but no payload on host"
+
   send_err=$(as_home /tmp/airc-it-h send beta "m2-from-alpha" 2>&1 >/dev/null)
   if [ $? -eq 0 ]; then
     pass "alpha → beta send returns OK"

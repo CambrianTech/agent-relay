@@ -603,8 +603,19 @@ cmd_send_file() {
 
   local rhome; rhome=$(remote_home)
   relay_ssh "$target_host" "mkdir -p $rhome/files/${my_name}" 2>/dev/null
-  scp -o StrictHostKeyChecking=accept-new -q "$filepath" "${target_host}:${rhome}/files/${my_name}/${filename}" 2>/dev/null \
-    || die "Failed to transfer $filename"
+  # Use the airc identity key for scp — same key relay_ssh uses. Without -i,
+  # scp falls back to system ssh_config (~/.ssh/id_* etc), which doesn't know
+  # about isolated AIRC_HOME identities. Surfaced by m5-test's send-file test.
+  local ssh_key="$IDENTITY_DIR/ssh_key"
+  local scp_out
+  if [ -f "$ssh_key" ]; then
+    scp_out=$(scp -i "$ssh_key" -o StrictHostKeyChecking=accept-new -q "$filepath" "${target_host}:${rhome}/files/${my_name}/${filename}" 2>&1)
+  else
+    scp_out=$(scp -o StrictHostKeyChecking=accept-new -q "$filepath" "${target_host}:${rhome}/files/${my_name}/${filename}" 2>&1)
+  fi
+  if [ $? -ne 0 ]; then
+    die "Failed to transfer $filename: $scp_out"
+  fi
 
   local filesize; filesize=$(stat -f%z "$filepath" 2>/dev/null || stat -c%s "$filepath" 2>/dev/null || echo "0")
   cmd_send "$peer_name" "Sent file: $filename ($filesize bytes)"
