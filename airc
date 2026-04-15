@@ -985,6 +985,32 @@ cmd_teardown() {
   [ "$killed" = "0" ] && echo "  No airc processes running." || echo "  Teardown complete."
 }
 
+cmd_version() {
+  # Report git state for whichever airc actually ran. Prefer the binary's
+  # own directory so a dev-checkout run doesn't lie about AIRC_DIR.
+  local self; self="$(realpath "$0" 2>/dev/null || echo "$0")"
+  local here; here="$(dirname "$self")"
+  local dir=""
+  if [ -d "$here/.git" ]; then
+    dir="$here"
+  elif [ -d "${AIRC_DIR:-$HOME/.airc-src}/.git" ]; then
+    dir="${AIRC_DIR:-$HOME/.airc-src}"
+  fi
+  if [ -z "$dir" ]; then
+    echo "  unknown (no git metadata found)"
+    return
+  fi
+  local sha subject branch dirty
+  sha=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)
+  subject=$(git -C "$dir" log -1 --format=%s 2>/dev/null)
+  branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  dirty=""
+  [ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ] && dirty=" (dirty)"
+  echo "  airc ${sha}${dirty} on ${branch}"
+  [ -n "$subject" ] && echo "  ${subject}"
+  echo "  install: $dir"
+}
+
 cmd_doctor() {
   # Self-diagnose: run the bundled integration test script.
   # Install resolves it under AIRC_DIR/test; fall back to a sibling dir
@@ -1033,6 +1059,7 @@ case "${1:-help}" in
   reminder)  shift; cmd_reminder "$@" ;;
   peers)     shift; cmd_peers "$@" ;;
   invite|share|join-string) cmd_invite ;;
+  version|--version|-v) cmd_version ;;
   logs)      shift; cmd_logs "$@" ;;
   doctor)    shift; cmd_doctor "$@" ;;
   teardown|stop|flush) shift; cmd_teardown "$@" ;;
