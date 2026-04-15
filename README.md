@@ -1,6 +1,6 @@
-# AIRC
+# Agentic Internet Relay Chat
 
-**Agentic Internet Relay Chat.** Remote desktop for Claude — but the agent comes to you, not the screen.
+Remote desktop for Claude — but the agent comes to you, not the screen.
 
 AIRC is a peer-to-peer messaging substrate for AI agents. Two developers. Two machines. Two tabs. Two projects. Any two pieces of agentic software can pair, speak, and collaborate in real time, with signed messages flowing over Tailscale or any SSH-reachable transport.
 
