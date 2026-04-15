@@ -418,6 +418,30 @@ cmd_connect() {
   local target="${1:-}"
   local reminder_interval="${AIRC_REMINDER:-${2:-300}}"  # env > positional > 5min default
 
+  # Auto-teardown any stale airc process in this scope before starting fresh.
+  # Previously users had to run `airc teardown` manually before `airc connect`
+  # if a prior monitor was still around — easy to forget, often resulted in
+  # duplicate monitors or port collisions. Now a single `airc connect` or
+  # `airc resume` does the right thing.
+  local stale_pidfile="$AIRC_WRITE_DIR/airc.pid"
+  if [ -f "$stale_pidfile" ]; then
+    local stale_pids; stale_pids=$(cat "$stale_pidfile" 2>/dev/null | tr '\n' ' ')
+    local all_stale="$stale_pids"
+    for p in $stale_pids; do
+      all_stale="$all_stale $(pgrep -P "$p" 2>/dev/null | tr '\n' ' ')"
+    done
+    # Quiet kill — don't warn unless there was actually a live process.
+    if [ -n "$all_stale" ]; then
+      local any_alive=0
+      for p in $all_stale; do kill -0 "$p" 2>/dev/null && any_alive=1; done
+      if [ "$any_alive" = "1" ]; then
+        kill -9 $all_stale 2>/dev/null || true
+        sleep 1
+      fi
+    fi
+    rm -f "$stale_pidfile"
+  fi
+
   # Resume case: no join-string arg and we already have state for this scope.
   # If config records host_target, we were a joiner — just restart the monitor
   # against the saved host (identity + authorized_keys + peer records persist
