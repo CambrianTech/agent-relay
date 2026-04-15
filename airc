@@ -185,13 +185,26 @@ monitor() {
   # Stream inbound via `tail -n 0 -F` (inotify/kqueue) — no polling, every
   # new line surfaces the moment it's written. Joiner tails the host over
   # a persistent SSH; host tails its local log.
+  #
+  # Wrapped in a reconnect loop so a dropped SSH session / transient
+  # filesystem error doesn't permanently stop notifications. A brief sleep
+  # between retries avoids hot-looping if the remote is down.
   if [ -n "$host_target" ]; then
     local rhome; rhome=$(remote_home)
     local ssh_key="$IDENTITY_DIR/ssh_key"
     local ssh_opts="-i $ssh_key -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=3"
-    ssh $ssh_opts "$host_target" "tail -n 0 -F $rhome/messages.jsonl 2>/dev/null" | monitor_formatter "$my_name"
+    while true; do
+      ssh $ssh_opts "$host_target" "tail -n 0 -F $rhome/messages.jsonl 2>/dev/null" 2>/dev/null | monitor_formatter "$my_name" || true
+      # If we fall out, the ssh session ended (drop/timeout/remote restart).
+      # Brief pause then reconnect. Messages that arrived during the gap are
+      # retrievable via `airc logs`.
+      sleep 3
+    done
   else
-    tail -n 0 -F "$MESSAGES" 2>/dev/null | monitor_formatter "$my_name"
+    while true; do
+      tail -n 0 -F "$MESSAGES" 2>/dev/null | monitor_formatter "$my_name" || true
+      sleep 1
+    done
   fi
 }
 
