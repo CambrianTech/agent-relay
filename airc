@@ -242,12 +242,12 @@ for line in sys.stdin:
     msg = m.get("msg", "")
     if handle_rename(msg, ts):
         continue
-    # Every message gets surfaced — including own sends (so Claude Code
-    # notifications confirm your outbound hit the wire).
+    # Filter own sends — they create self-echo noise in Claude Code
+    # notifications. Outbounds are still in airc logs for audit; the
+    # send command itself returns status on success/failure.
     if fr == my_name:
-        target = to if to else "all"
-        label = f"me->{target}"
-    elif fr in ("airc", "sys"):
+        continue
+    if fr in ("airc", "sys"):
         label = "airc"
     else:
         label = fr
