@@ -1072,6 +1072,30 @@ cmd_teardown() {
   [ "$killed" = "0" ] && echo "  No airc processes running." || echo "  Teardown complete."
 }
 
+cmd_update() {
+  # Pull latest main into the install dir. Does NOT teardown or reconnect —
+  # the running monitor keeps its in-memory code until the next restart.
+  # Running agents: `airc teardown` then `airc connect` to pick up changes.
+  local dir="${AIRC_DIR:-$HOME/.airc-src}"
+  if [ ! -d "$dir/.git" ]; then
+    die "No git checkout at $dir. Reinstall: curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash"
+  fi
+  echo "  Fetching latest..."
+  local before after
+  before=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)
+  if git -C "$dir" pull --ff-only --quiet 2>&1; then
+    after=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)
+    if [ "$before" = "$after" ]; then
+      echo "  Already at ${after}."
+    else
+      echo "  Updated: ${before} -> ${after}"
+      echo "  Running monitor still uses the old code. To pick up:  airc teardown && airc connect"
+    fi
+  else
+    die "git pull failed. Fix the checkout at $dir and retry."
+  fi
+}
+
 cmd_version() {
   # Report git state for whichever airc actually ran. Prefer the binary's
   # own directory so a dev-checkout run doesn't lie about AIRC_DIR.
@@ -1147,6 +1171,7 @@ case "${1:-help}" in
   peers)     shift; cmd_peers "$@" ;;
   invite|share|join-string) cmd_invite ;;
   version|--version|-v) cmd_version ;;
+  update|upgrade|pull) cmd_update ;;
   logs)      shift; cmd_logs "$@" ;;
   doctor)    shift; cmd_doctor "$@" ;;
   teardown|stop|flush) shift; cmd_teardown "$@" ;;
