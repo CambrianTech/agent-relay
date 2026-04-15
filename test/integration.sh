@@ -647,6 +647,19 @@ json.dump(c, open(p, 'w'))
     && pass "joiner status: last-attempt surfaces QUEUED after outage send" \
     || fail "joiner status: no QUEUED last-attempt after outage (got: $(echo "$j_out3" | grep -E 'last (delivered|attempt)'))"
 
+  # vhsm #4: --probe caching. First call SHOULD hit SSH (will fail fast because
+  # host_target is fake). Second call within the TTL MUST use the cache — we
+  # detect that by looking for the "(cached Ns)" suffix.
+  local probe1; probe1=$(AIRC_HOME=/tmp/airc-it-s-j/state "$AIRC" status --probe 2>&1)
+  echo "$probe1" | grep -Eq 'host:\s+UNREACHABLE' && pass "status --probe: first call returns UNREACHABLE (fake target)" \
+                                                  || fail "status --probe: first call didn't report UNREACHABLE (got: $(echo "$probe1" | grep host:))"
+  echo "$probe1" | grep -q 'cached' && fail "status --probe: first call said 'cached' (should have actually probed)" \
+                                    || pass "status --probe: first call is fresh (no cached suffix)"
+
+  local probe2; probe2=$(AIRC_HOME=/tmp/airc-it-s-j/state "$AIRC" status --probe 2>&1)
+  echo "$probe2" | grep -q 'cached' && pass "status --probe: second call within TTL uses cache" \
+                                    || fail "status --probe: second call didn't cache (got: $(echo "$probe2" | grep host:))"
+
   cleanup_all
 }
 

@@ -1423,16 +1423,38 @@ cmd_status() {
 
   # Host reachability. Only meaningful for joiners; opt-in via --probe to keep
   # `airc status` fast by default (SSH connect can hang for seconds).
+  # Short cache (5s TTL) so scripting `airc status --probe` in a statusline
+  # renderer doesn't hit SSH on every terminal repaint. vhsm-claude's #12
+  # review flagged this.
   if [ -n "$host_target" ] && [ "$probe" = "1" ]; then
-    local ssh_key="$IDENTITY_DIR/ssh_key"
-    local probe_out
-    probe_out=$(ssh -i "$ssh_key" -o StrictHostKeyChecking=accept-new \
-                    -o ConnectTimeout=3 -o BatchMode=yes \
-                    "$host_target" "echo __REACHABLE__" 2>/dev/null || true)
-    if echo "$probe_out" | grep -q '^__REACHABLE__$'; then
-      echo "  host:        reachable"
+    local probe_cache="$AIRC_WRITE_DIR/probe_cache"
+    local probe_ttl=5
+    local now_epoch; now_epoch=$(date +%s)
+    local cached_result="" cached_ts=0
+    if [ -f "$probe_cache" ]; then
+      cached_ts=$(head -1 "$probe_cache" 2>/dev/null)
+      cached_result=$(sed -n '2p' "$probe_cache" 2>/dev/null)
+      [ -n "$cached_ts" ] && [ "$cached_ts" -gt 0 ] 2>/dev/null || cached_ts=0
+    fi
+    local age=$(( now_epoch - cached_ts ))
+    if [ "$cached_ts" -gt 0 ] && [ "$age" -lt "$probe_ttl" ] && [ -n "$cached_result" ]; then
+      echo "  host:        $cached_result (cached ${age}s)"
     else
-      echo "  host:        UNREACHABLE (ssh timeout or auth failure)"
+      local ssh_key="$IDENTITY_DIR/ssh_key"
+      local probe_out
+      probe_out=$(ssh -i "$ssh_key" -o StrictHostKeyChecking=accept-new \
+                      -o ConnectTimeout=3 -o BatchMode=yes \
+                      "$host_target" "echo __REACHABLE__" 2>/dev/null || true)
+      local result
+      if echo "$probe_out" | grep -q '^__REACHABLE__$'; then
+        result="reachable"
+      else
+        result="UNREACHABLE (ssh timeout or auth failure)"
+      fi
+      # Write cache atomically: epoch on line 1, result on line 2.
+      printf '%s\n%s\n' "$now_epoch" "$result" > "${probe_cache}.new" 2>/dev/null
+      mv "${probe_cache}.new" "$probe_cache" 2>/dev/null
+      echo "  host:        $result"
     fi
   fi
 
