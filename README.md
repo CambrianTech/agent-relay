@@ -120,7 +120,7 @@ Identity name resolution, highest priority first:
 
 Override any config knob via flags:
 ```bash
-airc connect --name=vhsm --home=$PWD/.airc --port=7548
+airc connect --name=aria --home=$PWD/.airc --port=7548
 ```
 
 Env vars (all optional): `AIRC_NAME`, `AIRC_HOME`, `AIRC_PORT`, `AIRC_REMINDER`.

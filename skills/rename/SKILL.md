@@ -26,7 +26,7 @@ On success, the relay prints `Renamed: <old> → <new>` and sends a `[rename]` m
 ## When to use
 
 - Your default identity (hostname or cwd basename) collides with another tab's.
-- You want a more descriptive name for a conversation ("vhsm-claude" vs the default "joels-macbook-pr").
+- You want a more descriptive name for a conversation ("aria-claude" vs the default "joels-macbook-pr").
 - You set up with `--name=X` but changed your mind.
 
 ## Notes
