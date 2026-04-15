@@ -204,10 +204,11 @@ monitor() {
       last_activity=$(date +%s)
       echo "$lines" | while IFS= read -r line; do
         [ -z "$line" ] && continue
-        local msg_from msg_text
+        local msg_from msg_ts msg_text
         msg_from=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('from',''))" 2>/dev/null || true)
         [ "$msg_from" = "$my_name" ] && continue
         # Handle [rename] protocol messages: update peer record and surface as info
+        msg_ts=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('ts',''))" 2>/dev/null || true)
         msg_text=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('msg',''))" 2>/dev/null || true)
         if [[ "$msg_text" == "[rename] old="* ]]; then
           local old_n new_n old_json old_pub new_json new_pub
@@ -230,11 +231,15 @@ try:
     json.dump(d, open('$new_json', 'w'), indent=2)
 except: pass
 " 2>/dev/null || true
-            echo "{\"from\":\"airc\",\"ts\":\"$(timestamp)\",\"msg\":\"Peer renamed: $old_n -> $new_n\"}"
+            printf '[%s] airc: Peer renamed: %s -> %s\n' "$(timestamp)" "$old_n" "$new_n"
             continue
           fi
         fi
-        echo "$line"
+        # Human-readable event for Claude Code Monitor notifications.
+        # The JSON-structured line is already persisted in messages.jsonl;
+        # stdout is for humans (and the Monitor tool surfacing this as a
+        # notification in Claude Code — needs a real summary, not raw JSON).
+        printf '[%s] %s: %s\n' "${msg_ts:-?}" "${msg_from:-?}" "${msg_text:-$line}"
       done
     fi
 
@@ -249,7 +254,7 @@ except: pass
         [ -f "$AIRC_WRITE_DIR/last_sent" ] && last_sent=$(cat "$AIRC_WRITE_DIR/last_sent" 2>/dev/null)
         local silent=$(( now - last_sent ))
         if [ "$last_sent" -gt 0 ] && [ "$silent" -ge "$interval" ]; then
-          echo "{\"from\":\"airc\",\"ts\":\"$(timestamp)\",\"msg\":\"Reminder: you haven't sent a message in ${silent}s. 'airc reminder off' to disable.\"}"
+          printf '[%s] airc: Reminder: you haven'"'"'t sent a message in %ss. '"'"'airc reminder off'"'"' to disable.\n' "$(timestamp)" "$silent"
           touch "$reminded_file"  # Don't fire again until next send
         fi
       fi
