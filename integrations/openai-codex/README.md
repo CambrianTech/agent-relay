@@ -1,14 +1,23 @@
 # OpenAI Codex CLI Integration
 
-Adds relay messaging to Codex CLI sessions.
+Adds AIRC peer messaging to Codex CLI sessions.
 
 ## Setup
 
-After `relay start` and `relay join`, add to your project instructions:
+Pair the machine first (host or join):
+
+```bash
+airc connect                  # host — prints a join string
+airc connect <join-string>    # join an existing host
+```
+
+Then add to your project instructions so Codex knows the surface:
 
 ```
-Monitor the relay for incoming messages by running: relay monitor
-Send messages with: relay send <peer> <message>
+You are paired on AIRC. Send messages with:
+  airc send <peer> "message"
+List peers with `airc peers`. Recent activity with `airc logs 20`.
+For a live tail of inbound messages, run `airc monitor` in a side terminal.
 ```
 
 ## Usage
@@ -16,11 +25,9 @@ Send messages with: relay send <peer> <message>
 Codex can run shell commands directly:
 
 ```bash
-# Send
-relay send peerName "message here"
-
-# Check recent messages
-relay logs 10
+airc send peerName "message here"
+airc logs 10
+airc peers
 ```
 
-For real-time monitoring, run `relay monitor` in a background terminal — Codex will see output in its context.
+For real-time inbound, run `airc monitor` in a background terminal — Codex sees the output in its context.

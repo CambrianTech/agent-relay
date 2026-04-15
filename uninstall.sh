@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# Agent Relay uninstaller
+# AIRC uninstaller
 #
-# Removes symlinks from ~/.claude/skills/ and ~/.local/bin/relay.
-# Leaves the clone at ~/.agent-relay-src — delete it manually to fully remove.
+# Removes symlinks from ~/.claude/skills/ and ~/.local/bin/airc.
+# Leaves the clone at ~/.airc-src — delete it manually to fully remove.
 
 set -euo pipefail
 
-CLONE_DIR="${AGENT_RELAY_DIR:-$HOME/.agent-relay-src}"
+CLONE_DIR="${AIRC_DIR:-$HOME/.airc-src}"
 BIN_DIR="$HOME/.local/bin"
 SKILLS_TARGET="$HOME/.claude/skills"
 
@@ -30,10 +30,10 @@ for old in "$SKILLS_TARGET"/relay-*; do
   [ -L "$old" ] && rm "$old" && ok "Removed old skill: $(basename "$old")"
 done
 
-# Remove relay binary symlink
-if [ -L "$BIN_DIR/relay" ]; then
-  rm "$BIN_DIR/relay"
-  ok "Removed relay from PATH"
+# Remove airc binary symlink
+if [ -L "$BIN_DIR/airc" ]; then
+  rm "$BIN_DIR/airc"
+  ok "Removed airc from PATH"
 fi
 
 echo ""

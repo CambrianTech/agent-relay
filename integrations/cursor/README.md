@@ -1,28 +1,34 @@
 # Cursor Integration
 
-Adds relay messaging to Cursor AI sessions.
+Adds AIRC peer messaging to Cursor AI sessions.
 
 ## Setup
 
-After `relay start` and `relay join`, add to `.cursorrules`:
+Pair the machine first (host or join):
+
+```bash
+airc connect                  # host — prints a join string
+airc connect <join-string>    # join an existing host
+```
+
+Then add to `.cursorrules`:
 
 ```
-You have access to a peer-to-peer messaging relay. 
-To send messages to other machines: relay send <peer> <message>
-To check incoming messages: relay logs 10
-To monitor in real-time: relay monitor (run in integrated terminal)
+You have access to AIRC, a peer-to-peer messaging fabric for agents.
+- Send: airc send <peer> "<message>"
+- Inbound history: airc logs 20
+- Peers: airc peers
+- Live tail: airc monitor (run in the integrated terminal)
+Every send is mirrored locally first; failed deliveries leave a [SEND FAILED] marker in the log.
 ```
 
 ## Usage
 
-Cursor's agent can run terminal commands:
+Cursor's agent can run terminal commands directly:
 
 ```bash
-# Send
-relay send peerName "message here"
-
-# Recent messages
-relay logs 20
+airc send peerName "message here"
+airc logs 20
 ```
 
-For real-time notifications, run `relay monitor` in Cursor's integrated terminal.
+For real-time notifications, run `airc monitor` in Cursor's integrated terminal.

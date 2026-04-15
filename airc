@@ -1,0 +1,821 @@
+#!/bin/bash
+# AIRC — Agentic Internet Relay Chat. Peer messaging between AI agent instances.
+# Requires Tailscale: https://tailscale.com
+#
+# airc connect              → host, wait for peers
+# airc connect name@host    → join a host
+# airc send peer "message"  → send a message
+
+set -euo pipefail
+
+# One-time migration from pre-rename ~/.agent-relay → ~/.airc. Fires when user
+# is on vanilla defaults, the old dir exists as a real dir (not a symlink we
+# already left), and ~/.airc doesn't. Leaves a symlink ~/.agent-relay → ~/.airc
+# so running monitors + tails pointing at the old path keep working.
+if [ -z "${AIRC_HOME:-}" ] && [ -d "$HOME/.agent-relay" ] && [ ! -L "$HOME/.agent-relay" ] && [ ! -e "$HOME/.airc" ]; then
+  mv "$HOME/.agent-relay" "$HOME/.airc" 2>/dev/null && \
+    ln -s "$HOME/.airc" "$HOME/.agent-relay" 2>/dev/null && \
+    echo "  Migrated $HOME/.agent-relay → $HOME/.airc (symlink left for back-compat)" >&2
+fi
+
+# Two-tier state. Opt-in local: create $PWD/.airc/ for per-project identity.
+# Otherwise $HOME/.airc/ is the one-identity-per-machine default (vanilla).
+# AIRC_HOME collapses everything to one explicit tier (explicit override).
+HOME_TIER="${AIRC_HOME:-$HOME/.airc}"
+LOCAL_TIER=""
+[ -z "${AIRC_HOME:-}" ] && [ -d "$PWD/.airc" ] && LOCAL_TIER="$PWD/.airc"
+
+# Resolver: give it a subpath, get the effective file path.
+# Reads: returns the tier that owns the file (local wins).
+# Writes: new files land in local if opted in, else home; updates hit their owner.
+relay_path() {
+  local sub="$1"
+  [ -n "$LOCAL_TIER" ] && [ -e "$LOCAL_TIER/$sub" ] && { echo "$LOCAL_TIER/$sub"; return; }
+  [ -e "$HOME_TIER/$sub" ]                        && { echo "$HOME_TIER/$sub";  return; }
+  [ -n "$LOCAL_TIER" ]                            && { echo "$LOCAL_TIER/$sub"; return; }
+  echo "$HOME_TIER/$sub"
+}
+
+# Union listing of entries under a subdir, local-first, deduped by name.
+# Use when you want every <name> across tiers, e.g. peers.
+relay_list() {
+  local sub="$1"
+  {
+    [ -n "$LOCAL_TIER" ] && [ -d "$LOCAL_TIER/$sub" ] && ls -1 "$LOCAL_TIER/$sub" 2>/dev/null
+    [ -d "$HOME_TIER/$sub" ] && ls -1 "$HOME_TIER/$sub" 2>/dev/null
+  } | awk '!seen[$0]++'
+}
+
+# Common paths via the resolver. Legacy global vars remain for back-compat.
+AIRC_WRITE_DIR="$([ -n "$LOCAL_TIER" ] && echo "$LOCAL_TIER" || echo "$HOME_TIER")"
+CONFIG="$(relay_path config.json)"
+IDENTITY_DIR="$(relay_path identity)"
+PEERS_DIR="$(relay_path peers)"
+MESSAGES="$(relay_path messages.jsonl)"
+
+# ── Helpers ─────────────────────────────────────────────────────────────
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+ensure_init() {
+  [ -f "$CONFIG" ] || die "Not initialized. Run: airc connect"
+}
+
+get_name() {
+  python3 -c "import json; print(json.load(open('$CONFIG'))['name'])" 2>/dev/null || echo "unknown"
+}
+
+get_config_val() {
+  python3 -c "import json; print(json.load(open('$CONFIG')).get('$1','$2'))" 2>/dev/null || echo "$2"
+}
+
+get_host() {
+  # Prefer Tailscale IP, fall back to hostname
+  local ts_bin=""
+  if command -v tailscale >/dev/null 2>&1; then
+    ts_bin="tailscale"
+  elif [ -x "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ]; then
+    ts_bin="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+  fi
+  if [ -n "$ts_bin" ]; then
+    local ts_ip; ts_ip=$("$ts_bin" ip -4 2>/dev/null || true)
+    [ -n "$ts_ip" ] && echo "$ts_ip" && return
+  fi
+  hostname
+}
+
+timestamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+sign_message() {
+  local tmpfile; tmpfile=$(mktemp)
+  printf '%s' "$1" > "$tmpfile"
+  openssl pkeyutl -sign -inkey "$IDENTITY_DIR/private.pem" -in "$tmpfile" 2>/dev/null | base64
+  rm -f "$tmpfile"
+}
+
+relay_ssh() {
+  local ssh_key="$IDENTITY_DIR/ssh_key"
+  # ConnectTimeout 10 so unreachable hosts fail fast instead of hanging ~60s
+  # for the system-wide SSH default. ServerAliveInterval keeps long-lived
+  # monitor tails from stalling on dead TCP state.
+  local opts="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=30"
+  if [ -f "$ssh_key" ]; then
+    ssh -i "$ssh_key" $opts "$@"
+  else
+    ssh $opts "$@"
+  fi
+}
+
+# Return the remote's AIRC_WRITE_DIR path (from config), or ~/.airc as fallback.
+# Used for constructing SSH paths when talking to the host we joined.
+remote_home() {
+  local h
+  h=$(get_config_val host_airc_home "")
+  [ -z "$h" ] && h='$HOME/.airc'
+  echo "$h"
+}
+
+# Resolve this session's peer name.
+# Priority: AIRC_NAME env > config.json name > cwd basename > hostname.
+# Multiple sessions on one machine get distinct names by using different AIRC_WRITE_DIRs
+# with cwd-derived defaults, or by setting AIRC_NAME explicitly.
+resolve_name() {
+  local name=""
+  if [ -n "${AIRC_NAME:-}" ]; then
+    name="$AIRC_NAME"
+  elif [ -f "$CONFIG" ]; then
+    name=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('name',''))" 2>/dev/null)
+  fi
+  if [ -z "$name" ]; then
+    # Auto-derive from cwd basename — contextual and human-readable
+    # e.g. /path/to/vHSM → vhsm, /path/to/continuum → continuum
+    local cwd_base
+    cwd_base=$(basename "$PWD" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-16)
+    [ -n "$cwd_base" ] && [ "$cwd_base" != "-" ] && name="$cwd_base"
+  fi
+  [ -z "$name" ] && name=$(hostname | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-16)
+  echo "$name"
+}
+
+init_identity() {
+  local name="$1"
+  mkdir -p "$AIRC_WRITE_DIR" "$IDENTITY_DIR" "$PEERS_DIR"
+  if [ ! -f "$IDENTITY_DIR/private.pem" ]; then
+    openssl genpkey -algorithm Ed25519 -out "$IDENTITY_DIR/private.pem" 2>/dev/null
+    openssl pkey -in "$IDENTITY_DIR/private.pem" -pubout -out "$IDENTITY_DIR/public.pem" 2>/dev/null
+    chmod 600 "$IDENTITY_DIR/private.pem"
+  fi
+  if [ ! -f "$IDENTITY_DIR/ssh_key" ]; then
+    ssh-keygen -t ed25519 -f "$IDENTITY_DIR/ssh_key" -N "" -C "airc-${name}" -q
+    mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+    local pubkey; pubkey=$(cat "$IDENTITY_DIR/ssh_key.pub")
+    grep -qF "$pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
+      echo "$pubkey" >> "$HOME/.ssh/authorized_keys"
+      chmod 600 "$HOME/.ssh/authorized_keys"
+    }
+  fi
+  touch "$MESSAGES"
+}
+
+monitor() {
+  local my_name host_target last
+  my_name=$(get_name)
+  host_target=$(get_config_val host_target "")
+
+  # Persist the last-seen line offset so monitor doesn't replay history
+  # on every (re)start. On first-ever run, skip to end-of-file — history
+  # is available via `airc logs`.
+  local offset_file="$AIRC_WRITE_DIR/monitor_offset"
+  if [ -f "$offset_file" ]; then
+    last=$(cat "$offset_file" 2>/dev/null || echo 0)
+  else
+    if [ -n "$host_target" ]; then
+      local rhome; rhome=$(remote_home)
+      last=$(relay_ssh "$host_target" "wc -l < $rhome/messages.jsonl 2>/dev/null || echo 0" 2>/dev/null | tr -d ' ' || echo 0)
+    else
+      last=$(wc -l < "$MESSAGES" 2>/dev/null | tr -d ' ' || echo 0)
+    fi
+    echo "$last" > "$offset_file"
+  fi
+  [ -z "$last" ] && last=0
+  local last_activity; last_activity=$(date +%s)
+
+  while true; do
+    local lines=""
+    if [ -n "$host_target" ]; then
+      local rhome; rhome=$(remote_home)
+      lines=$(relay_ssh "$host_target" "tail -n +$((last+1)) $rhome/messages.jsonl 2>/dev/null" 2>/dev/null) || true
+    else
+      lines=$(tail -n +$((last+1)) "$MESSAGES" 2>/dev/null) || true
+    fi
+    if [ -n "$lines" ]; then
+      local count; count=$(echo "$lines" | wc -l)
+      last=$((last + count))
+      echo "$last" > "$offset_file"
+      last_activity=$(date +%s)
+      echo "$lines" | while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        local msg_from msg_text
+        msg_from=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('from',''))" 2>/dev/null || true)
+        [ "$msg_from" = "$my_name" ] && continue
+        # Handle [rename] protocol messages: update peer record and surface as info
+        msg_text=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('msg',''))" 2>/dev/null || true)
+        if [[ "$msg_text" == "[rename] old="* ]]; then
+          local old_n new_n old_json old_pub new_json new_pub
+          old_n=$(echo "$msg_text" | sed -n 's/.*old=\([a-z0-9-]*\).*/\1/p')
+          new_n=$(echo "$msg_text" | sed -n 's/.*new=\([a-z0-9-]*\).*/\1/p')
+          old_json=$(relay_path "peers/$old_n.json")
+          if [ -n "$old_n" ] && [ -n "$new_n" ] && [ -f "$old_json" ]; then
+            # Rename within the same tier that owns the peer record
+            new_json="$(dirname "$old_json")/$new_n.json"
+            old_pub="$(dirname "$old_json")/$old_n.pub"
+            new_pub="$(dirname "$old_json")/$new_n.pub"
+            mv "$old_json" "$new_json" 2>/dev/null || true
+            [ -f "$old_pub" ] && mv "$old_pub" "$new_pub" 2>/dev/null
+            # Update the name field inside the JSON so `airc peers` reflects it
+            python3 -c "
+import json
+try:
+    d = json.load(open('$new_json'))
+    d['name'] = '$new_n'
+    json.dump(d, open('$new_json', 'w'), indent=2)
+except: pass
+" 2>/dev/null || true
+            echo "{\"from\":\"airc\",\"ts\":\"$(timestamp)\",\"msg\":\"Peer renamed: $old_n -> $new_n\"}"
+            continue
+          fi
+        fi
+        echo "$line"
+      done
+    fi
+
+    # Reminder: nudge once if no SEND for interval, don't repeat until next send
+    local reminder_file="$AIRC_WRITE_DIR/reminder"
+    local reminded_file="$AIRC_WRITE_DIR/reminded"
+    if [ -f "$reminder_file" ] && [ ! -f "$reminded_file" ]; then
+      local interval; interval=$(cat "$reminder_file" 2>/dev/null)
+      if [ -n "$interval" ] && [ "$interval" -gt 0 ] 2>/dev/null; then
+        local now; now=$(date +%s)
+        local last_sent=0
+        [ -f "$AIRC_WRITE_DIR/last_sent" ] && last_sent=$(cat "$AIRC_WRITE_DIR/last_sent" 2>/dev/null)
+        local silent=$(( now - last_sent ))
+        if [ "$last_sent" -gt 0 ] && [ "$silent" -ge "$interval" ]; then
+          echo "{\"from\":\"airc\",\"ts\":\"$(timestamp)\",\"msg\":\"Reminder: you haven't sent a message in ${silent}s. 'airc reminder off' to disable.\"}"
+          touch "$reminded_file"  # Don't fire again until next send
+        fi
+      fi
+    fi
+
+    sleep 5
+  done
+}
+
+cmd_reminder() {
+  ensure_init
+  local arg="${1:-status}"
+  local reminder_file="$AIRC_WRITE_DIR/reminder"
+
+  case "$arg" in
+    off|0)
+      rm -f "$reminder_file"
+      echo "  Reminders off."
+      ;;
+    pause)
+      echo "0" > "$reminder_file"
+      echo "  Reminders paused. 'airc reminder <seconds>' to resume."
+      ;;
+    status)
+      if [ -f "$reminder_file" ]; then
+        local val; val=$(cat "$reminder_file")
+        if [ "$val" = "0" ]; then
+          echo "  Reminders paused."
+        else
+          echo "  Reminder every ${val}s."
+        fi
+      else
+        echo "  Reminders off."
+      fi
+      ;;
+    *)
+      echo "$arg" > "$reminder_file"
+      echo "  Reminder every ${arg}s if no messages."
+      ;;
+  esac
+}
+
+# ── Commands ────────────────────────────────────────────────────────────
+
+cmd_connect() {
+  local target="${1:-}"
+  local reminder_interval="${AIRC_REMINDER:-${2:-300}}"  # env > positional > 5min default
+
+  if [ -n "$target" ] && echo "$target" | grep -q '@'; then
+    # ── JOIN MODE ──────────────────────────────────────────────────
+    # Parse name@user@host[:port]#pubkey
+    local host_ssh_pubkey_b64=""
+    if echo "$target" | grep -q '#'; then
+      host_ssh_pubkey_b64="${target##*#}"
+      target="${target%%#*}"
+    fi
+
+    local peer_name ssh_target peer_port="7547"
+    peer_name="${target%%@*}"
+    ssh_target="${target#*@}"
+    # Extract :port if present at the end of the host part
+    if echo "$ssh_target" | grep -qE ':[0-9]+$'; then
+      peer_port="${ssh_target##*:}"
+      ssh_target="${ssh_target%:*}"
+    fi
+
+    [ -z "$peer_name" ] || [ -z "$ssh_target" ] && die "Format: airc connect name@user@host"
+
+    local my_name
+    my_name=$(resolve_name)
+    init_identity "$my_name"
+
+    cat > "$CONFIG" << EOF
+{
+  "name": "$my_name",
+  "host": "$(get_host)",
+  "host_target": "$ssh_target",
+  "created": "$(timestamp)"
+}
+EOF
+
+    # Exchange keys with host via TCP (port 7547) — public keys only
+    # Pre-authorize host's pubkey if in join string
+    if [ -n "$host_ssh_pubkey_b64" ]; then
+      local host_ssh_pubkey
+      host_ssh_pubkey=$(echo "$host_ssh_pubkey_b64" | base64 -d 2>/dev/null || echo "$host_ssh_pubkey_b64" | base64 -D 2>/dev/null || true)
+      if [ -n "$host_ssh_pubkey" ]; then
+        mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+        grep -qF "$host_ssh_pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
+          echo "$host_ssh_pubkey" >> "$HOME/.ssh/authorized_keys"
+          chmod 600 "$HOME/.ssh/authorized_keys"
+        }
+      fi
+    fi
+
+    # Exchange keys with host via TCP
+    local peer_host_only="${ssh_target##*@}"
+    echo "  Connecting to $peer_host_only:$peer_port..."
+    local my_ssh_pub my_sign_pub
+    my_ssh_pub=$(cat "$IDENTITY_DIR/ssh_key.pub" 2>/dev/null)
+    my_sign_pub=$(cat "$IDENTITY_DIR/public.pem" 2>/dev/null)
+
+    local response
+    response=$(python3 -c "
+import socket, json, sys
+payload = json.dumps({
+    'name': '$my_name',
+    'host': '$(whoami)@$(get_host)',
+    'ssh_pub': '''$my_ssh_pub''',
+    'sign_pub': '''$my_sign_pub''',
+    'airc_home': '$AIRC_WRITE_DIR'
+})
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.settimeout(30)
+sock.connect(('$peer_host_only', $peer_port))
+sock.sendall((payload + '\n').encode())
+sock.shutdown(socket.SHUT_WR)
+data = b''
+while True:
+    chunk = sock.recv(4096)
+    if not chunk: break
+    data += chunk
+sock.close()
+print(data.decode().strip())
+" 2>&1) || die "Can't reach $peer_host_only:$peer_port. Is the host running 'airc connect'?"
+
+    # Authorize host's SSH pubkey
+    local host_ssh_pub
+    host_ssh_pub=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ssh_pub',''))" 2>/dev/null || true)
+    if [ -n "$host_ssh_pub" ]; then
+      mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+      grep -qF "$host_ssh_pub" "$HOME/.ssh/authorized_keys" 2>/dev/null || {
+        echo "$host_ssh_pub" >> "$HOME/.ssh/authorized_keys"
+        chmod 600 "$HOME/.ssh/authorized_keys"
+      }
+    fi
+
+    # Save host as a peer (with their airc_home so wire paths are correct)
+    local host_airc_home
+    host_airc_home=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('airc_home',''))" 2>/dev/null || true)
+    python3 -c "
+import json, os
+peers_dir = os.path.expanduser('$PEERS_DIR')
+os.makedirs(peers_dir, exist_ok=True)
+record = {
+    'name': '$peer_name',
+    'host': '$ssh_target',
+    'airc_home': '$host_airc_home',
+    'paired': '$(timestamp)'
+}
+with open(os.path.join(peers_dir, '$peer_name.json'), 'w') as f:
+    json.dump(record, f, indent=2)
+" 2>/dev/null || true
+
+    # Persist host_airc_home in own config for quick wire-path lookups
+    python3 -c "
+import json
+c = json.load(open('$CONFIG'))
+c['host_airc_home'] = '$host_airc_home'
+json.dump(c, open('$CONFIG', 'w'), indent=2)
+" 2>/dev/null || true
+
+    # Pick up reminder setting from host
+    local host_reminder
+    host_reminder=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('reminder',300))" 2>/dev/null || echo "300")
+    if [ "$host_reminder" -gt 0 ] 2>/dev/null; then
+      echo "$host_reminder" > "$AIRC_WRITE_DIR/reminder"
+      date +%s > "$AIRC_WRITE_DIR/last_sent"
+    fi
+
+    # Verify SSH works
+    if relay_ssh "$ssh_target" "echo ok" 2>/dev/null; then
+      echo "  Connected to '$peer_name' (SSH verified, reminder: ${host_reminder}s)"
+    else
+      echo "  Connected to '$peer_name' (SSH not verified — messages may need retry)"
+    fi
+
+    # Write PID file so `airc teardown` can find us later.
+    echo $$ > "$AIRC_WRITE_DIR/airc.pid"
+    trap 'rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null' EXIT
+
+    echo "  Monitoring for messages..."
+    monitor
+
+  else
+    # ── HOST MODE ─────────────────────────────────────────────────
+    local name="${target:-}"
+    [ -z "$name" ] && name=$(resolve_name)
+
+    init_identity "$name"
+
+    cat > "$CONFIG" << EOF
+{
+  "name": "$name",
+  "host": "$(get_host)",
+  "created": "$(timestamp)"
+}
+EOF
+
+    local host; host=$(get_host)
+    local user; user=$(whoami)
+    local ssh_pubkey_b64; ssh_pubkey_b64=$(base64 < "$IDENTITY_DIR/ssh_key.pub" | tr -d '\n')
+    # Port override: AIRC_PORT env var, default 7547. Only include
+    # :port in the join string when non-default, keeping strings compact.
+    local host_port="${AIRC_PORT:-7547}"
+    local port_suffix=""
+    [ "$host_port" != "7547" ] && port_suffix=":$host_port"
+
+    # Set reminder interval from host
+    if [ "$reminder_interval" -gt 0 ] 2>/dev/null; then
+      echo "$reminder_interval" > "$AIRC_WRITE_DIR/reminder"
+      date +%s > "$AIRC_WRITE_DIR/last_sent"
+    fi
+
+    echo ""
+    echo "  Hosting as '$name' (reminder: ${reminder_interval}s)"
+    echo ""
+    echo "  On the other machine:"
+    echo "    airc connect ${name}@${user}@${host}${port_suffix}#${ssh_pubkey_b64}"
+    echo ""
+    echo "  Waiting for peers on port $host_port..."
+    # Background: accept peer registrations via TCP (public keys only)
+    while true; do
+      python3 -c "
+import socket, json, sys, os
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(('0.0.0.0', $host_port))
+sock.listen(1)
+conn, addr = sock.accept()
+data = b''
+while True:
+    chunk = conn.recv(4096)
+    if not chunk: break
+    data += chunk
+    if b'\n' in data: break
+
+joiner = json.loads(data.decode().strip())
+
+# Authorize joiner's SSH key
+ssh_dir = os.path.expanduser('~/.ssh')
+os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
+ak = os.path.join(ssh_dir, 'authorized_keys')
+ssh_key = joiner.get('ssh_pub', '')
+if ssh_key:
+    existing = open(ak).read() if os.path.exists(ak) else ''
+    if ssh_key not in existing:
+        with open(ak, 'a') as f:
+            f.write(ssh_key.strip() + '\n')
+        os.chmod(ak, 0o600)
+
+# Save joiner as peer
+peers_dir = os.path.expanduser('$PEERS_DIR')
+os.makedirs(peers_dir, exist_ok=True)
+jname = joiner['name']
+with open(os.path.join(peers_dir, jname + '.json'), 'w') as f:
+    json.dump({
+        'name': jname,
+        'host': joiner.get('host',''),
+        'airc_home': joiner.get('airc_home', ''),
+        'paired': '$(timestamp)'
+    }, f, indent=2)
+if joiner.get('sign_pub'):
+    with open(os.path.join(peers_dir, jname + '.pub'), 'w') as f:
+        f.write(joiner['sign_pub'])
+
+# Send back host's SSH pubkey and airc_home
+host_pub = open(os.path.expanduser('$IDENTITY_DIR/ssh_key.pub')).read().strip()
+response = json.dumps({
+    'ssh_pub': host_pub,
+    'name': '$name',
+    'reminder': $reminder_interval,
+    'airc_home': '$AIRC_WRITE_DIR'
+})
+conn.sendall((response + '\n').encode())
+conn.close()
+sock.close()
+print(f'  Peer joined: {jname}')
+" 2>/dev/null || true
+    done &
+    PAIR_PID=$!
+
+    # Write PID file so `airc teardown` can find us later. Record both us and
+    # the PAIR_PID (the backgrounded TCP-accept loop) so teardown can reap both.
+    echo "$$ $PAIR_PID" > "$AIRC_WRITE_DIR/airc.pid"
+    trap 'rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null; kill $PAIR_PID 2>/dev/null' EXIT
+
+    echo "  Monitoring for messages..."
+    monitor
+    kill $PAIR_PID 2>/dev/null
+  fi
+}
+
+cmd_rename() {
+  local new_name="${1:-}"
+  [ -z "$new_name" ] && die "Usage: airc rename <new-name>"
+  new_name=$(echo "$new_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-24)
+  [ -z "$new_name" ] && die "Invalid name (must be a-z 0-9 -)"
+  [ ! -f "$CONFIG" ] && die "Not initialized — run 'airc connect' first"
+
+  local old_name
+  old_name=$(python3 -c "import json; print(json.load(open('$CONFIG')).get('name',''))" 2>/dev/null)
+  if [ "$old_name" = "$new_name" ]; then
+    echo "  Already named '$new_name'."
+    return
+  fi
+
+  python3 -c "
+import json
+c = json.load(open('$CONFIG'))
+c['name'] = '$new_name'
+json.dump(c, open('$CONFIG', 'w'), indent=2)
+"
+  echo "  Renamed: $old_name → $new_name"
+
+  # Best-effort broadcast to every paired peer across tiers.
+  # Peer consumers recognize '[rename]' prefix and update peer file accordingly.
+  local entry
+  for entry in $(relay_list peers); do
+    case "$entry" in *.json) ;; *) continue ;; esac
+    local peer; peer="${entry%.json}"
+    cmd_send "$peer" "[rename] old=$old_name new=$new_name" >/dev/null 2>&1 || true
+  done
+}
+
+cmd_send() {
+  local peer_name="${1:-}"
+  shift 2>/dev/null || true
+  local msg="$*"
+  [ -z "$peer_name" ] || [ -z "$msg" ] && die "Usage: airc send <peer> <message>"
+  ensure_init
+
+  local my_name ts_val
+  my_name=$(get_name)
+  ts_val=$(timestamp)
+
+  local escaped_msg
+  escaped_msg=$(printf '%s' "$msg" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])")
+
+  local payload="{\"from\":\"$my_name\",\"to\":\"$peer_name\",\"ts\":\"$ts_val\",\"msg\":\"$escaped_msg\"}"
+  local sig; sig=$(sign_message "$payload")
+  local full_msg="{\"from\":\"$my_name\",\"to\":\"$peer_name\",\"ts\":\"$ts_val\",\"msg\":\"$escaped_msg\",\"sig\":\"$sig\"}"
+
+  local host_target
+  host_target=$(get_config_val host_target "")
+
+  if [ -n "$host_target" ]; then
+    local rhome; rhome=$(remote_home)
+    # Always mirror locally FIRST so we have an audit trail regardless of
+    # what the wire does. If send succeeds: local + remote both have it.
+    # If send fails: local has it (user can see it + retry), remote doesn't.
+    # This prevents silent loss where both sides forget a message that
+    # never arrived.
+    echo "$full_msg" >> "$MESSAGES"
+
+    # Attempt the wire. Trust the remote's __APPENDED__ marker — some shells
+    # bubble benign ssh stderr warnings up as non-zero exit, but the append
+    # itself succeeded. We check stdout for the marker, not the exit code.
+    # `|| true` prevents set -e from aborting when ssh itself fails (exit 255
+    # on unreachable host); we want to reach the failure-marker branch below.
+    # Pipe message via stdin so apostrophes (or any shell metachar) in the
+    # payload cannot break the single-quoted remote echo.
+    local out err
+    err=$(mktemp -t airc-send-err.XXXXXX)
+    out=$(printf '%s\n' "$full_msg" | relay_ssh "$host_target" "cat >> $rhome/messages.jsonl && echo __APPENDED__" 2>"$err" || true)
+    if ! echo "$out" | grep -q '^__APPENDED__$'; then
+      # Wire failed. Append a failure marker next to the mirrored line so the
+      # user's `airc logs` shows the message AND the failure reason.
+      local stderr; stderr=$(tr '\n' ' ' < "$err" | sed 's/"/\\"/g' | cut -c1-200)
+      rm -f "$err"
+      local fail_marker; fail_marker=$(printf '{"from":"airc","ts":"%s","msg":"[SEND FAILED to %s] %s"}' \
+        "$(timestamp)" "$peer_name" "${stderr:-no stderr}")
+      echo "$fail_marker" >> "$MESSAGES"
+      die "Failed to deliver to host ($host_target): ${stderr:-no stderr}"
+    fi
+    rm -f "$err"
+  else
+    echo "$full_msg" >> "$MESSAGES"
+  fi
+
+  # Reset reminder — you sent something, clock restarts
+  date +%s > "$AIRC_WRITE_DIR/last_sent" 2>/dev/null
+  rm -f "$AIRC_WRITE_DIR/reminded" 2>/dev/null
+}
+
+cmd_send_file() {
+  local peer_name="${1:-}" filepath="${2:-}"
+  [ -z "$peer_name" ] || [ -z "$filepath" ] && die "Usage: airc send-file <peer> <path>"
+  [ -f "$filepath" ] || die "File not found: $filepath"
+  ensure_init
+
+  local host_target my_name
+  host_target=$(get_config_val host_target "")
+  my_name=$(get_name)
+
+  local filename; filename=$(basename "$filepath")
+  local target_host="$host_target"
+  [ -z "$target_host" ] && target_host="localhost"
+
+  local rhome; rhome=$(remote_home)
+  relay_ssh "$target_host" "mkdir -p $rhome/files/${my_name}" 2>/dev/null
+  # Use the airc identity key for scp — same key relay_ssh uses. Without -i,
+  # scp falls back to system ssh_config (~/.ssh/id_* etc), which doesn't know
+  # about isolated AIRC_HOME identities. Surfaced by m5-test's send-file test.
+  local ssh_key="$IDENTITY_DIR/ssh_key"
+  local scp_out
+  if [ -f "$ssh_key" ]; then
+    scp_out=$(scp -i "$ssh_key" -o StrictHostKeyChecking=accept-new -q "$filepath" "${target_host}:${rhome}/files/${my_name}/${filename}" 2>&1)
+  else
+    scp_out=$(scp -o StrictHostKeyChecking=accept-new -q "$filepath" "${target_host}:${rhome}/files/${my_name}/${filename}" 2>&1)
+  fi
+  if [ $? -ne 0 ]; then
+    die "Failed to transfer $filename: $scp_out"
+  fi
+
+  local filesize; filesize=$(stat -f%z "$filepath" 2>/dev/null || stat -c%s "$filepath" 2>/dev/null || echo "0")
+  cmd_send "$peer_name" "Sent file: $filename ($filesize bytes)"
+  echo "Sent $filename ($filesize bytes)"
+}
+
+cmd_peers() {
+  ensure_init
+  local found=false
+  local entry
+  for entry in $(relay_list peers); do
+    case "$entry" in *.json) ;; *) continue ;; esac
+    local f; f=$(relay_path "peers/$entry")
+    [ -f "$f" ] || continue
+    found=true
+    local name host
+    name=$(python3 -c "import json; print(json.load(open('$f'))['name'])" 2>/dev/null)
+    host=$(python3 -c "import json; print(json.load(open('$f'))['host'])" 2>/dev/null)
+    echo "  $name → $host"
+  done
+  if [ "$found" = false ]; then
+    echo "  No peers yet."
+  fi
+}
+
+cmd_teardown() {
+  # Kill all airc processes for this user and free any ports they hold.
+  # Add --flush to also wipe the state dir (identity, peers, messages) — nuclear.
+  local flush=0
+  [ "${1:-}" = "--flush" ] && flush=1
+
+  local killed=0
+  # Scope-aware via PID file: cmd_connect wrote its PID(s) to $AIRC_WRITE_DIR/airc.pid.
+  # We kill ONLY those PIDs + their descendants. Never touches other scopes.
+  local pidfile="$AIRC_WRITE_DIR/airc.pid"
+  if [ -f "$pidfile" ]; then
+    local main_pids
+    main_pids=$(cat "$pidfile" 2>/dev/null | tr '\n' ' ')
+    if [ -n "$main_pids" ]; then
+      # Collect descendants (Python listener etc) before killing the parent.
+      local all_pids="$main_pids"
+      for pid in $main_pids; do
+        local kids
+        kids=$(pgrep -P "$pid" 2>/dev/null | tr '\n' ' ' || true)
+        [ -n "$kids" ] && all_pids="$all_pids $kids"
+      done
+      all_pids=$(echo "$all_pids" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
+      if [ -n "$all_pids" ]; then
+        echo "  killing scope $AIRC_WRITE_DIR: $(echo $all_pids | tr '\n' ' ')"
+        kill -9 $all_pids 2>/dev/null || true
+        killed=1
+      fi
+    fi
+    rm -f "$pidfile" 2>/dev/null
+  fi
+
+  # Brief pause to let the kernel reparent any airc python listener children
+  # to init (PID 1) after we killed their bash parent. Then reap orphans.
+  [ "$killed" = "1" ] && sleep 0.5
+
+  # Free the TCP port we were listening on. Kill any python socket listener
+  # that's now orphaned (parent=1). Don't touch anything else.
+  local ports="${AIRC_PORT:-7547}"
+  [ "$ports" != "7547" ] && ports="$ports 7547"
+  for port in $ports; do
+    local lpids
+    lpids=$(lsof -tiTCP:$port -sTCP:LISTEN 2>/dev/null || true)
+    for lpid in $lpids; do
+      local parent; parent=$(ps -p "$lpid" -o ppid= 2>/dev/null | tr -d ' ')
+      local cmd; cmd=$(ps -p "$lpid" -o command= 2>/dev/null)
+      # Reap if orphaned AND is a python socket listener.
+      if [ "$parent" = "1" ] && echo "$cmd" | grep -q "socket.SOCK_STREAM"; then
+        echo "  freeing orphaned port $port (pid $lpid)"
+        kill -9 "$lpid" 2>/dev/null || true
+        killed=1
+      fi
+    done
+  done
+
+  if [ "$flush" = "1" ]; then
+    # Wipe current tier's state. Leaves the other tier alone.
+    local dir="$AIRC_WRITE_DIR"
+    if [ -n "$dir" ] && [ -d "$dir" ]; then
+      echo "  flushing state: $dir"
+      rm -rf "$dir"
+    fi
+  fi
+
+  [ "$killed" = "0" ] && echo "  No airc processes running." || echo "  Teardown complete."
+}
+
+cmd_doctor() {
+  # Self-diagnose: run the bundled integration test script.
+  # Install resolves it under AIRC_DIR/test; fall back to a sibling dir
+  # when running from a git checkout.
+  local script="${AIRC_DIR:-$HOME/.airc-src}/test/integration.sh"
+  if [ ! -x "$script" ]; then
+    # Try next to the binary itself (dev checkout case)
+    local self; self="$(realpath "$0" 2>/dev/null || echo "$0")"
+    local here; here="$(dirname "$self")"
+    [ -x "$here/test/integration.sh" ] && script="$here/test/integration.sh"
+  fi
+  [ -x "$script" ] || die "Can't find test script. Expected at \$AIRC_DIR/test/integration.sh"
+  exec bash "$script" "$@"
+}
+
+cmd_logs() {
+  ensure_init
+  local count="${1:-20}"
+  local host_target
+  host_target=$(get_config_val host_target "")
+
+  local raw
+  if [ -n "$host_target" ]; then
+    local rhome; rhome=$(remote_home)
+    raw=$(relay_ssh "$host_target" "tail -${count} $rhome/messages.jsonl 2>/dev/null" 2>/dev/null) || true
+  else
+    raw=$(tail -"$count" "$MESSAGES" 2>/dev/null) || true
+  fi
+  echo "$raw" | python3 -c "
+import sys, json
+for line in sys.stdin:
+    try:
+        m = json.loads(line.strip())
+        print(f\"[{m.get('ts','')}] {m.get('from','?')}: {m.get('msg','')}\")
+    except: pass
+"
+}
+
+# ── Dispatch ────────────────────────────────────────────────────────────
+
+case "${1:-help}" in
+  connect|setup|start|join) shift; cmd_connect "$@" ;;
+  send)      shift; cmd_send "$@" ;;
+  send-file) shift; cmd_send_file "$@" ;;
+  rename)    shift; cmd_rename "$@" ;;
+  reminder)  shift; cmd_reminder "$@" ;;
+  peers)     cmd_peers ;;
+  logs)      shift; cmd_logs "$@" ;;
+  doctor)    shift; cmd_doctor "$@" ;;
+  teardown|stop|flush) shift; cmd_teardown "$@" ;;
+  monitor)   shift; monitor "$@" ;;
+  help|--help|-h)
+    echo "AIRC — Agentic Internet Relay Chat for AI peers"
+    echo ""
+    echo "  airc connect                    Host — wait for peers"
+    echo "  airc connect <name@user@host>   Join a host"
+    echo "  airc send <peer> <message>      Send a message"
+    echo "  airc rename <new-name>          Rename this session (notifies peers)"
+    echo "  airc reminder <seconds>         Nudge if silent (off/pause/300)"
+    echo "  airc peers                      List connected peers"
+    echo "  airc doctor [tabs|scope|all]    Self-test: pairing, send, rename, scope"
+    echo "  airc teardown [--flush]         Kill local airc processes (and wipe state with --flush)"
+    echo ""
+    echo "Identity resolution (highest priority first):"
+    echo "  AIRC_NAME env var > config.json name > cwd basename > hostname"
+    echo "  AIRC_HOME env var overrides state dir (default \$HOME/.airc)"
+    echo "  AIRC_PORT env var overrides host listen port (default 7547)"
+    echo "  AIRC_REMINDER env var overrides reminder interval in seconds (default 300)"
+    echo "  Join string may include :port after host, e.g. name@user@host:7548#key"
+    ;;
+  *) die "Unknown command: $1. Try: relay help" ;;
+esac

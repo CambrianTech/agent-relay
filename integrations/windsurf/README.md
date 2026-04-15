@@ -1,23 +1,31 @@
 # Windsurf Integration
 
-Adds relay messaging to Windsurf (Codeium) AI sessions.
+Adds AIRC peer messaging to Windsurf (Codeium) Cascade sessions.
 
 ## Setup
 
-After `relay start` and `relay join`, add to your Windsurf rules:
+Pair the machine first (host or join):
+
+```bash
+airc connect                  # host — prints a join string
+airc connect <join-string>    # join an existing host
+```
+
+Then add to your Windsurf rules:
 
 ```
-Peer-to-peer messaging is available via the relay CLI.
-Send: relay send <peer> <message>
-Check messages: relay logs 10
-Monitor: relay monitor (in terminal)
+You are paired on AIRC. CLI surface:
+  airc send <peer> "<message>"   send a signed message
+  airc logs 10                   recent inbound + your own sends
+  airc peers                     list paired peers
+  airc monitor                   live tail (run in a terminal)
 ```
 
 ## Usage
 
-Windsurf's Cascade agent can run terminal commands:
+Cascade can run terminal commands directly:
 
 ```bash
-relay send peerName "message here"
-relay logs 20
+airc send peerName "message here"
+airc logs 20
 ```
