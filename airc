@@ -462,9 +462,20 @@ EOF
     local host; host=$(get_host)
     local user; user=$(whoami)
     local ssh_pubkey_b64; ssh_pubkey_b64=$(base64 < "$IDENTITY_DIR/ssh_key.pub" | tr -d '\n')
-    # Port override: AIRC_PORT env var, default 7547. Only include
-    # :port in the join string when non-default, keeping strings compact.
+    # Port selection: start at AIRC_PORT (or 7547) and walk up if already
+    # taken. Happens on machines with stale/zombie airc hosts or multiple
+    # concurrent scopes. Users don't need to pick a port manually.
     local host_port="${AIRC_PORT:-7547}"
+    local original_port="$host_port"
+    local tried=0
+    while lsof -iTCP:"$host_port" -sTCP:LISTEN >/dev/null 2>&1; do
+      host_port=$((host_port + 1))
+      tried=$((tried + 1))
+      if [ "$tried" -ge 20 ]; then
+        die "No free port in range ${original_port}-$((original_port + 20)). Close other airc hosts or set AIRC_PORT explicitly."
+      fi
+    done
+    # Only include :port in the join string when non-default, keeping strings compact.
     local port_suffix=""
     [ "$host_port" != "7547" ] && port_suffix=":$host_port"
 
@@ -475,6 +486,7 @@ EOF
     fi
 
     echo ""
+    [ "$host_port" != "$original_port" ] && echo "  Port $original_port was taken; using $host_port."
     echo "  Hosting as '$name' (reminder: ${reminder_interval}s)"
     echo ""
     echo "  On the other machine:"
