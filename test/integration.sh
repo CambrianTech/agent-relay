@@ -240,7 +240,43 @@ scenario_scope() {
   echo "$visible" | grep -q LOCAL-OVERRIDE && pass "local tier shadows home when name collides" \
                                            || fail "local tier did NOT shadow home peer"
 
-  rm -rf /tmp/airc-it-homefake /tmp/airc-it-project
+  # Regression (commit 0b3b2a0): fresh local tier with no config.json must
+  # auto-derive identity from cwd basename, NOT inherit home tier's config.
+  # Pre-fix, cross-tier relay_path() fell back to home's config.json so the
+  # local scope silently adopted home's identity.
+  local localproj="/tmp/airc-it-mylocalproj"
+  rm -rf "$localproj"
+  mkdir -p "$localproj/.airc"   # opt into local tier, no config/identity yet
+  ( cd "$localproj" && HOME=/tmp/airc-it-homefake AIRC_PORT=7550 \
+      "$AIRC" connect > "$localproj/out.log" 2>&1 ) &
+  local conn_pid=$!
+  local i
+  for i in 1 2 3 4 5; do
+    sleep 1
+    [ -f "$localproj/.airc/config.json" ] && break
+  done
+  kill -9 "$conn_pid" 2>/dev/null
+  for p in $(pgrep -P "$conn_pid" 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
+
+  if [ -f "$localproj/.airc/config.json" ]; then
+    local local_name
+    local_name=$(python3 -c "import json; print(json.load(open('$localproj/.airc/config.json')).get('name',''))" 2>/dev/null)
+    case "$local_name" in
+      airc-it-*) pass "local scope auto-derives name from cwd (got '$local_name')" ;;
+      home-self) fail "local scope inherited home identity — cross-tier leak regressed" ;;
+      *)         fail "local scope got unexpected name: '$local_name'" ;;
+    esac
+  else
+    fail "local scope connect didn't write config.json to local tier"
+  fi
+
+  # Home tier's config.json must be untouched by the local-scope connect.
+  local home_name
+  home_name=$(python3 -c "import json; print(json.load(open('$home/config.json')).get('name',''))" 2>/dev/null)
+  [ "$home_name" = "home-self" ] && pass "home tier config untouched by local-scope connect" \
+                                 || fail "home tier polluted by local-scope connect (name='$home_name')"
+
+  rm -rf /tmp/airc-it-homefake /tmp/airc-it-project /tmp/airc-it-mylocalproj
 }
 
 # ── Entry point ─────────────────────────────────────────────────────────
