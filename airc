@@ -639,10 +639,26 @@ json.dump(c, open('$CONFIG', 'w'), indent=2)
 }
 
 cmd_send() {
-  local peer_name="${1:-}"
-  shift 2>/dev/null || true
-  local msg="$*"
-  [ -z "$peer_name" ] || [ -z "$msg" ] && die "Usage: airc send <peer> <message>"
+  # Chat-room semantics. Default: broadcast to everyone on the host.
+  # Prefix the first arg with '@' to DM a specific peer.
+  #   airc send "hello everyone"        → broadcast (to=all)
+  #   airc send @alice "hey"            → DM to alice
+  local first="${1:-}"
+  [ -z "$first" ] && die "Usage: airc send <message>  or  airc send @peer <message>"
+
+  local peer_name msg
+  case "$first" in
+    @*)
+      peer_name="${first#@}"
+      shift
+      msg="$*"
+      [ -z "$msg" ] && die "Usage: airc send @peer <message>"
+      ;;
+    *)
+      peer_name="all"
+      msg="$*"
+      ;;
+  esac
   ensure_init
 
   local my_name ts_val
