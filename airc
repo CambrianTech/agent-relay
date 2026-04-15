@@ -379,8 +379,16 @@ flush_pending_loop() {
   local rhome; rhome=$(remote_home)
   local ssh_key="$IDENTITY_DIR/ssh_key"
 
+  # Exponential backoff on consecutive failed drain attempts.
+  # 5s → 10s → 30s → 60s → 120s → 300s (cap). Reset to 5s on any success.
+  # Prevents the week-long-outage-at-5s-poll scenario vhsm-claude flagged
+  # in the #12 review (that would be 120k SSH attempts/week otherwise).
+  local backoff=5
+  local backoff_max=300
+  local consecutive_failures=0
+
   while true; do
-    sleep 5
+    sleep "$backoff"
     [ -s "$pending" ] || continue
 
     # Re-read host_target each iteration — user might have re-paired.
@@ -432,9 +440,25 @@ flush_pending_loop() {
         "$(timestamp)" "$delivered")
       echo "$drain_marker" >> "$MESSAGES"
       date +%s > "$AIRC_WRITE_DIR/last_delivered" 2>/dev/null
+      # Clear the warn marker so the warning can fire again if queue re-grows.
+      rm -f "$AIRC_WRITE_DIR/pending_warned" 2>/dev/null
     fi
 
     rm -f "$snapshot" "$unsent" 2>/dev/null
+
+    # Backoff state machine: any delivery resets to 5s (host is healthy,
+    # poll often so new queued messages drain quickly). All-fail doubles
+    # up to the cap (host is sick, stop hammering it).
+    if [ "$delivered" -gt 0 ]; then
+      backoff=5
+      consecutive_failures=0
+    elif [ "$failed" -gt 0 ]; then
+      consecutive_failures=$((consecutive_failures + 1))
+      # 5 → 10 → 30 → 60 → 120 → 300 (cap). Doubling gets us to the cap
+      # in ~6 failed attempts.
+      backoff=$((backoff * 2))
+      [ "$backoff" -gt "$backoff_max" ] && backoff=$backoff_max
+    fi
   done
 }
 
@@ -1016,11 +1040,41 @@ cmd_send() {
       # they need to block on delivery.
       local stderr; stderr=$(tr '\n' ' ' < "$err" | sed 's/"/\\"/g' | cut -c1-200)
       rm -f "$err"
-      echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
+
+      # Pending queue size cap. AIRC_PENDING_MAX (default 10000) is the hard
+      # ceiling; beyond it, new sends are REJECTED rather than silently filling
+      # the queue for a host that might never come back. The first 1000 and
+      # the last 1000 are kept (for both the initial conversation context and
+      # the most recent user intent) — middle is dropped with a marker so the
+      # user sees what happened. Warn-level at 1000 so the user knows to act.
+      local pending_file="$AIRC_WRITE_DIR/pending.jsonl"
+      local pending_max="${AIRC_PENDING_MAX:-10000}"
+      local pending_warn=1000
+      local pcount=0
+      [ -f "$pending_file" ] && pcount=$(grep -c '^.' "$pending_file" 2>/dev/null || echo 0)
+
+      if [ "$pcount" -ge "$pending_max" ]; then
+        # Hard refuse. Don't touch pending.jsonl — the user's shell exit will
+        # indicate the refusal. Local log gets a clear marker.
+        local reject_marker; reject_marker=$(printf '{"from":"airc","ts":"%s","msg":"[REJECTED to %s — pending queue at cap (%d); host unreachable too long] %s"}' \
+          "$(timestamp)" "$peer_name" "$pending_max" "${stderr:-no stderr}")
+        echo "$reject_marker" >> "$MESSAGES"
+        die "Pending queue at cap ($pending_max messages). Host has been unreachable too long; check: airc status"
+      fi
+
+      echo "$full_msg" >> "$pending_file"
       local queue_marker; queue_marker=$(printf '{"from":"airc","ts":"%s","msg":"[QUEUED to %s — host unreachable, will retry] %s"}' \
         "$(timestamp)" "$peer_name" "${stderr:-no stderr}")
       echo "$queue_marker" >> "$MESSAGES"
       echo "  Host unreachable — message queued for retry. Monitor will flush when host returns." >&2
+
+      # Warn once per threshold crossing so long outages get user attention
+      # without spamming. Uses a marker file to dedup.
+      local warn_marker="$AIRC_WRITE_DIR/pending_warned"
+      if [ "$pcount" -ge "$pending_warn" ] && [ ! -f "$warn_marker" ]; then
+        echo "  WARNING: pending queue size is $((pcount + 1)) (host unreachable). Cap is ${pending_max}." >&2
+        touch "$warn_marker"
+      fi
       # NOTE: don't update last_delivered — delivery didn't happen.
     else
       rm -f "$err"

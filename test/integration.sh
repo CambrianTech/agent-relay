@@ -650,6 +650,110 @@ json.dump(c, open(p, 'w'))
   cleanup_all
 }
 
+scenario_queue_limits() {
+  section "queue_limits: backoff, size cap, partial-drain ordering"
+  cleanup_all
+
+  spawn_host /tmp/airc-it-ql-h qlhost 7549 || { fail "qlhost failed to start"; return; }
+  local join; join=$(read_join_string /tmp/airc-it-ql-h)
+  spawn_joiner /tmp/airc-it-ql-j qljoiner "$join" || { fail "qljoiner join failed"; return; }
+  sleep 3
+
+  local real_target
+  real_target=$(python3 -c "import json; print(json.load(open('/tmp/airc-it-ql-j/state/config.json'))['host_target'])")
+
+  # Kill the joiner's monitor (and its flush_pending_loop) before messing
+  # with pending.jsonl — otherwise the flush loop races us and the counts
+  # become nondeterministic. Cap+ordering tests don't need the monitor.
+  AIRC_HOME=/tmp/airc-it-ql-j/state AIRC_PORT=7549 "$AIRC" teardown >/dev/null 2>&1
+  sleep 1
+
+  # Flip to unreachable now that no flush loop is running.
+  python3 -c "
+import json
+p = '/tmp/airc-it-ql-j/state/config.json'
+c = json.load(open(p))
+c['host_target'] = 'nobody@127.0.0.99'
+json.dump(c, open(p, 'w'))
+"
+  echo '{"name":"qlhost","host":"nobody@127.0.0.99","airc_home":"/tmp/nowhere"}' \
+    > /tmp/airc-it-ql-j/state/peers/qlhost.json
+
+  # ── Pending size cap: send 2, expect 3rd to REJECT ───────────────────
+  AIRC_PENDING_MAX=2 AIRC_HOME=/tmp/airc-it-ql-j/state "$AIRC" send @qlhost "m1" >/dev/null 2>&1 || true
+  AIRC_PENDING_MAX=2 AIRC_HOME=/tmp/airc-it-ql-j/state "$AIRC" send @qlhost "m2" >/dev/null 2>&1 || true
+
+  local pending_file=/tmp/airc-it-ql-j/state/pending.jsonl
+  local pcount; pcount=$(grep -c '^.' "$pending_file" 2>/dev/null || echo 0)
+  [ "$pcount" = "2" ] && pass "pending cap: first 2 sends queued (count=$pcount)" \
+                      || fail "pending cap: expected 2 queued, got $pcount"
+
+  local err_file; err_file=$(mktemp -t airc-ql-err.XXXXXX)
+  AIRC_PENDING_MAX=2 AIRC_HOME=/tmp/airc-it-ql-j/state "$AIRC" send @qlhost "m3" >/dev/null 2>"$err_file"
+  local reject_exit=$?
+  [ "$reject_exit" -ne 0 ] && pass "pending cap: 3rd send rejected with non-zero exit ($reject_exit)" \
+                           || fail "pending cap: 3rd send exited 0 — should have been refused"
+  grep -q 'at cap' "$err_file" && pass "pending cap: user sees 'at cap' error" \
+                              || fail "pending cap: no 'at cap' in error (got: $(cat "$err_file"))"
+
+  local pcount2; pcount2=$(grep -c '^.' "$pending_file" 2>/dev/null || echo 0)
+  [ "$pcount2" = "2" ] && pass "pending cap: size stayed at 2 after reject" \
+                       || fail "pending cap: size grew to $pcount2 — reject path wrote to pending"
+
+  rm -f "$err_file"
+
+  # ── Partial-drain ordering (vhsm #3) ─────────────────────────────────
+  # Seed pending with a known 3-message sequence. Still no flush loop running
+  # since we haven't restarted the joiner's monitor.
+  cat > "$pending_file" << 'EOFP'
+{"from":"qljoiner","to":"qlhost","ts":"2026-04-15T20:00:00Z","msg":"ordered-1"}
+{"from":"qljoiner","to":"qlhost","ts":"2026-04-15T20:00:01Z","msg":"ordered-2"}
+{"from":"qljoiner","to":"qlhost","ts":"2026-04-15T20:00:02Z","msg":"ordered-3"}
+EOFP
+  # Clear the warn marker left over from the cap phase so warn semantics are
+  # clean for the next test run
+  rm -f /tmp/airc-it-ql-j/state/pending_warned
+
+  # Restore real host, restart joiner so a fresh flush_pending_loop picks up.
+  # Backoff resets to 5s on new process, so first drain cycle fires in 5s.
+  python3 -c "
+import json
+p = '/tmp/airc-it-ql-j/state/config.json'
+c = json.load(open(p))
+c['host_target'] = '$real_target'
+json.dump(c, open(p, 'w'))
+"
+  ( cd /tmp/airc-it-ql-j && AIRC_HOME=/tmp/airc-it-ql-j/state AIRC_NAME=qljoiner \
+      "$AIRC" connect >> /tmp/airc-it-ql-j/out.log 2>&1 & )
+  sleep 2  # let monitor stabilize
+
+  local i delivered_count
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18; do
+    sleep 1
+    delivered_count=$(grep -cE '"ordered-[123]"' /tmp/airc-it-ql-h/state/messages.jsonl 2>/dev/null || echo 0)
+    [ "$delivered_count" = "3" ] && break
+  done
+
+  [ "$delivered_count" = "3" ] && pass "partial-drain ordering: all 3 messages delivered (${i}s)" \
+                               || fail "partial-drain ordering: only $delivered_count of 3 delivered"
+
+  # Order check — ordered-1 must come before ordered-2 must come before ordered-3
+  local host_msgs; host_msgs=$(grep -oE 'ordered-[0-9]' /tmp/airc-it-ql-h/state/messages.jsonl | tr '\n' ' ')
+  [ "$host_msgs" = "ordered-1 ordered-2 ordered-3 " ] \
+    && pass "partial-drain ordering: sequence preserved on host" \
+    || fail "partial-drain ordering: got '$host_msgs' (expected 'ordered-1 ordered-2 ordered-3 ')"
+
+  # ── Backoff: source-level sanity check ───────────────────────────────
+  # True timing test would take minutes; grep ensures a future refactor can't
+  # silently delete the backoff vars without failing the suite.
+  grep -q 'backoff=5' "$AIRC" && pass "backoff: initial 5s constant present in source" \
+                              || fail "backoff: initial-5s constant missing (removed?)"
+  grep -q 'backoff_max=300' "$AIRC" && pass "backoff: 300s cap constant present in source" \
+                                    || fail "backoff: 300s cap missing (removed?)"
+
+  cleanup_all
+}
+
 scenario_sendpath() {
   section "send-path: unknown @peer fails loudly, broadcast + known @peer work"
   cleanup_all
@@ -702,8 +806,9 @@ case "$MODE" in
   queue)       scenario_queue ;;
   status)      scenario_status ;;
   sendpath)    scenario_sendpath ;;
-  all)         scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_sendpath ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|sendpath|all]"; exit 2 ;;
+  queue_limits) scenario_queue_limits ;;
+  all)         scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_sendpath; scenario_queue_limits ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|sendpath|queue_limits|all]"; exit 2 ;;
 esac
 
 echo
