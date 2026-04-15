@@ -423,11 +423,15 @@ with open(os.path.join(peers_dir, '$peer_name.json'), 'w') as f:
     json.dump(record, f, indent=2)
 " 2>/dev/null || true
 
-    # Persist host_airc_home in own config for quick wire-path lookups
+    # Persist host details in own config so `airc invite` can reconstruct
+    # the join string for onward sharing without a fresh handshake.
     python3 -c "
 import json
 c = json.load(open('$CONFIG'))
 c['host_airc_home'] = '$host_airc_home'
+c['host_name']      = '$peer_name'
+c['host_port']      = ${peer_port:-7547}
+c['host_ssh_pub']   = '''$host_ssh_pub'''
 json.dump(c, open('$CONFIG', 'w'), indent=2)
 " 2>/dev/null || true
 
@@ -487,6 +491,10 @@ EOF
     # Only include :port in the join string when non-default, keeping strings compact.
     local port_suffix=""
     [ "$host_port" != "7547" ] && port_suffix=":$host_port"
+
+    # Persist the actual listen port so `airc invite` can reconstruct the
+    # join string later without needing to parse the startup banner.
+    echo "$host_port" > "$AIRC_WRITE_DIR/host_port"
 
     # Set reminder interval from host
     if [ "$reminder_interval" -gt 0 ] 2>/dev/null; then
@@ -712,6 +720,42 @@ cmd_send_file() {
   echo "Sent $filename ($filesize bytes)"
 }
 
+cmd_invite() {
+  ensure_init
+  local host_target pubkey_b64 join_string
+  host_target=$(get_config_val host_target "")
+
+  if [ -n "$host_target" ]; then
+    # Joiner: reconstruct the HOST's join string from stored pairing info.
+    # Any connected peer can share the same join string — everyone converges
+    # on the same host.
+    local host_name host_port host_ssh_pub
+    host_name=$(get_config_val host_name "")
+    host_port=$(get_config_val host_port 7547)
+    host_ssh_pub=$(get_config_val host_ssh_pub "")
+    if [ -z "$host_name" ] || [ -z "$host_ssh_pub" ]; then
+      die "Host info missing from config. Re-pair with 'airc teardown' then 'airc connect <join-string>'."
+    fi
+    pubkey_b64=$(printf '%s\n' "$host_ssh_pub" | base64 | tr -d '\n')
+    local port_suffix=""
+    [ "$host_port" != "7547" ] && port_suffix=":$host_port"
+    join_string="${host_name}@${host_target}${port_suffix}#${pubkey_b64}"
+  else
+    # Host: build own join string from live state.
+    local my_name user host port
+    my_name=$(get_name)
+    user=$(whoami)
+    host=$(get_host)
+    port=$(cat "$AIRC_WRITE_DIR/host_port" 2>/dev/null || echo 7547)
+    local port_suffix=""
+    [ "$port" != "7547" ] && port_suffix=":$port"
+    pubkey_b64=$(base64 < "$IDENTITY_DIR/ssh_key.pub" | tr -d '\n')
+    join_string="${my_name}@${user}@${host}${port_suffix}#${pubkey_b64}"
+  fi
+
+  echo "$join_string"
+}
+
 cmd_peers() {
   ensure_init
   local found=false
@@ -844,6 +888,7 @@ case "${1:-help}" in
   rename)    shift; cmd_rename "$@" ;;
   reminder)  shift; cmd_reminder "$@" ;;
   peers)     cmd_peers ;;
+  invite|share|join-string) cmd_invite ;;
   logs)      shift; cmd_logs "$@" ;;
   doctor)    shift; cmd_doctor "$@" ;;
   teardown|stop|flush) shift; cmd_teardown "$@" ;;
