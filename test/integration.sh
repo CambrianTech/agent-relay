@@ -584,6 +584,60 @@ json.dump(c, open(p, 'w'))
   cleanup_all
 }
 
+scenario_status() {
+  section "status: liveness view reflects identity, monitor, queue, last-activity"
+  cleanup_all
+
+  spawn_host /tmp/airc-it-s-h shost 7549 || { fail "shost failed to start"; return; }
+  local join; join=$(read_join_string /tmp/airc-it-s-h)
+  spawn_joiner /tmp/airc-it-s-j sjoiner "$join" || { fail "sjoiner join failed"; return; }
+  sleep 2
+
+  # Host status: should show "hosting on port 7549" + monitor running
+  local h_out
+  h_out=$(AIRC_HOME=/tmp/airc-it-s-h/state "$AIRC" status 2>&1)
+  echo "$h_out" | grep -q 'hosting on port 7549' && pass "host status: identity line reads 'hosting on port 7549'" \
+                                                 || fail "host status missing port (got: $h_out)"
+  echo "$h_out" | grep -Eq 'monitor:\s+running' && pass "host status: monitor shown running" \
+                                                || fail "host status: monitor not shown running"
+  echo "$h_out" | grep -q 'queue:.*empty' && pass "host status: queue empty (no pending)" \
+                                          || fail "host status: queue line wrong"
+
+  # Joiner status: should show "joiner of shost"
+  local j_out
+  j_out=$(AIRC_HOME=/tmp/airc-it-s-j/state "$AIRC" status 2>&1)
+  echo "$j_out" | grep -q 'joiner of' && pass "joiner status: identity line shows joiner role" \
+                                      || fail "joiner status missing joiner-of line (got: $j_out)"
+  echo "$j_out" | grep -q ':7549' && pass "joiner status: host port visible" \
+                                  || fail "joiner status missing host port"
+
+  # Send a message then assert status reflects activity
+  as_home /tmp/airc-it-s-j send @shost "status-probe" >/dev/null 2>&1
+  sleep 1
+  local j_out2; j_out2=$(AIRC_HOME=/tmp/airc-it-s-j/state "$AIRC" status 2>&1)
+  echo "$j_out2" | grep -Eq 'last send:\s+[0-9]+s ago' && pass "joiner status: last-send shows elapsed seconds" \
+                                                       || fail "joiner status: last send not updated (got: $(echo "$j_out2" | grep 'last send'))"
+
+  # Pending queue: simulate an outage by flipping host_target and sending, then assert queue size.
+  # Reuse the same fake-target pattern as scenario_queue.
+  python3 -c "
+import json
+p = '/tmp/airc-it-s-j/state/config.json'
+c = json.load(open(p))
+c['_real_host_target'] = c['host_target']
+c['host_target'] = 'nobody@127.0.0.99'
+json.dump(c, open(p, 'w'))
+"
+  echo '{"name":"shost","host":"nobody@127.0.0.99","airc_home":"/tmp/nowhere"}' > /tmp/airc-it-s-j/state/peers/shost.json
+  AIRC_HOME=/tmp/airc-it-s-j/state "$AIRC" send @shost "status-queue-probe" >/dev/null 2>&1 || true
+  local j_out3; j_out3=$(AIRC_HOME=/tmp/airc-it-s-j/state "$AIRC" status 2>&1)
+  echo "$j_out3" | grep -Eq 'queue:\s+[1-9][0-9]* pending' \
+    && pass "joiner status: queue shows 1+ pending after outage send" \
+    || fail "joiner status: queue line didn't reflect pending (got: $(echo "$j_out3" | grep 'queue'))"
+
+  cleanup_all
+}
+
 case "$MODE" in
   tabs)        scenario_tabs  ;;
   scope)       scenario_scope ;;
@@ -592,8 +646,9 @@ case "$MODE" in
   resilience)  scenario_resilience ;;
   reconnect)   scenario_reconnect ;;
   queue)       scenario_queue ;;
-  all)         scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|all]"; exit 2 ;;
+  status)      scenario_status ;;
+  all)         scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|all]"; exit 2 ;;
 esac
 
 echo
