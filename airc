@@ -947,6 +947,31 @@ cmd_send() {
   esac
   ensure_init
 
+  # Unknown-peer guard (#14). Before this, `airc send @typo "hello"` exited 0
+  # and the message went to the shared log with a bogus `to:` label — no error,
+  # no warning, silent loss from the user's POV. Worse for cross-mesh case: two
+  # Claude tabs paired to different hosts exchanging DMs both "succeeded" and
+  # neither arrived. Fail loudly if @peer isn't in the local peers/ dir.
+  # Always allow "all" (broadcast) and "airc" (system-source label).
+  if [ "$peer_name" != "all" ] && [ "$peer_name" != "airc" ]; then
+    # Own-name is implicitly OK (self-DM) — own peer record won't exist on disk.
+    local self_name; self_name=$(get_name)
+    if [ "$peer_name" != "$self_name" ]; then
+      if [ ! -f "$PEERS_DIR/${peer_name}.json" ]; then
+        echo "  Known peers:" >&2
+        if [ -d "$PEERS_DIR" ]; then
+          for f in "$PEERS_DIR"/*.json; do
+            [ -f "$f" ] || continue
+            local pn; pn=$(python3 -c "import json; print(json.load(open('$f'))['name'])" 2>/dev/null || true)
+            [ -n "$pn" ] && echo "    $pn" >&2
+          done
+        fi
+        echo "    all (broadcast to everyone in this mesh)" >&2
+        die "No peer '$peer_name' in this mesh. Check: airc peers"
+      fi
+    fi
+  fi
+
   local my_name ts_val
   my_name=$(get_name)
   ts_val=$(timestamp)

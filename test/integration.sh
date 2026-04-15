@@ -638,6 +638,48 @@ json.dump(c, open(p, 'w'))
   cleanup_all
 }
 
+scenario_sendpath() {
+  section "send-path: unknown @peer fails loudly, broadcast + known @peer work"
+  cleanup_all
+
+  spawn_host /tmp/airc-it-sp-h sphost 7549 || { fail "sphost failed to start"; return; }
+  local join; join=$(read_join_string /tmp/airc-it-sp-h)
+  spawn_joiner /tmp/airc-it-sp-j spjoiner "$join" || { fail "spjoiner join failed"; return; }
+  sleep 3
+
+  # #14: DM to nonexistent peer should fail with non-zero exit AND print the
+  # known-peers list to stderr so the user sees the typo immediately.
+  local out err_file
+  err_file=$(mktemp -t airc-sp-err.XXXXXX)
+  AIRC_HOME=/tmp/airc-it-sp-j/state "$AIRC" send @nobody "should-fail" >/dev/null 2>"$err_file"
+  local sp_exit=$?
+  [ $sp_exit -ne 0 ] && pass "unknown @peer: exit non-zero (was $sp_exit)" \
+                     || fail "unknown @peer: exit 0 — silent loss regression"
+  grep -q 'No peer' "$err_file" && pass "unknown @peer: stderr mentions 'No peer'" \
+                                || fail "unknown @peer: missing user-facing error (stderr: $(cat "$err_file"))"
+  grep -q 'Known peers' "$err_file" && pass "unknown @peer: stderr lists known peers (discoverability)" \
+                                    || fail "unknown @peer: no 'Known peers' list shown"
+
+  # Critically: the bogus message MUST NOT have been written to either
+  # messages.jsonl. Otherwise we'd still have pollution even if the CLI errored.
+  grep -q 'should-fail' /tmp/airc-it-sp-j/state/messages.jsonl 2>/dev/null \
+    && fail "unknown @peer: message STILL mirrored locally — state leak" \
+    || pass "unknown @peer: no message mirrored (no state pollution)"
+
+  # Broadcast still works (no @ prefix).
+  AIRC_HOME=/tmp/airc-it-sp-j/state "$AIRC" send "broadcast-works" >/dev/null 2>&1 \
+    && pass "broadcast (no @ prefix) still exits 0" \
+    || fail "broadcast send broken by unknown-peer guard"
+
+  # Known @peer still works.
+  AIRC_HOME=/tmp/airc-it-sp-j/state "$AIRC" send @sphost "known-peer-works" >/dev/null 2>&1 \
+    && pass "known @peer still exits 0" \
+    || fail "known @peer send broken by unknown-peer guard"
+
+  rm -f "$err_file"
+  cleanup_all
+}
+
 case "$MODE" in
   tabs)        scenario_tabs  ;;
   scope)       scenario_scope ;;
@@ -647,8 +689,9 @@ case "$MODE" in
   reconnect)   scenario_reconnect ;;
   queue)       scenario_queue ;;
   status)      scenario_status ;;
-  all)         scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|all]"; exit 2 ;;
+  sendpath)    scenario_sendpath ;;
+  all)         scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_sendpath ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|sendpath|all]"; exit 2 ;;
 esac
 
 echo
