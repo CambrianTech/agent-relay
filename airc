@@ -172,100 +172,109 @@ init_identity() {
 }
 
 monitor() {
-  local my_name host_target last
+  local my_name host_target
   my_name=$(get_name)
   host_target=$(get_config_val host_target "")
 
-  # Persist the last-seen line offset so monitor doesn't replay history
-  # on every (re)start. On first-ever run, skip to end-of-file — history
-  # is available via `airc logs`.
-  local offset_file="$AIRC_WRITE_DIR/monitor_offset"
-  if [ -f "$offset_file" ]; then
-    last=$(cat "$offset_file" 2>/dev/null || echo 0)
+  # Background reminder timer — fires once if there's no SEND for the
+  # interval, resets when the user sends (cmd_send removes the marker).
+  ( reminder_timer_loop ) &
+  local reminder_pid=$!
+  trap "kill $reminder_pid 2>/dev/null" EXIT INT TERM
+
+  # Stream inbound via `tail -n 0 -F` (inotify/kqueue) — no polling, every
+  # new line surfaces the moment it's written. Joiner tails the host over
+  # a persistent SSH; host tails its local log.
+  if [ -n "$host_target" ]; then
+    local rhome; rhome=$(remote_home)
+    local ssh_key="$IDENTITY_DIR/ssh_key"
+    local ssh_opts="-i $ssh_key -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=3"
+    ssh $ssh_opts "$host_target" "tail -n 0 -F $rhome/messages.jsonl 2>/dev/null" | monitor_formatter "$my_name"
   else
-    if [ -n "$host_target" ]; then
-      local rhome; rhome=$(remote_home)
-      last=$(relay_ssh "$host_target" "wc -l < $rhome/messages.jsonl 2>/dev/null || echo 0" 2>/dev/null | tr -d ' ' || echo 0)
-    else
-      last=$(wc -l < "$MESSAGES" 2>/dev/null | tr -d ' ' || echo 0)
-    fi
-    echo "$last" > "$offset_file"
+    tail -n 0 -F "$MESSAGES" 2>/dev/null | monitor_formatter "$my_name"
   fi
-  [ -z "$last" ] && last=0
-  local last_activity; last_activity=$(date +%s)
+}
 
+# Read JSONL from stdin, emit one human-readable line per message.
+# Handles [rename] protocol by updating peer records on disk.
+monitor_formatter() {
+  local my_name="$1"
+  PEERS_DIR="$PEERS_DIR" MY_NAME="$my_name" python3 -u -c '
+import sys, json, os, re, time
+
+peers_dir = os.environ.get("PEERS_DIR", "")
+my_name = os.environ.get("MY_NAME", "")
+RENAME_RE = re.compile(r"^\[rename\] old=([a-z0-9-]+) new=([a-z0-9-]+)")
+
+def handle_rename(msg, ts):
+    m = RENAME_RE.match(msg)
+    if not m: return False
+    old, new = m.group(1), m.group(2)
+    old_json = os.path.join(peers_dir, f"{old}.json")
+    new_json = os.path.join(peers_dir, f"{new}.json")
+    if os.path.isfile(old_json):
+        try:
+            os.rename(old_json, new_json)
+            d = json.load(open(new_json))
+            d["name"] = new
+            json.dump(d, open(new_json, "w"), indent=2)
+        except Exception:
+            pass
+        old_pub = os.path.join(peers_dir, f"{old}.pub")
+        new_pub = os.path.join(peers_dir, f"{new}.pub")
+        if os.path.isfile(old_pub):
+            try: os.rename(old_pub, new_pub)
+            except Exception: pass
+        print(f"[{ts}] airc: Peer renamed: {old} -> {new}", flush=True)
+        return True
+    return False
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        m = json.loads(line)
+    except Exception:
+        continue
+    ts = m.get("ts", "")
+    fr = m.get("from", "?")
+    to = m.get("to", "")
+    msg = m.get("msg", "")
+    if handle_rename(msg, ts):
+        continue
+    # Every message gets surfaced — including own sends (so Claude Code
+    # notifications confirm your outbound hit the wire).
+    if fr == my_name:
+        target = to if to else "all"
+        label = f"me->{target}"
+    elif fr in ("airc", "sys"):
+        label = "airc"
+    else:
+        label = fr
+    print(f"[{ts}] {label}: {msg}", flush=True)
+'
+}
+
+# Separate loop, runs in background during monitor.
+# Periodically checks whether the user has been silent longer than their
+# configured interval. Fires ONCE per silence period (via reminded marker).
+reminder_timer_loop() {
   while true; do
-    local lines=""
-    if [ -n "$host_target" ]; then
-      local rhome; rhome=$(remote_home)
-      lines=$(relay_ssh "$host_target" "tail -n +$((last+1)) $rhome/messages.jsonl 2>/dev/null" 2>/dev/null) || true
-    else
-      lines=$(tail -n +$((last+1)) "$MESSAGES" 2>/dev/null) || true
-    fi
-    if [ -n "$lines" ]; then
-      local count; count=$(echo "$lines" | wc -l)
-      last=$((last + count))
-      echo "$last" > "$offset_file"
-      last_activity=$(date +%s)
-      echo "$lines" | while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        local msg_from msg_ts msg_text
-        msg_from=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('from',''))" 2>/dev/null || true)
-        [ "$msg_from" = "$my_name" ] && continue
-        # Handle [rename] protocol messages: update peer record and surface as info
-        msg_ts=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('ts',''))" 2>/dev/null || true)
-        msg_text=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('msg',''))" 2>/dev/null || true)
-        if [[ "$msg_text" == "[rename] old="* ]]; then
-          local old_n new_n old_json old_pub new_json new_pub
-          old_n=$(echo "$msg_text" | sed -n 's/.*old=\([a-z0-9-]*\).*/\1/p')
-          new_n=$(echo "$msg_text" | sed -n 's/.*new=\([a-z0-9-]*\).*/\1/p')
-          old_json=$(relay_path "peers/$old_n.json")
-          if [ -n "$old_n" ] && [ -n "$new_n" ] && [ -f "$old_json" ]; then
-            # Rename within the same tier that owns the peer record
-            new_json="$(dirname "$old_json")/$new_n.json"
-            old_pub="$(dirname "$old_json")/$old_n.pub"
-            new_pub="$(dirname "$old_json")/$new_n.pub"
-            mv "$old_json" "$new_json" 2>/dev/null || true
-            [ -f "$old_pub" ] && mv "$old_pub" "$new_pub" 2>/dev/null
-            # Update the name field inside the JSON so `airc peers` reflects it
-            python3 -c "
-import json
-try:
-    d = json.load(open('$new_json'))
-    d['name'] = '$new_n'
-    json.dump(d, open('$new_json', 'w'), indent=2)
-except: pass
-" 2>/dev/null || true
-            printf '[%s] airc: Peer renamed: %s -> %s\n' "$(timestamp)" "$old_n" "$new_n"
-            continue
-          fi
-        fi
-        # Human-readable event for Claude Code Monitor notifications.
-        # The JSON-structured line is already persisted in messages.jsonl;
-        # stdout is for humans (and the Monitor tool surfacing this as a
-        # notification in Claude Code — needs a real summary, not raw JSON).
-        printf '[%s] %s: %s\n' "${msg_ts:-?}" "${msg_from:-?}" "${msg_text:-$line}"
-      done
-    fi
-
-    # Reminder: nudge once if no SEND for interval, don't repeat until next send
+    sleep 5
     local reminder_file="$AIRC_WRITE_DIR/reminder"
     local reminded_file="$AIRC_WRITE_DIR/reminded"
-    if [ -f "$reminder_file" ] && [ ! -f "$reminded_file" ]; then
-      local interval; interval=$(cat "$reminder_file" 2>/dev/null)
-      if [ -n "$interval" ] && [ "$interval" -gt 0 ] 2>/dev/null; then
-        local now; now=$(date +%s)
-        local last_sent=0
-        [ -f "$AIRC_WRITE_DIR/last_sent" ] && last_sent=$(cat "$AIRC_WRITE_DIR/last_sent" 2>/dev/null)
-        local silent=$(( now - last_sent ))
-        if [ "$last_sent" -gt 0 ] && [ "$silent" -ge "$interval" ]; then
-          printf '[%s] airc: Reminder: you haven'"'"'t sent a message in %ss. '"'"'airc reminder off'"'"' to disable.\n' "$(timestamp)" "$silent"
-          touch "$reminded_file"  # Don't fire again until next send
-        fi
-      fi
+    [ -f "$reminder_file" ] || continue
+    [ -f "$reminded_file" ] && continue
+    local interval; interval=$(cat "$reminder_file" 2>/dev/null)
+    [ -n "$interval" ] && [ "$interval" -gt 0 ] 2>/dev/null || continue
+    local now; now=$(date +%s)
+    local last_sent=0
+    [ -f "$AIRC_WRITE_DIR/last_sent" ] && last_sent=$(cat "$AIRC_WRITE_DIR/last_sent" 2>/dev/null)
+    local silent=$(( now - last_sent ))
+    if [ "$last_sent" -gt 0 ] && [ "$silent" -ge "$interval" ]; then
+      printf '[%s] airc: Reminder: you haven'"'"'t sent a message in %ss. '"'"'airc reminder off'"'"' to disable.\n' "$(timestamp)" "$silent"
+      touch "$reminded_file"
     fi
-
-    sleep 5
   done
 }
 
