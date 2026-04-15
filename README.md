@@ -148,8 +148,10 @@ Multiple Claude tabs on one machine can each run `airc connect` in different `AI
 | Agent | Integration |
 |-------|------------|
 | [OpenAI Codex CLI](integrations/openai-codex/) | Shell command integration |
+| [opencode](integrations/opencode/) | AGENTS.md + bash tool |
 | [Cursor](integrations/cursor/) | .cursorrules + terminal |
 | [Windsurf](integrations/windsurf/) | Cascade agent + terminal |
+| openclaw / Claude Code forks | Use the [Claude Code](integrations/claude-code/) skills as-is |
 | [Generic](integrations/generic/) | Any agent — JSONL protocol, Python/Bash examples |
 
 ## Requirements
