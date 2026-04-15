@@ -63,7 +63,18 @@ MESSAGES="$AIRC_WRITE_DIR/messages.jsonl"
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 ensure_init() {
-  [ -f "$CONFIG" ] || die "Not initialized. Run: airc connect"
+  [ -f "$CONFIG" ] && return 0
+  # Give a useful error: the usual case is a fresh install, but if a partial
+  # local tier was opted into without finishing `airc connect`, the user can
+  # easily loop on "Not initialized" without knowing why the home identity
+  # stopped appearing. Point at the stale local tier explicitly.
+  if [ -n "$LOCAL_TIER" ] && [ -f "$HOME_TIER/config.json" ]; then
+    die "Not initialized in local scope ($LOCAL_TIER) even though home scope has an identity.
+    This cwd has a .airc/ dir, which opts into a project-local scope. Either:
+    - finish setting it up:   airc connect  (or 'airc connect <join-string>')
+    - drop the local scope:   rm -rf $LOCAL_TIER   (falls back to $HOME_TIER)"
+  fi
+  die "Not initialized. Run: airc connect"
 }
 
 get_name() {
