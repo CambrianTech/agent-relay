@@ -120,7 +120,7 @@ scenario_tabs() {
   # work, the peer record + airc_home field were written correctly.
   sleep 3
   local send_err
-  send_err=$(as_home /tmp/airc-it-j send alpha "m1-from-beta" 2>&1 >/dev/null)
+  send_err=$(as_home /tmp/airc-it-j send @alpha "m1-from-beta" 2>&1 >/dev/null)
   if [ $? -eq 0 ]; then
     pass "beta → alpha send returns OK"
   else
@@ -162,7 +162,7 @@ json.dump(c, open('$fake_home/state/config.json', 'w'))
 "
   # Write a fake peer so resolution doesn't fail
   echo '{"name":"ghost","host":"nobody@127.0.0.99","airc_home":"/tmp/nowhere"}' > "$fake_home/state/peers/ghost.json"
-  AIRC_HOME=$fake_home/state "$AIRC" send ghost "this-should-fail-but-still-mirror" >/dev/null 2>&1
+  AIRC_HOME=$fake_home/state "$AIRC" send @ghost "this-should-fail-but-still-mirror" >/dev/null 2>&1
   # Exit should be non-zero (we die()), but local must have both the attempt AND the failure marker
   grep -q '"this-should-fail-but-still-mirror"' "$fake_home/state/messages.jsonl" 2>/dev/null && \
     pass "failed send: outbound still mirrored to local log (no silent loss)" \
@@ -172,7 +172,7 @@ json.dump(c, open('$fake_home/state/config.json', 'w'))
     || fail "failed send: no [SEND FAILED] marker — user can't tell it failed"
   rm -rf "$fake_home"
 
-  send_err=$(as_home /tmp/airc-it-h send beta "m2-from-alpha" 2>&1 >/dev/null)
+  send_err=$(as_home /tmp/airc-it-h send @beta "m2-from-alpha" 2>&1 >/dev/null)
   if [ $? -eq 0 ]; then
     pass "alpha → beta send returns OK"
   else

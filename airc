@@ -634,7 +634,7 @@ json.dump(c, open('$CONFIG', 'w'), indent=2)
   for entry in $(relay_list peers); do
     case "$entry" in *.json) ;; *) continue ;; esac
     local peer; peer="${entry%.json}"
-    cmd_send "$peer" "[rename] old=$old_name new=$new_name" >/dev/null 2>&1 || true
+    cmd_send "@$peer" "[rename] old=$old_name new=$new_name" >/dev/null 2>&1 || true
   done
 }
 
