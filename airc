@@ -232,6 +232,16 @@ scope_dir = os.path.dirname(peers_dir)
 config_path = os.path.join(scope_dir, "config.json")
 local_log = os.path.join(scope_dir, "messages.jsonl")
 offset_path = os.path.join(scope_dir, "monitor_offset")
+# Only mirror inbound to the local log when we are a joiner (tailing a
+# REMOTE host over SSH). For a HOST, the local log IS the source the
+# tail reads from — mirroring creates an infinite feedback loop: tail
+# sees new line, we append that line back to the file, tail sees it
+# again, append, etc. Scary fast log pollution.
+is_joiner = False
+try:
+    is_joiner = bool(json.load(open(config_path)).get("host_target", ""))
+except Exception:
+    pass
 
 def current_name():
     """Read identity name fresh from config.json each time so a rename
@@ -326,15 +336,16 @@ for line in sys.stdin:
     # the name fresh so a mid-session rename takes effect immediately.
     if fr == current_name():
         continue
-    # Mirror every inbound event to the local messages.jsonl. Lets a
-    # legacy monitor (or any tool) tail $AIRC_HOME/messages.jsonl as
-    # the single source of truth, regardless of whether the events
-    # originated locally or arrived via SSH tail from the host.
-    try:
-        with open(local_log, "a") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
+    # Mirror inbound to the local messages.jsonl ONLY when we are a
+    # joiner (tailing the remote host). For a host the local log is
+    # already the source of truth; mirroring would create a feedback
+    # loop (tail sees line -> we append line -> tail sees it again).
+    if is_joiner:
+        try:
+            with open(local_log, "a") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
     if handle_rename(msg, ts):
         continue
     if fr in ("airc", "sys"):
