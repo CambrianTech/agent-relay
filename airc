@@ -212,11 +212,22 @@ monitor() {
 # Handles [rename] protocol by updating peer records on disk.
 monitor_formatter() {
   local my_name="$1"
-  PEERS_DIR="$PEERS_DIR" MY_NAME="$my_name" python3 -u -c '
+  PEERS_DIR="$PEERS_DIR" python3 -u -c '
 import sys, json, os, re, time
 
 peers_dir = os.environ.get("PEERS_DIR", "")
-my_name = os.environ.get("MY_NAME", "")
+config_path = os.path.join(os.path.dirname(peers_dir), "config.json")
+
+def current_name():
+    """Read identity name fresh from config.json each time so a rename
+    during the session immediately takes effect for own-send filtering.
+    Without this the monitor keeps the name it saw at startup and fails
+    to filter our own outbound rename markers, which can trigger the
+    host-fallback chain-repair against other peers sharing our host."""
+    try:
+        return json.load(open(config_path)).get("name", "")
+    except Exception:
+        return ""
 # Marker may carry an optional `host=user@ip` so receivers can find the
 # sender via stable host field even when name-keyed lookup would miss
 # (chain break from a dropped rename, stale records, etc).
@@ -283,10 +294,9 @@ for line in sys.stdin:
     fr = m.get("from", "?")
     to = m.get("to", "")
     msg = m.get("msg", "")
-    # Filter own sends early, including our own [rename] markers. Our own
-    # rename does not apply to our peer records, and the host-fallback
-    # match would wrongly touch another peer sharing our host.
-    if fr == my_name:
+    # Filter own sends early, including our own [rename] markers. Read
+    # the name fresh so a mid-session rename takes effect immediately.
+    if fr == current_name():
         continue
     if handle_rename(msg, ts):
         continue
