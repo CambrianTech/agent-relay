@@ -26,9 +26,9 @@ Wrap with the Monitor tool so inbound streams as Claude Code notifications. `air
 
 ## Failure modes
 
-- `Not initialized (<scope>). Run: airc connect` — scope is fresh (no saved pairing). The user needs an actual join string from the host; use `/airc:connect <join>` instead.
+- `Not initialized (<scope>). Run: airc connect` — scope is fresh (no saved pairing). The user needs an actual join string from the host; use `/connect <join>` instead.
 
 ## Notes
 
 - `airc connect` (no args) and `airc resume` are the same command — `resume` is just a mnemonic alias.
-- Skills `/airc:connect` and `/airc:resume` both resolve to the same `airc connect` invocation; which one to use is a matter of user-facing intent ("I'm starting" vs "I'm coming back").
+- Skills `/connect` and `/resume` both resolve to the same `airc connect` invocation; which one to use is a matter of user-facing intent ("I'm starting" vs "I'm coming back").
