@@ -63,12 +63,12 @@ Done. Both machines are paired, monitoring, and talking. SSH keys exchange autom
 
 **Machine A:**
 ```
-/airc:connect
+/connect
 ```
 
 **Machine B — paste the join string:**
 ```
-/airc:connect <join-string>
+/connect <join-string>
 ```
 
 Skills install, pair, and stream inbound as notifications. No Monitor incantation, no env-var juggling, no polling loop.
@@ -150,20 +150,20 @@ airc doctor [tabs|scope|reminder|teardown]  # integration suite
 
 | Skill | Command | What it does |
 |-------|---------|-------------|
-| [connect](skills/connect/) | `/airc:connect [join]` | Host, join, or resume prior pairing |
-| [resume](skills/resume/) | `/airc:resume` | Explicit resume (alias for connect with no args) |
-| [send](skills/send/) | `/airc:send [@peer] <msg>` | Broadcast by default; `@peer` prefix for DM |
-| [send-file](skills/send-file/) | `/airc:send-file <peer> <path>` | File over scp with airc identity |
-| [rename](skills/rename/) | `/airc:rename <new>` | Rename, broadcasts `[rename]` to paired peers |
-| [peers](skills/peers/) | `/airc:peers [--prune]` | List peers; prune cleans stale records |
-| [logs](skills/logs/) | `/airc:logs [N]` | Tail the shared log |
-| [invite](skills/invite/) | `/airc:invite` | Print current mesh's join string |
-| [reminder](skills/reminder/) | `/airc:reminder <seconds\|off\|pause>` | Control silence-nudge |
-| [disconnect](skills/disconnect/) | `/airc:disconnect` | Leave mesh, keep identity |
-| [teardown](skills/teardown/) | `/airc:teardown [--flush]` | Kill scope's processes |
-| [update](skills/update/) | `/airc:update` | Pull latest + refresh skills |
-| [version](skills/version/) | `/airc:version` | Short sha + install path |
-| [doctor](skills/doctor/) | `/airc:doctor [scenario]` | Integration suite |
+| [connect](skills/connect/) | `/connect [join]` | Host, join, or resume prior pairing |
+| [resume](skills/resume/) | `/resume` | Explicit resume (alias for connect with no args) |
+| [send](skills/send/) | `/send [@peer] <msg>` | Broadcast by default; `@peer` prefix for DM |
+| [send-file](skills/send-file/) | `/send-file <peer> <path>` | File over scp with airc identity |
+| [rename](skills/rename/) | `/rename <new>` | Rename, broadcasts `[rename]` to paired peers |
+| [peers](skills/peers/) | `/peers [--prune]` | List peers; prune cleans stale records |
+| [logs](skills/logs/) | `/logs [N]` | Tail the shared log |
+| [invite](skills/invite/) | `/invite` | Print current mesh's join string |
+| [reminder](skills/reminder/) | `/reminder <seconds\|off\|pause>` | Control silence-nudge |
+| [disconnect](skills/disconnect/) | `/disconnect` | Leave mesh, keep identity |
+| [teardown](skills/teardown/) | `/teardown [--flush]` | Kill scope's processes |
+| [update](skills/update/) | `/update` | Pull latest + refresh skills |
+| [version](skills/version/) | `/version` | Short sha + install path |
+| [doctor](skills/doctor/) | `/doctor [scenario]` | Integration suite |
 
 ## Identity & State
 

@@ -28,7 +28,7 @@ Monitor(persistent=true, command="airc connect")
 ```
 
 The relay prints a join string. Show it to the user:
-> "Share this with the other peer: `/airc:connect <the join string>`"
+> "Share this with the other peer: `/connect <the join string>`"
 
 **Join mode** (one arg, the join string the host gave you):
 ```
@@ -56,10 +56,10 @@ Show them the platform-appropriate command. Don't make them research it.
 ## 4. After connecting
 
 - `airc peers` — list paired peers you can send to
-- `/airc:send <peer> <message>` — send to a specific peer
-- `/airc:rename <new-name>` — rename this identity; paired peers auto-update
-- `/airc:teardown` — kill this scope's airc processes (keep state for resume; add `--flush` to wipe)
-- `/airc:doctor` — self-diagnose: runs the integration suite
+- `/send <peer> <message>` — send to a specific peer
+- `/rename <new-name>` — rename this identity; paired peers auto-update
+- `/teardown` — kill this scope's airc processes (keep state for resume; add `--flush` to wipe)
+- `/doctor` — self-diagnose: runs the integration suite
 
 ## 5. Troubleshooting
 

@@ -40,6 +40,6 @@ On failure: exit 1 with `ERROR: Failed to deliver to host (…)`. Common causes:
 
 ## Notes
 
-- `airc connect` must be running in a Monitor somewhere so inbound streams as notifications. If not connected, run `/airc:connect` first.
+- `airc connect` must be running in a Monitor somewhere so inbound streams as notifications. If not connected, run `/connect` first.
 - Every paired agent tails the host's log, so a `to=all` broadcast lands for everyone.
 - A `to=@peer` DM is still written to the same shared log — the `to` field is just a human-readable label, not a routing directive. Nothing hides inside airc.

@@ -13,8 +13,8 @@ curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh |
 Then in any Claude Code tab:
 
 ```
-/airc:connect                  # host — Claude prints the join string
-/airc:connect <join-string>    # join an existing host
+/connect                  # host — Claude prints the join string
+/connect <join-string>    # join an existing host
 ```
 
 The skill spawns `airc connect` under the Monitor tool, so inbound messages surface as notifications inside Claude Code automatically.
@@ -23,12 +23,12 @@ The skill spawns `airc connect` under the Monitor tool, so inbound messages surf
 
 | Skill | What it does |
 |-------|-------------|
-| `/airc:connect [join]` | Host or join — pairs and starts streaming inbound |
-| `/airc:send <peer> <msg>` | Send (peer is required); mirror-first, `[SEND FAILED]` marker on wire failure |
-| `/airc:rename <new>` | Rename this identity, broadcasts `[rename]` to paired peers |
-| `/airc:send-file <peer> <path>` | Send a file via scp under the airc identity key |
-| `/airc:doctor [scenario]` | Run the integration suite (33 assertions) |
-| `/airc:teardown [--flush]` | Kill THIS scope's airc processes (and wipe state with --flush) |
+| `/connect [join]` | Host or join — pairs and starts streaming inbound |
+| `/send <peer> <msg>` | Send (peer is required); mirror-first, `[SEND FAILED]` marker on wire failure |
+| `/rename <new>` | Rename this identity, broadcasts `[rename]` to paired peers |
+| `/send-file <peer> <path>` | Send a file via scp under the airc identity key |
+| `/doctor [scenario]` | Run the integration suite (33 assertions) |
+| `/teardown [--flush]` | Kill THIS scope's airc processes (and wipe state with --flush) |
 
 ## Manual Bash usage
 
@@ -41,4 +41,4 @@ Bash("airc send peerName 'message here'")
 
 ## Scope isolation
 
-Multiple Claude tabs can each run `/airc:connect` in different `AIRC_HOME` dirs — `airc teardown` only kills its own scope's processes. Validated by `/airc:doctor`.
+Multiple Claude tabs can each run `/connect` in different `AIRC_HOME` dirs — `airc teardown` only kills its own scope's processes. Validated by `/doctor`.

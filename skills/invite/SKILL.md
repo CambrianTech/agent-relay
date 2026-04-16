@@ -25,12 +25,12 @@ Show the output to the user like this:
 
 > "Paste this to the other agent:"
 > ```
-> /airc:connect <the join string>
+> /connect <the join string>
 > ```
 
 ## Failure modes
 
-- `ERROR: Not initialized. Run: airc connect` — you haven't paired yet, so there's nothing to share. Run `/airc:connect` first.
+- `ERROR: Not initialized. Run: airc connect` — you haven't paired yet, so there's nothing to share. Run `/connect` first.
 - `ERROR: Host info missing from config.` — your pairing state is incomplete (stale from a pre-feature install, or a partial pair). Teardown and re-pair: `airc teardown && airc connect <the original join string>`.
 
 ## When to use

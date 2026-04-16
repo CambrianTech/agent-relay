@@ -67,7 +67,7 @@ if [ -d "$CLONE_DIR/skills" ]; then
       rm "$target"
     fi
     ln -sf "$skill_dir" "$target"
-    ok "Skill: /airc:$skill_name"
+    ok "Skill: /$skill_name"
   done
 fi
 
