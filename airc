@@ -184,7 +184,13 @@ monitor() {
   # back. No-op on host-mode (empty host_target short-circuits).
   ( flush_pending_loop ) &
   local flush_pid=$!
-  trap "kill $reminder_pid $flush_pid 2>/dev/null" EXIT INT TERM
+  # DO NOT replace the outer trap set by cmd_connect — it owns the airc.pid
+  # cleanup + whole-subtree child reap (SSH tail, Python formatter, this
+  # function's background loops). Overriding it here leaked those children
+  # as orphans whenever the outer shell exited, which kept the SSH session
+  # open on the remote and left inbound streaming visible-but-untracked.
+  # The `pgrep -P $$` in cmd_connect's trap picks up reminder_pid/flush_pid
+  # transitively, so nothing extra is needed here.
 
   # Stream inbound via `tail -n 0 -F` (inotify/kqueue) — no polling, every
   # new line surfaces the moment it's written. Joiner tails the host over
