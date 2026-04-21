@@ -215,8 +215,41 @@ monitor() {
     local rhome; rhome=$(remote_home)
     local ssh_key="$IDENTITY_DIR/ssh_key"
     local ssh_opts="-i $ssh_key -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=3"
+    # Connection-health state surfaced to `airc status`. An attempt that
+    # returns in <MIN_HOLD_SEC is an immediate failure (connection refused,
+    # key reject, wrong port) — distinct from a held channel that later
+    # dropped. After FAST_FAIL_THRESHOLD consecutive fast failures we're
+    # zombie-looping against a dead host; status should say so instead of
+    # reporting "monitor: running" indefinitely.
+    local conn_state_file="$AIRC_WRITE_DIR/connection_state"
+    local MIN_HOLD_SEC=10
+    local FAST_FAIL_THRESHOLD=5
+    local fast_fail_count=0
+    local fast_fail_since=""
+    rm -f "$conn_state_file" 2>/dev/null
     while true; do
+      local attempt_start; attempt_start=$(date +%s)
       ssh $ssh_opts "$host_target" "tail $tail_pos -F $rhome/messages.jsonl 2>/dev/null" 2>/dev/null | monitor_formatter "$my_name" || true
+      local attempt_end; attempt_end=$(date +%s)
+      local held=$(( attempt_end - attempt_start ))
+      if [ "$held" -lt "$MIN_HOLD_SEC" ]; then
+        fast_fail_count=$(( fast_fail_count + 1 ))
+        [ -z "$fast_fail_since" ] && fast_fail_since="$attempt_start"
+        if [ "$fast_fail_count" -ge "$FAST_FAIL_THRESHOLD" ]; then
+          # Atomic write so `airc status` never reads a half-written line.
+          printf 'unreachable since=%s host=%s consecutive_failures=%d\n' \
+            "$fast_fail_since" "$host_target" "$fast_fail_count" \
+            > "$conn_state_file.tmp" 2>/dev/null \
+            && mv "$conn_state_file.tmp" "$conn_state_file" 2>/dev/null
+        fi
+      else
+        # Channel was up for at least MIN_HOLD_SEC; reset the counter
+        # whether it dropped later or not. This is the recovery signal —
+        # any sustained SSH session means the host is reachable now.
+        fast_fail_count=0
+        fast_fail_since=""
+        rm -f "$conn_state_file" 2>/dev/null
+      fi
       # Subsequent reconnects use the now-persisted offset updated by the formatter.
       tail_pos="-n +$(($(cat "$offset_file" 2>/dev/null || echo 0) + 1))"
       sleep 3
@@ -1418,11 +1451,39 @@ cmd_status() {
     done
     if [ -n "$any_alive" ]; then
       monitor_state="running (PID $any_alive)"
+      # Even with the monitor subprocess alive, the SSH reconnect loop
+      # may be zombie-looping against a dead host. Read the
+      # connection_state file written by cmd_monitor's reconnect loop;
+      # when present it carries the consecutive-failure count + since-ts.
+      local conn_state_file="$AIRC_WRITE_DIR/connection_state"
+      if [ -f "$conn_state_file" ]; then
+        local line; line=$(cat "$conn_state_file" 2>/dev/null || true)
+        if echo "$line" | grep -q '^unreachable '; then
+          local since_ts; since_ts=$(echo "$line" | sed -n 's/.*since=\([0-9]*\).*/\1/p')
+          local fails;    fails=$(echo "$line" | sed -n 's/.*consecutive_failures=\([0-9]*\).*/\1/p')
+          local ago=""
+          if [ -n "$since_ts" ] && [ "$since_ts" -gt 0 ] 2>/dev/null; then
+            local now_ts; now_ts=$(date +%s)
+            ago=" since $(( now_ts - since_ts ))s ago"
+          fi
+          monitor_state="reconnect-looping (${fails:-?} consecutive ssh failures${ago})"
+        fi
+      fi
     else
       monitor_state="stale pidfile (PIDs $pids_raw not alive — run 'airc connect' to self-heal)"
     fi
   fi
   echo "  monitor:     $monitor_state"
+  # When reconnect-looping, point the user at the fix. Reading the same
+  # state file again is fine — the `[ -f ]` check is cheap and the file
+  # only exists on the failure path.
+  if [ -n "$host_target" ] && [ -f "$AIRC_WRITE_DIR/connection_state" ]; then
+    local line; line=$(cat "$AIRC_WRITE_DIR/connection_state" 2>/dev/null || true)
+    if echo "$line" | grep -q '^unreachable '; then
+      echo "               host ${host_target}:${host_port} unreachable"
+      echo "               try: airc teardown --flush && airc connect <fresh-join-string>"
+    fi
+  fi
 
   # Host reachability. Only meaningful for joiners; opt-in via --probe to keep
   # `airc status` fast by default (SSH connect can hang for seconds).
