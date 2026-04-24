@@ -613,6 +613,11 @@ cmd_connect() {
   local use_gist=1   # default ON; runtime probe later checks gh availability
   local room_name="general"
   local use_room=1   # default ON — auto-#general substrate
+  # Declared at function scope so set -u doesn't bite when JOIN MODE runs
+  # without a prior gist parser (inline-invite path skips the parser
+  # entirely; resolved_room_name only gets a value when we resolved a
+  # kind:room gist envelope).
+  local resolved_room_name=""
   local positional=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -902,7 +907,6 @@ cmd_connect() {
       # field, dispatch on `kind`. Otherwise, treat raw_content as the
       # legacy raw-invite-string format (backward compat).
       local resolved=""
-      local resolved_room_name=""   # set when kind==room, used to remember which room we joined
       if command -v jq >/dev/null 2>&1; then
         local airc_ver kind
         airc_ver=$(printf '%s' "$raw_content" | jq -r '.airc // empty' 2>/dev/null)
@@ -1192,6 +1196,18 @@ EOF
       echo "  On the other machine:"
       echo "    airc connect $_invite_long"
       _printed_long=1
+    fi
+
+    # Record room name + print substrate banner BEFORE the gist push
+    # attempt so cmd_part / status / diagnostics know the channel name
+    # even when the gist push is skipped (--no-gist) or fails (gh
+    # missing/unauthed). The gist_id is recorded only when an actual
+    # gist is created (see below). The "Hosting #<name>" banner is the
+    # signal both humans and the integration test use to confirm
+    # substrate framing took effect — emit unconditionally for room mode.
+    if [ "$use_room" = "1" ]; then
+      echo "$room_name" > "$AIRC_WRITE_DIR/room_name"
+      echo "  Hosting #${room_name} (gh-account substrate)."
     fi
 
     # ── Gist transport (--gist flag, issue #37) ────────────────────
@@ -1701,14 +1717,19 @@ cmd_rooms() {
 }
 
 # ── cmd_part: leave the current room ──────────────────────────────────
-# Issue #39. Two paths:
-#   - Host: delete the room gist (graceful channel teardown — joiners
-#     will see SSH die and re-host on next reconnect, IRC-style "ircd
-#     restart"). Then teardown local processes.
-#   - Joiner: just teardown local processes. Host's gist stays open for
-#     other joiners (we're one of N).
+# Issue #39. Two paths, distinguished by config.json's host_target:
+#   - Host (no host_target): delete the room gist if we created one, then
+#     teardown. Joiners watching us will see SSH die — IRC's "ircd
+#     restart" — and the next reconnect re-elects a new host.
+#   - Joiner (host_target set): just teardown local processes; host's
+#     gist stays open for other joiners (we're one of N).
 # Either way, local config + identity + peer records persist (use
 # `airc teardown --flush` for nuclear).
+#
+# Detection note: we use config.json::host_target as the host-vs-joiner
+# signal, NOT presence of room_gist_id. The gist file may be absent for
+# a legitimate host case (`--no-gist`, or gh push failed) — falling back
+# to "you're a joiner" would be wrong.
 cmd_part() {
   ensure_init
 
@@ -1717,22 +1738,29 @@ cmd_part() {
   local room_name="(unnamed)"
   [ -f "$room_name_file" ] && room_name=$(cat "$room_name_file")
 
-  if [ -f "$gist_id_file" ]; then
-    # We were the host. Delete the room gist so future `airc connect`
-    # in this gh account doesn't keep trying to pair against a dead
-    # SSH endpoint.
-    local gid; gid=$(cat "$gist_id_file")
-    if command -v gh >/dev/null 2>&1; then
-      echo "  Host of #${room_name} parting — deleting room gist ${gid}..."
-      gh gist delete "$gid" --yes 2>/dev/null \
-        && echo "  ✓ Room gist deleted." \
-        || echo "  ⚠  Couldn't delete gist ${gid} (already gone? gh auth?). Continuing teardown."
+  local host_target; host_target=$(get_config_val host_target "")
+
+  if [ -z "$host_target" ]; then
+    # ── Host path ──
+    if [ -f "$gist_id_file" ]; then
+      local gid; gid=$(cat "$gist_id_file")
+      if command -v gh >/dev/null 2>&1; then
+        echo "  Host of #${room_name} parting — deleting room gist ${gid}..."
+        gh gist delete "$gid" --yes 2>/dev/null \
+          && echo "  ✓ Room gist deleted." \
+          || echo "  ⚠  Couldn't delete gist ${gid} (already gone? gh auth?). Continuing teardown."
+      else
+        echo "  ⚠  gh CLI not available — can't delete room gist ${gid} automatically."
+        echo "     Delete it manually:  gh gist delete ${gid} --yes"
+      fi
     else
-      echo "  ⚠  gh CLI not available — can't delete room gist ${gid} automatically."
-      echo "     Delete it manually:  gh gist delete ${gid} --yes"
+      # Host but no gist (--no-gist or gh-push failed). Nothing to delete
+      # in the gh namespace; just clean local state.
+      echo "  Host of #${room_name} parting (no gist was published; nothing to clean up in gh)."
     fi
     rm -f "$gist_id_file" "$room_name_file"
   else
+    # ── Joiner path ──
     echo "  Joiner of #${room_name} parting — host's gist stays open for others."
     rm -f "$room_name_file"
   fi
@@ -2271,7 +2299,7 @@ case "${1:-help}" in
   update|upgrade|pull) cmd_update ;;
   logs)      shift; cmd_logs "$@" ;;
   status)    shift; cmd_status "$@" ;;
-  doctor)    shift; cmd_doctor "$@" ;;
+  doctor|tests|test) shift; cmd_doctor "$@" ;;
   teardown|stop|flush) shift; cmd_teardown "$@" ;;
   disconnect|leave|unbind) cmd_disconnect ;;
   monitor)   shift; monitor "$@" ;;
