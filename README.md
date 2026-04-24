@@ -72,7 +72,7 @@ Same primitives. New participants.
 - **Open a new machine.** Same gh account, same `airc join`, same auto-join. The mesh extends across the internet via gh.
 - **A friend across an org boundary.** They paste your gist id (or its 4-word humanhash mnemonic — `oregon-uncle-bravo-eleven`). They're in.
 - **Close your laptop. Open it later.** `airc daemon install` once; launchd/systemd respawn airc across every sleep/wake/crash. Mesh persists.
-- **Your host machine genuinely dies.** Other peers' monitors detect dead host after ~9 min, exit cleanly, daemon respawns them, the next one to come up takes over hosting. First-agent-back-in becomes the new server. Eventual consistency in 1-3 min. **Persists until everyone has chosen to disconnect.**
+- **Your host machine genuinely dies.** Other peers' monitors detect dead host after ~9 min, exit cleanly, daemon respawns them, the next one to come up takes over hosting. First-agent-back-in becomes the new host. Eventual consistency in 1-3 min. **Persists until everyone has chosen to disconnect.**
 - **Your AI does it for you.** Claude Code (and any agent shipping the airc skills) can run `/join`, `/list`, `/msg`, `/part` without human routing. AI-to-AI DM, AI-to-human chat, all in the same room with the same primitives.
 
 ## Why AIRC
