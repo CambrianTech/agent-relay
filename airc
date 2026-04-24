@@ -557,6 +557,18 @@ cmd_reminder() {
 # ── Commands ────────────────────────────────────────────────────────────
 
 cmd_connect() {
+  # Flag parsing — accepted: --gist | -gist (host pushes invite to a
+  # secret gist + prints the short ID alongside the long form). Issue #37.
+  local use_gist=0
+  local positional=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --gist|-gist) use_gist=1; shift ;;
+      *) positional+=("$1"); shift ;;
+    esac
+  done
+  set -- "${positional[@]+"${positional[@]}"}"
+
   local target="${1:-}"
   local reminder_interval="${AIRC_REMINDER:-${2:-300}}"  # env > positional > 5min default
 
@@ -708,6 +720,91 @@ cmd_connect() {
       ' EXIT INT TERM
       monitor
       return
+    fi
+  fi
+
+  # ── Gist transport (issue #37) ───────────────────────────────────
+  # If the target doesn't look like an inline invite (no `@`), treat it
+  # as a gist ID and fetch the real invite content from there. Three
+  # accepted shapes:
+  #   gist:<id>   — explicit, unambiguous
+  #   <id>        — bare alphanumeric, auto-detected as a gist ID
+  #   foo@bar@... — today's inline invite, untouched
+  #
+  # The whole point: an inline invite is ~200 chars of base64 that gets
+  # mangled by chat clients (line wraps, auto-linkification, smart
+  # quotes). A 7-char gist ID survives every transport. Host pushes the
+  # invite to a secret gist (see `airc connect --gist` below); receiver
+  # pastes just the ID. Also: gist works as a coordination layer for
+  # cross-tailnet pairing where the two peers don't share a VPN
+  # initially.
+  #
+  # Gist payload format: a versioned JSON envelope (see host-side push
+  # below for shape). Receiver parses `{ airc: 1, kind: "invite", invite: "..." }`
+  # and dispatches on `kind`. Today only `kind: "invite"` is recognized.
+  # Future kinds (cross-tailnet relay, bootstrap, webrtc-mesh) slot in
+  # by adding a case below — old peers reject the kind cleanly with a
+  # version-mismatch message instead of silently misinterpreting bytes.
+  #
+  # Backward compat: a gist that contains a raw invite string (no JSON
+  # envelope) still parses — we fall through to the raw-string branch
+  # if JSON parse fails. Lets pre-envelope gists keep working.
+  if [ -n "$target" ] && ! echo "$target" | grep -q '@'; then
+    local gist_id="${target#gist:}"
+    # Gist IDs are hex strings, typically 20-32 chars but accept any
+    # plausible length so future GH ID schemes don't break us.
+    if echo "$gist_id" | grep -qE '^[a-zA-Z0-9]{6,40}$'; then
+      echo "  Resolving gist $gist_id ..."
+      local raw_content=""
+      if command -v gh >/dev/null 2>&1; then
+        raw_content=$(gh gist view "$gist_id" --raw 2>/dev/null)
+      fi
+      if [ -z "$raw_content" ] && command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        # Anonymous GitHub API call. Works for public + secret gists
+        # given the ID. No auth needed for read.
+        raw_content=$(curl -fsSL "https://api.github.com/gists/$gist_id" 2>/dev/null \
+                      | jq -r '.files | to_entries[0].value.content // empty' 2>/dev/null)
+      fi
+      if [ -z "$raw_content" ]; then
+        die "Failed to fetch gist '$gist_id'. Check the ID, network, and (if private) 'gh auth login'."
+      fi
+
+      # Try parse as airc JSON envelope first. If it parses + has airc
+      # field, dispatch on `kind`. Otherwise, treat raw_content as the
+      # legacy raw-invite-string format (backward compat).
+      local resolved=""
+      if command -v jq >/dev/null 2>&1; then
+        local airc_ver kind
+        airc_ver=$(printf '%s' "$raw_content" | jq -r '.airc // empty' 2>/dev/null)
+        kind=$(printf '%s' "$raw_content" | jq -r '.kind // empty' 2>/dev/null)
+        if [ -n "$airc_ver" ]; then
+          # Versioned envelope — dispatch on kind.
+          case "$kind" in
+            invite)
+              resolved=$(printf '%s' "$raw_content" | jq -r '.invite // empty' 2>/dev/null \
+                         | head -1 | tr -d '\r\n ')
+              ;;
+            "")
+              die "Gist has airc envelope (v$airc_ver) but no 'kind' field — malformed."
+              ;;
+            *)
+              # Unknown kind — fail loud. Old peers should reject
+              # rather than silently misinterpret a future kind.
+              die "Gist uses unknown kind '$kind' (airc v$airc_ver). This receiver only supports 'invite'. Update airc: 'airc update'."
+              ;;
+          esac
+        fi
+      fi
+      if [ -z "$resolved" ]; then
+        # Legacy raw-string format OR jq missing — take the first
+        # non-empty line that looks like an invite.
+        resolved=$(printf '%s' "$raw_content" | grep -E '@.*@' | head -1 | tr -d '\r\n ')
+      fi
+      if [ -z "$resolved" ] || ! echo "$resolved" | grep -q '@'; then
+        die "Failed to resolve gist '$gist_id' to a valid invite (got: $(printf '%s' "$raw_content" | head -c 80)...)"
+      fi
+      echo "  ✓ Resolved invite from gist."
+      target="$resolved"
     fi
   fi
 
@@ -934,8 +1031,81 @@ EOF
     [ "$host_port" != "$original_port" ] && echo "  Port $original_port was taken; using $host_port."
     echo "  Hosting as '$name' (reminder: ${reminder_interval}s)"
     echo ""
-    echo "  On the other machine:"
-    echo "    airc connect ${name}@${user}@${host}${port_suffix}#${ssh_pubkey_b64}"
+    local _invite_long="${name}@${user}@${host}${port_suffix}#${ssh_pubkey_b64}"
+    # When --gist is requested AND succeeds, the short gist ID becomes
+    # the primary handoff and the long invite is demoted to a footnote
+    # ("if the gist channel fails, fall back to this"). When --gist is
+    # NOT requested, we print the long invite as the primary as today.
+    local _printed_long=0
+    if [ "$use_gist" != "1" ]; then
+      echo "  On the other machine:"
+      echo "    airc connect $_invite_long"
+      _printed_long=1
+    fi
+
+    # ── Gist transport (--gist flag, issue #37) ────────────────────
+    # Push the long invite to a secret gist + print the short ID. The
+    # short ID is robust across chat clients (sms, slack, paste-buffer
+    # cross-machine) where the 200-char base64 invite gets line-wrapped
+    # or auto-formatted into uselessness. It's also a coordination
+    # layer for cross-tailnet pairing where the two peers don't share
+    # a VPN initially — the gist is the shared rendezvous point.
+    #
+    # Payload is a versioned JSON envelope, NOT a raw invite string.
+    # Same shape as image file headers: magic + version + typed body.
+    # `airc: 1` marks it as ours; `kind` is the dispatch field for
+    # future connection kinds (cross-tailnet relay, bootstrap-tailnet,
+    # webrtc-mesh, etc.). Receiver reads kind → calls the matching
+    # handler; new kinds added without breaking old peers because the
+    # version field gates compat.
+    if [ "$use_gist" = "1" ]; then
+      if ! command -v gh >/dev/null 2>&1; then
+        echo ""
+        echo "  ⚠  --gist requested but 'gh' CLI not installed."
+        echo "     Install: https://cli.github.com  (or: brew install gh)"
+        echo "     Skipping gist push; long invite above is the only handoff."
+      else
+        local _gist_tmp; _gist_tmp=$(mktemp -t airc-invite.XXXXXX)
+        # Versioned JSON envelope — see above. `kind: "invite"` is
+        # today's flow; future kinds slot in without renaming `invite`
+        # or breaking parsers that only know v1.
+        local _now; _now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        cat > "$_gist_tmp" <<JSON
+{
+  "airc": 1,
+  "kind": "invite",
+  "invite": "$_invite_long",
+  "host": {
+    "name": "$name",
+    "user": "$user",
+    "address": "$host",
+    "port": $host_port
+  },
+  "created": "$_now"
+}
+JSON
+        # Secret gist: URL-only-discoverable, not searchable. The gist
+        # ID itself is the secret. Same threat model as the long invite:
+        # whoever holds the string can pair.
+        local _gist_url; _gist_url=$(gh gist create -d "airc invite for $name (delete after pair)" "$_gist_tmp" 2>/dev/null | tail -1)
+        rm -f "$_gist_tmp"
+        if [ -n "$_gist_url" ]; then
+          local _gist_id="${_gist_url##*/}"
+          echo "  On the other machine:"
+          echo "    airc connect $_gist_id"
+          echo ""
+          echo "  (Gist: $_gist_url — secret, single-use; delete after pairing.)"
+          echo "  (Long invite if gist channel fails: airc connect $_invite_long)"
+        else
+          echo ""
+          echo "  ⚠  Gist push failed. Check 'gh auth status'."
+          if [ "$_printed_long" = "0" ]; then
+            echo "  Falling back to long invite:"
+            echo "    airc connect $_invite_long"
+          fi
+        fi
+      fi
+    fi
     echo ""
     echo "  Waiting for peers on port $host_port..."
     # Background: accept peer registrations via TCP (public keys only)
