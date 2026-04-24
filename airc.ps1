@@ -154,18 +154,112 @@ function Resolve-AircName {
     return $name
 }
 
+# -- Tailscale helpers (parity with bash: resolve_tailscale_bin,
+#    is_peer_offline_in_tailnet, advise_tailscale_if_down) -----------------
+# Extracted into named helpers so Get-AircHost, Invoke-Send, and
+# Invoke-Connect all resolve the binary the same way. Mirrors canary's
+# 4d41dab / 64b604d / 0f8d8a7.
+function Resolve-TailscaleBin {
+    # Priority:
+    #   1. tailscale / tailscale.exe on PATH
+    #   2. C:\Program Files\Tailscale\tailscale.exe
+    #   3. C:\Program Files (x86)\Tailscale\tailscale.exe
+    foreach ($name in @('tailscale', 'tailscale.exe')) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+    }
+    foreach ($p in @(
+        'C:\Program Files\Tailscale\tailscale.exe',
+        'C:\Program Files (x86)\Tailscale\tailscale.exe'
+    )) {
+        if (Test-Path $p) { return $p }
+    }
+    return $null
+}
+
+function Test-CgnatIp {
+    # Tailscale CGNAT range 100.64.0.0/10 = 100.64.0.0 .. 100.127.255.255
+    param([string]$Ip)
+    if (-not $Ip) { return $false }
+    if ($Ip -match '^100\.(\d+)\.') {
+        $second = [int]$matches[1]
+        return ($second -ge 64 -and $second -le 127)
+    }
+    return $false
+}
+
+function Test-PeerOfflineInTailnet {
+    # Return $true only when we can CONFIRM the peer at the given IP is
+    # offline according to our local tailscale status. Used as a fast-path
+    # gate in Invoke-Send so a known-offline peer skips the 10s SSH
+    # ConnectTimeout and queues straight away. Mirrors bash
+    # is_peer_offline_in_tailnet (commit 64b604d).
+    param([string]$TargetHost)
+    if (-not $TargetHost) { return $false }
+    if (-not (Test-CgnatIp -Ip $TargetHost)) { return $false }
+    $ts = Resolve-TailscaleBin
+    if (-not $ts) { return $false }
+    $out = & $ts status 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $out) { return $false }
+    foreach ($line in $out) {
+        # Plain-text: <IP>  <hostname>  <owner>  <os>  <state...>
+        # When a peer is offline the state column has the literal word
+        # "offline" on the same line. Match IP at column 1 + word offline.
+        $cols = ($line -split '\s+', 2)
+        if ($cols.Count -ge 1 -and $cols[0] -eq $TargetHost -and $line -match '\boffline\b') {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Advise-TailscaleIfDown {
+    # When a saved pairing points at a Tailscale CGNAT address and the
+    # local Tailscale daemon is NOT running, cmd_connect would silently
+    # hang on SSH ConnectTimeout. Instead, print fail-loud instructions
+    # and return $true so the caller exits. Mirrors bash
+    # advise_tailscale_if_down (commit 0f8d8a7).
+    # Returns $true when the caller should ABORT (we printed guidance).
+    # Returns $false when it is safe to proceed (non-CGNAT, env override,
+    # or tailnet already up).
+    param([string]$TargetHost)
+    if ($env:AIRC_NO_TAILSCALE -eq '1') { return $false }
+    if (-not $TargetHost) { return $false }
+    if (-not (Test-CgnatIp -Ip $TargetHost)) { return $false }
+
+    $ts = Resolve-TailscaleBin
+    if ($ts) {
+        & $ts status 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) { return $false }   # daemon up, proceed
+    }
+
+    Write-Host ''
+    Write-Host "X airc: can't reach Tailscale-routed host $TargetHost -- Tailscale appears down on this machine."
+    Write-Host ''
+    if (-not $ts) {
+        Write-Host '   Tailscale is not installed. airc needs it only for cross-machine mesh.'
+        Write-Host '   Install:'
+        Write-Host '     winget install --id tailscale.tailscale'
+        Write-Host '     (or https://tailscale.com/download/windows)'
+        Write-Host ''
+        Write-Host '   After install, bring the tailnet up and re-run airc join.'
+        return $true
+    }
+    Write-Host '   Tailscale CLI is installed but the daemon is not running. Start it:'
+    Write-Host '     (Windows) Click the Tailscale tray icon to start the app.'
+    Write-Host '               Or from an elevated PowerShell:  Start-Service Tailscale'
+    Write-Host ''
+    return $true
+}
+
 # -- get_host: tailscale IP > LAN IP > hostname -------------------------
-# We use the same priority order as bash: tailscale first (works on the
-# whole tailnet), LAN IP next (no Tailscale required for same-LAN), then
+# Priority order matches bash: tailscale IP first (works across the whole
+# tailnet), LAN IP next (no Tailscale required for same-LAN mesh), then
 # hostname as last resort. AIRC_NO_TAILSCALE=1 forces past tailscale.
 function Get-AircHost {
     $tsBin = $null
     if ($env:AIRC_NO_TAILSCALE -ne '1') {
-        $cmd = Get-Command tailscale -ErrorAction SilentlyContinue
-        if ($cmd) { $tsBin = $cmd.Source }
-        elseif (Test-Path 'C:\Program Files\Tailscale\tailscale.exe') {
-            $tsBin = 'C:\Program Files\Tailscale\tailscale.exe'
-        }
+        $tsBin = Resolve-TailscaleBin
     }
     if ($tsBin) {
         try {
@@ -1293,6 +1387,27 @@ function Invoke-Send {
         # Mirror locally FIRST so we always have an audit trail.
         Add-Content -Path $MESSAGES -Value $fullMsg
 
+        # Fast-path: if the target is a Tailscale CGNAT IP and tailscale
+        # status already reports the peer as offline, skip the 10s SSH
+        # ConnectTimeout and queue immediately with a cleaner marker.
+        # flush_pending_loop + monitor reconnect handle the drain when
+        # the peer wakes. Mirrors bash 64b604d.
+        if (Test-PeerOfflineInTailnet -TargetHost $hostTarget) {
+            $pending = Join-Path $AIRC_WRITE_DIR 'pending.jsonl'
+            Add-Content -Path $pending -Value $fullMsg
+            $marker = ([ordered]@{
+                from = 'airc'
+                ts   = (Get-Timestamp)
+                msg  = "[QUEUED to $peerName - peer offline in tailnet, auto-delivers on wake]"
+            } | ConvertTo-Json -Compress)
+            Add-Content -Path $MESSAGES -Value $marker
+            # Reset reminder state (we did send something, just queued)
+            $now = [int][double]::Parse(((Get-Date).ToUniversalTime() - [DateTime]'1970-01-01').TotalSeconds)
+            Set-Content -Path (Join-Path $AIRC_WRITE_DIR 'last_sent') -Value $now -NoNewline
+            Remove-Item (Join-Path $AIRC_WRITE_DIR 'reminded') -Force -ErrorAction SilentlyContinue
+            return
+        }
+
         $sshKey = Join-Path $IDENTITY_DIR 'ssh_key'
         $remoteCmd = "cat >> $rhome/messages.jsonl && echo __APPENDED__"
         $errFile = [System.IO.Path]::GetTempFileName()
@@ -1544,6 +1659,15 @@ function Invoke-Connect {
         if ($priorHost) {
             $priorName = Get-ConfigVal -Key 'host_name' -Default (Get-Name)
             Write-Host "  Resuming as joiner of '$priorName' ($priorHost)..."
+            # Tailscale-down fail-loud: if the saved host is CGNAT and
+            # Tailscale is not running locally, SSH would hang 5s on the
+            # ConnectTimeout then the monitor retry loop would spin forever
+            # with no actionable signal. Advise-TailscaleIfDown prints
+            # platform-specific start instructions and returns $true when
+            # the caller should abort. Mirrors bash 0f8d8a7.
+            if (Advise-TailscaleIfDown -TargetHost $priorHost) {
+                Die 'Re-run airc join after starting Tailscale.'
+            }
             # Auth probe before committing to monitor loop
             $sshKey = Join-Path $IDENTITY_DIR 'ssh_key'
             $probeErr = [System.IO.Path]::GetTempFileName()
