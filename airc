@@ -251,10 +251,60 @@ monitor() {
     local rhome; rhome=$(remote_home)
     local ssh_key="$IDENTITY_DIR/ssh_key"
     local ssh_opts="-i $ssh_key -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=3"
+    # Monitor escalation (no-claude-left-behind): count consecutive watchdog
+    # timeouts (formatter exit code 2 = no inbound in WATCHDOG_SEC). After
+    # ESCALATE_AFTER consecutive timeouts, the host is genuinely gone (sleep
+    # without launchd, hard crash, network gone). Exit airc connect with a
+    # distinct code so the platform daemon (launchd / systemd Restart=always)
+    # respawns us into a fresh airc connect — that re-enters the resume path
+    # which now self-heals (PR #46): probes the dead host, gives up, deletes
+    # the stale gist, takes over as the new host of #general. First peer to
+    # complete this loop wins; the others discover the new gist on their next
+    # cold-restart and join as peers. Standard distributed-systems leader
+    # election with optimistic conflict resolution via gh-create.
+    local consecutive_timeouts=0
+    local ESCALATE_AFTER=3   # ~9 minutes of dead host (3 × WATCHDOG_SEC=180)
     while true; do
+      local cycle_start; cycle_start=$(date +%s)
       ssh $ssh_opts "$host_target" "tail $tail_pos -F $rhome/messages.jsonl 2>/dev/null" 2>/dev/null | monitor_formatter "$my_name" || true
+      local fmt_exit="${PIPESTATUS[1]:-0}"
+      local cycle_end; cycle_end=$(date +%s)
+      local cycle_lifetime=$((cycle_end - cycle_start))
+
       # Subsequent reconnects use the now-persisted offset updated by the formatter.
       tail_pos="-n +$(($(cat "$offset_file" 2>/dev/null || echo 0) + 1))"
+
+      # Count this iteration as a "timeout" if formatter exited with code 2
+      # (its watchdog-no-inbound exit) OR the whole pipe died in under 30s
+      # (likely SSH refused / connection reset — host gone). Anything else,
+      # especially a long-lived formatter that received traffic, resets.
+      if [ "$fmt_exit" = "2" ] || [ "$cycle_lifetime" -lt 30 ]; then
+        consecutive_timeouts=$((consecutive_timeouts + 1))
+      else
+        consecutive_timeouts=0
+      fi
+
+      if [ "$consecutive_timeouts" -ge "$ESCALATE_AFTER" ]; then
+        # Only escalate if we have a saved room name (the substrate use case);
+        # legacy 1:1 invite scopes shouldn't auto-promote — they were
+        # explicit pairings, not channel members.
+        local saved_room=""
+        [ -f "$AIRC_WRITE_DIR/room_name" ] && saved_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
+        if [ -n "$saved_room" ]; then
+          echo ""
+          echo "  ⚠  Host of #${saved_room} dead for $consecutive_timeouts consecutive cycles" >&2
+          echo "  ⚠  Exiting airc connect — daemon restart will trigger self-heal" >&2
+          echo "  ⚠  (per the no-claude-left-behind protocol — first agent back becomes new host)" >&2
+          # Specific exit code so postmortems can tell why we left. launchd /
+          # systemd Restart=always treat any non-zero exit as restart-worthy.
+          exit 99
+        else
+          # Legacy 1:1 invite scope. Don't auto-promote, but warn the user
+          # so they can manually re-pair if the host is genuinely gone.
+          echo "  ⚠  $consecutive_timeouts consecutive watchdog timeouts on legacy invite scope — host may be down" >&2
+          consecutive_timeouts=0   # reset to avoid spamming
+        fi
+      fi
       sleep 3
     done
   else
