@@ -776,11 +776,14 @@ function Start-AircMonitor {
             $env:PEERS_DIR     = $PEERS_DIR
             $env:AIRC_CMD_PATH = (Resolve-Path (Join-Path $PSScriptRoot 'airc.cmd') -ErrorAction SilentlyContinue).Path
             if (-not $env:AIRC_CMD_PATH) { $env:AIRC_CMD_PATH = 'airc.cmd' }
-            & ssh '-i', $sshKey,
-                '-o','StrictHostKeyChecking=accept-new',
-                '-o','ServerAliveInterval=30',
-                '-o','ServerAliveCountMax=3',
-                $hostTarget, $remoteCmd 2>$null `
+            $tailArgs = @(
+                '-i', $sshKey,
+                '-o', 'StrictHostKeyChecking=accept-new',
+                '-o', 'ServerAliveInterval=30',
+                '-o', 'ServerAliveCountMax=3',
+                $hostTarget, $remoteCmd
+            )
+            & ssh @tailArgs 2>$null `
               | & $script:PythonResolved.Bin @($script:PythonResolved.Args + @('-u', '-c', $script:MonitorFormatterPython))
             $fmtExit = $LASTEXITCODE
             $cycleLifetime = ((Get-Date) - $cycleStart).TotalSeconds
@@ -789,11 +792,14 @@ function Start-AircMonitor {
                 # Probe-before-spam: distinguish healthy idle from dead host.
                 $probeOk = $false
                 try {
-                    $r = & ssh '-i', $sshKey,
-                        '-o','StrictHostKeyChecking=accept-new',
-                        '-o','ConnectTimeout=5',
-                        '-o','BatchMode=yes',
-                        $hostTarget, 'true' 2>$null
+                    $probeArgs = @(
+                        '-i', $sshKey,
+                        '-o', 'StrictHostKeyChecking=accept-new',
+                        '-o', 'ConnectTimeout=5',
+                        '-o', 'BatchMode=yes',
+                        $hostTarget, 'true'
+                    )
+                    $r = & ssh @probeArgs 2>$null
                     if ($LASTEXITCODE -eq 0) { $probeOk = $true }
                 } catch { }
                 if ($probeOk) {
@@ -1223,11 +1229,14 @@ function Invoke-Status {
     # Host reachability (only joiners; opt-in via --probe)
     if ($hostTarget -and $probe) {
         $sshKey = Join-Path $IDENTITY_DIR 'ssh_key'
-        $r = & ssh '-i', $sshKey,
-            '-o','StrictHostKeyChecking=accept-new',
-            '-o','ConnectTimeout=3',
-            '-o','BatchMode=yes',
-            $hostTarget, 'echo __REACHABLE__' 2>$null
+        $statusProbeArgs = @(
+            '-i', $sshKey,
+            '-o', 'StrictHostKeyChecking=accept-new',
+            '-o', 'ConnectTimeout=3',
+            '-o', 'BatchMode=yes',
+            $hostTarget, 'echo __REACHABLE__'
+        )
+        $r = & ssh @statusProbeArgs 2>$null
         if ($r -match '__REACHABLE__') {
             Write-Host '  host:        reachable'
         } else {
@@ -1417,11 +1426,14 @@ function Invoke-Send {
         $remoteCmd = "cat >> $rhome/messages.jsonl && echo __APPENDED__"
         $errFile = [System.IO.Path]::GetTempFileName()
         try {
-            $out = $fullMsg | & ssh '-i', $sshKey,
-                '-o','StrictHostKeyChecking=accept-new',
-                '-o','ConnectTimeout=10',
-                '-o','BatchMode=yes',
-                $hostTarget, $remoteCmd 2>$errFile
+            $sendArgs = @(
+                '-i', $sshKey,
+                '-o', 'StrictHostKeyChecking=accept-new',
+                '-o', 'ConnectTimeout=10',
+                '-o', 'BatchMode=yes',
+                $hostTarget, $remoteCmd
+            )
+            $out = $fullMsg | & ssh @sendArgs 2>$errFile
             $stderrRaw = if (Test-Path $errFile) { (Get-Content $errFile -Raw -ErrorAction SilentlyContinue) } else { '' }
             if ($out -match '__APPENDED__') {
                 # delivered
@@ -1518,8 +1530,14 @@ function Invoke-SendFile {
     $rhome = Get-RemoteHome
     Invoke-AircSsh $targetHost "mkdir -p $rhome/files/$myName" 2>$null
     $sshKey = Join-Path $IDENTITY_DIR 'ssh_key'
-    & scp '-i', $sshKey, '-o','StrictHostKeyChecking=accept-new', '-q',
-        $filepath, "${targetHost}:${rhome}/files/${myName}/${filename}" 2>&1
+    $scpArgs = @(
+        '-i', $sshKey,
+        '-o', 'StrictHostKeyChecking=accept-new',
+        '-q',
+        $filepath,
+        "${targetHost}:${rhome}/files/${myName}/${filename}"
+    )
+    & scp @scpArgs 2>&1
     if ($LASTEXITCODE -ne 0) { Die "scp failed for $filename" }
     $size = (Get-Item $filepath).Length
     Invoke-Send -Argv @("@$peerName", "Sent file: $filename ($size bytes)") | Out-Null
@@ -1680,11 +1698,14 @@ function Invoke-Connect {
             # Auth probe before committing to monitor loop
             $sshKey = Join-Path $IDENTITY_DIR 'ssh_key'
             $probeErr = [System.IO.Path]::GetTempFileName()
-            $probeOut = & ssh '-i', $sshKey,
-                '-o','StrictHostKeyChecking=accept-new',
-                '-o','ConnectTimeout=5',
-                '-o','BatchMode=yes',
-                $priorHost, 'echo __AUTH_OK__' 2>$probeErr
+            $authProbeArgs = @(
+                '-i', $sshKey,
+                '-o', 'StrictHostKeyChecking=accept-new',
+                '-o', 'ConnectTimeout=5',
+                '-o', 'BatchMode=yes',
+                $priorHost, 'echo __AUTH_OK__'
+            )
+            $probeOut = & ssh @authProbeArgs 2>$probeErr
             $stderrText = (Get-Content $probeErr -Raw -ErrorAction SilentlyContinue)
             Remove-Item $probeErr -Force -ErrorAction SilentlyContinue
             if ($probeOut -notmatch '__AUTH_OK__') {
