@@ -37,7 +37,32 @@ function Resolve-PythonBin {
         return @{ Bin = $cmd.Source; Args = @() }
     }
     $py = Get-Command 'py' -ErrorAction SilentlyContinue
-    if ($py) { return @{ Bin = $py.Source; Args = @('-3') } }
+    if ($py -and $py.Source -notlike '*\WindowsApps\*') {
+        return @{ Bin = $py.Source; Args = @('-3') }
+    }
+    # Well-known install-location fallback. winget's Python.Python.3.12
+    # lands at $env:LOCALAPPDATA\Programs\Python\Python3XX\python.exe;
+    # python.org Program Files installer at C:\Program Files\Python3XX\.
+    # Both are added to User PATH by the installer, but a process launched
+    # with a snapshotted PATH (or before the install) won't see them.
+    # Same defensive pattern as Resolve-OpenSSL / Resolve-TailscaleBin.
+    # Without this, airc.ps1 in such a process hits `& $null @(...)` in
+    # the monitor pipeline and dies with "expression after '&' must be
+    # a command."
+    $candidates = @()
+    foreach ($root in @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\Python'),
+        $env:ProgramFiles,
+        ${env:ProgramFiles(x86)}
+    )) {
+        if ($root -and (Test-Path $root)) {
+            $candidates += Get-ChildItem -Path $root -Filter 'Python3*' -Directory -ErrorAction SilentlyContinue `
+                         | ForEach-Object { Join-Path $_.FullName 'python.exe' }
+        }
+    }
+    foreach ($p in $candidates) {
+        if ($p -and (Test-Path $p)) { return @{ Bin = $p; Args = @() } }
+    }
     return $null
 }
 $script:PythonResolved = Resolve-PythonBin
@@ -787,6 +812,14 @@ function Invoke-MonitorFormatter {
 # Mirrors bash monitor() closely.
 function Start-AircMonitor {
     param([string]$MyName)
+    if (-not $script:PythonResolved) {
+        Die @"
+Python 3 is required for the monitor formatter but was not found.
+Run 'airc doctor' for install instructions, or:
+  winget install --id Python.Python.3.12
+After install, open a NEW terminal so PATH refreshes (or re-run airc).
+"@
+    }
     $hostTarget = Get-ConfigVal -Key 'host_target' -Default ''
     $offsetFile = Join-Path $AIRC_WRITE_DIR 'monitor_offset'
 
