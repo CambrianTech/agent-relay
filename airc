@@ -1014,6 +1014,44 @@ cmd_connect() {
     fi
   fi
 
+  # ── Mnemonic resolver (humanhash → gist id, same gh account) ─────
+  # Joel's UX target: a friend (or your own other tab) can type
+  #   airc connect oregon-uncle-bravo-eleven
+  # instead of pasting a 32-char hex gist id. Humanhash is one-way
+  # (XOR-fold of the gist id bytes), so we can't reverse it directly —
+  # but we CAN walk gh's gist list, hash each id, and pick the match.
+  #
+  # Detection: target looks like a hyphen-separated 3+ word phrase of
+  # lowercase alphabetic tokens (matches the humanhash dictionary
+  # convention — no digits, no underscores). Example acceptable form:
+  # `oregon-uncle-bravo-eleven`. Reject `2f6a907224f4...` (it's a hex id),
+  # `gist:abc123` (handled below), inline invites with `@`, etc.
+  #
+  # Scope: same-gh-account only (we list OUR own gists). Cross-account
+  # (Friend on a different gh) requires the `user/mnemonic` form which
+  # is roadmap. For now the friend pastes the gist id directly when
+  # accounts differ.
+  if [ -n "$target" ] && echo "$target" | grep -qE '^[a-z]+(-[a-z]+){2,}$'; then
+    if ! command -v gh >/dev/null 2>&1; then
+      die "Mnemonic '$target' lookup needs the 'gh' CLI. Install gh + 'gh auth login', or use the gist id directly: airc connect <id>"
+    fi
+    local _matched_gist_id=""
+    while IFS=$'\t' read -r _gid _; do
+      [ -z "$_gid" ] && continue
+      local _hh; _hh=$(humanhash "$_gid" 2>/dev/null)
+      if [ "$_hh" = "$target" ]; then
+        _matched_gist_id="$_gid"
+        break
+      fi
+    done < <(gh gist list --limit 50 2>/dev/null | awk -F'\t' '/airc room:|airc invite for/ { print $1 "\t" $2 }')
+    if [ -n "$_matched_gist_id" ]; then
+      echo "  Resolved mnemonic '$target' → gist $_matched_gist_id"
+      target="$_matched_gist_id"
+    else
+      die "Mnemonic '$target' didn't match any airc gist on this gh account. If your friend's gist is on a different gh, paste the gist id directly: airc connect <id>"
+    fi
+  fi
+
   # ── Gist transport (issue #37) ───────────────────────────────────
   # If the target doesn't look like an inline invite (no `@`), treat it
   # as a gist ID and fetch the real invite content from there. Three

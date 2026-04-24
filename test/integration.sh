@@ -976,6 +976,67 @@ scenario_get_host() {
     || fail "fallback flapped: '$fallback_host' then '$repeat'"
 }
 
+# ── Scenario: mnemonic (humanhash → gist id resolver) ──────────────────
+# Per Joel's UX target: a friend can type
+#   airc connect oregon-uncle-bravo-eleven
+# instead of a 32-char hex gist id. Same-account resolution = walk
+# `gh gist list`, hash each id, match against the input phrase.
+#
+# This scenario runs as a unit-style test (no host/joiner spawning):
+#   - Word-form input is detected (regex match)
+#   - Hex-form input is NOT misclassified
+#   - Without gh OR with no matching gist, fails LOUD with actionable error
+#
+# We don't depend on a real gh account here — instead we exercise the
+# detection regex by capturing airc's stderr/exit-code on a known-bad
+# mnemonic. The actual gh resolution path is exercised in dogfood (the
+# `Peer joined` event from the live host monitor when a test process
+# resolves the room mnemonic against the real gh account).
+scenario_mnemonic() {
+  section "mnemonic: humanhash → gist id resolver detection + error path"
+
+  # 1. Word-form (3+ hyphens, lowercase alpha) triggers the resolver.
+  #    Without gh, dies with mnemonic-needs-gh message.
+  #    With gh + no match, dies with no-match message.
+  # We run airc connect with the test bogus mnemonic in an isolated
+  # AIRC_HOME so we don't touch the user's real state.
+  local thome=/tmp/airc-it-mnem-$$
+  mkdir -p "$thome"
+
+  local out
+  out=$(AIRC_HOME="$thome" AIRC_NO_DISCOVERY=1 "$AIRC" connect zzzz-yyyy-xxxx-wwww 2>&1 || true)
+
+  # If gh is on PATH, expect the no-match error. If gh is missing,
+  # expect the install-gh error. Either way: must mention 'mnemonic'
+  # and exit non-zero.
+  if echo "$out" | grep -qi 'mnemonic'; then
+    pass "word-form input detected as mnemonic + dispatched to resolver"
+  else
+    fail "word-form input did NOT route through mnemonic resolver: $out"
+  fi
+
+  # 2. Hex-form input must NOT be misclassified. We don't actually pair —
+  # just check that the mnemonic resolver doesn't fire (the gist resolver
+  # downstream will fire instead, and either succeed or fail differently).
+  out=$(AIRC_HOME="$thome" AIRC_NO_DISCOVERY=1 "$AIRC" connect 2f6a907224f4b88d236fda8ca16d37c4 2>&1 || true)
+  if ! echo "$out" | grep -qi "didn't match any airc gist on this gh account"; then
+    pass "hex-form input not misclassified as mnemonic"
+  else
+    fail "hex-form input incorrectly routed through mnemonic resolver: $out"
+  fi
+
+  # 3. A 1-hyphen string (looks like a CLI flag value, not a mnemonic)
+  # should NOT trigger the resolver. The regex requires 2+ hyphens.
+  out=$(AIRC_HOME="$thome" AIRC_NO_DISCOVERY=1 "$AIRC" connect foo-bar 2>&1 || true)
+  if ! echo "$out" | grep -qi "didn't match any airc gist"; then
+    pass "1-hyphen string ('foo-bar') not misclassified as mnemonic"
+  else
+    fail "1-hyphen string incorrectly routed through mnemonic resolver: $out"
+  fi
+
+  rm -rf "$thome"
+}
+
 case "$MODE" in
   tabs)         scenario_tabs  ;;
   scope)        scenario_scope ;;
