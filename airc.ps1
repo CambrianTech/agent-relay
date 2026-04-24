@@ -1431,7 +1431,11 @@ function Invoke-Send {
                 if ($stderrRaw -match '(?i)permission denied|publickey|host key verification|authentication fail|identification has changed|no supported authentication') {
                     $isAuth = $true
                 }
-                $stderrLine = ($stderrRaw -replace "`r?`n", ' ').Substring(0, [Math]::Min(300, $stderrRaw.Length))
+                # Defensive trim: Substring(0, N) with N > string length throws
+                # ArgumentOutOfRangeException. Use length of the *replaced* string
+                # (newlines collapsed shrinks it) and clamp to 300.
+                $stderrFlat = if ($stderrRaw) { ($stderrRaw -replace "`r?`n", ' ').Trim() } else { '' }
+                $stderrLine = if ($stderrFlat.Length -gt 300) { $stderrFlat.Substring(0, 300) } else { $stderrFlat }
                 if ($isAuth) {
                     $marker = ([ordered]@{ from='airc'; ts=(Get-Timestamp); msg="[AUTH FAILED to $peerName - repair required, NOT queued] $stderrLine" } | ConvertTo-Json -Compress)
                     Add-Content -Path $MESSAGES -Value $marker
