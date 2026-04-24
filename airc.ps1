@@ -595,7 +595,17 @@ function Get-GistContent {
 # verbatim from the bash version, with one Windows tweak: the auto-pong
 # subprocess uses the airc.cmd shim path (passed via env var).
 $script:MonitorFormatterPython = @'
-import sys, json, os, re, time, signal
+import sys, json, os, re, time, signal, io
+# Force UTF-8 on stdout/stderr regardless of Windows locale (default cp1252
+# can't encode emoji + a lot of unicode that peers post). errors='replace'
+# guarantees the formatter never crashes on a single bad codepoint and
+# kill the monitor pipeline. Reconfigure once at startup.
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
 
 WATCHDOG_SEC = 150
 def _watchdog_exit(signum=None, frame=None):
@@ -897,6 +907,11 @@ After install, open a NEW terminal so PATH refreshes (or re-run airc).
             # Pass through PEERS_DIR + AIRC_CMD_PATH explicitly.
             $pyInfo.EnvironmentVariables['PEERS_DIR']     = $env:PEERS_DIR
             $pyInfo.EnvironmentVariables['AIRC_CMD_PATH'] = $env:AIRC_CMD_PATH
+            # Force UTF-8 IO so peers' emoji / non-cp1252 chars can't crash
+            # the formatter. Belt-and-suspenders alongside the
+            # sys.stdout.reconfigure call inside the heredoc.
+            $pyInfo.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'
+            $pyInfo.EnvironmentVariables['PYTHONUTF8']       = '1'
             $pyProc = [System.Diagnostics.Process]::new()
             $pyProc.StartInfo = $pyInfo
             [void]$pyProc.Start()
