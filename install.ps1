@@ -297,15 +297,29 @@ if (Test-Path $skillsSrc) {
         }
     }
 
-    Get-ChildItem -Directory $skillsSrc | ForEach-Object {
-        $dst = Join-Path $SKILLS_TARGET $_.Name
-        if (Test-Path $dst) { Remove-Item $dst -Force -Recurse -ErrorAction SilentlyContinue }
-        try {
-            New-Item -ItemType SymbolicLink -Path $dst -Target $_.FullName -ErrorAction Stop | Out-Null
-        } catch {
-            Copy-Item -Recurse -Path $_.FullName -Destination $dst -Force
+    # foreach (statement) over a materialized array, with explicit
+    # locals -- avoids the PS 5.1 ForEach-Object pipeline edge case where
+    # an inner cmdlet failure surfaces as a misleading "ForEach-Object :
+    # parameter Path is null" error against the outer pipeline.
+    $skillDirs = @(Get-ChildItem -Path $skillsSrc -Directory -ErrorAction SilentlyContinue)
+    foreach ($skill in $skillDirs) {
+        if (-not $skill -or -not $skill.Name -or -not $skill.FullName) { continue }
+        $skillName = $skill.Name
+        $skillPath = $skill.FullName
+        $dst = Join-Path $SKILLS_TARGET $skillName
+        if (Test-Path $dst) {
+            Remove-Item $dst -Force -Recurse -ErrorAction SilentlyContinue
         }
-        Write-Host "    /$($_.Name)"
+        $linked = $false
+        try {
+            New-Item -ItemType SymbolicLink -Path $dst -Target $skillPath -ErrorAction Stop | Out-Null
+            $linked = $true
+        } catch {
+            # Symlink requires Developer Mode or admin on Windows;
+            # fall back to a recursive copy. Refresh on next install.
+            Copy-Item -Recurse -Path $skillPath -Destination $dst -Force
+        }
+        Write-Host "    /$skillName"
     }
 }
 
