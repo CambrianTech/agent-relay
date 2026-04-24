@@ -381,8 +381,16 @@ import sys, json, os, re, time, signal
 # there is no penalty when the channel is healthy.
 WATCHDOG_SEC = 180
 def _watchdog_exit(signum, frame):
-    sys.stderr.write(f"[airc:monitor] no inbound in {WATCHDOG_SEC}s — restarting\\n")
+    # Emit on stdout AS WELL as stderr so the line surfaces in the
+    # Monitor task notification stream (which only sees stdout). Without
+    # the stdout side, watchdog-triggered restarts are invisible — the
+    # Monitor task <summary> still shows whatever stale chat line was
+    # latest, telling humans/AIs nothing about the actual event.
+    msg = f"host went quiet ({WATCHDOG_SEC}s) — restarting"
+    sys.stderr.write(f"[airc:monitor] {msg}\\n")
     sys.stderr.flush()
+    sys.stdout.write(f"airc: {msg}\\n")
+    sys.stdout.flush()
     os._exit(2)
 signal.signal(signal.SIGALRM, _watchdog_exit)
 signal.alarm(WATCHDOG_SEC)
@@ -467,14 +475,14 @@ def handle_rename(msg, ts):
     old, new, host = m.group(1), m.group(2), m.group(3)
     # Primary path: name-keyed rename.
     if _rename_files(old, new):
-        print(f"[{ts}] airc: Peer renamed: {old} -> {new}", flush=True)
+        print(f"airc: nick: {old} → {new}", flush=True)
         return True
     # Fallback: peer file sits under a different (older) name due to a
     # previous chain break. Resolve via stable host field.
     if host:
         current = _find_peer_by_host(host)
         if current and current != new and _rename_files(current, new):
-            print(f"[{ts}] airc: Peer renamed (chain-repair via host): {current} -> {new}", flush=True)
+            print(f"airc: nick (chain-repair): {current} → {new}", flush=True)
             return True
     return False
 
@@ -1719,6 +1727,29 @@ conn.sendall((response + '\n').encode())
 conn.close()
 sock.close()
 print(f'  Peer joined: {jname}')
+# Surface the join as a system event in messages.jsonl so the monitor
+# formatter (and downstream Monitor task summaries on every paired peer)
+# render a one-liner like '[#general] airc: <peer> joined' instead of
+# silence. Without this, peer-joined is invisible to anyone reading
+# notifications — they only learn about the new peer when chat traffic
+# starts flowing. Joel 2026-04-24: 'preview of the message or the
+# connection or whatever happened, Anvil joined instead of generic'.
+import datetime
+try:
+    room_name_path = '$AIRC_WRITE_DIR/room_name'
+    room_name = open(room_name_path).read().strip() if os.path.isfile(room_name_path) else 'general'
+    event = {
+        'ts': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'from': 'airc',
+        'to': 'all',
+        'msg': f'{jname} joined #{room_name}',
+    }
+    with open('$MESSAGES', 'a') as f:
+        f.write(json.dumps(event) + '\n')
+except Exception:
+    # Don't fail the pair on event-emit error — pairing already
+    # succeeded by this point; the missing event line is cosmetic.
+    pass
 " 2>/dev/null || true
     done &
     PAIR_PID=$!
