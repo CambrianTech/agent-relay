@@ -893,8 +893,23 @@ cmd_connect() {
   # Skipped if `gh` isn't available (degraded → host invite-only) or
   # AIRC_NO_DISCOVERY=1 (explicit opt-out). With `--no-general` the room
   # path is skipped and we go straight to single-pair invite host mode.
+  #
+  # IMPORTANT: discovery used to be gated on `[ ! -f CONFIG ]` to avoid
+  # running on resume. But that broke daemon installs into stale-state
+  # scopes: a CONFIG with identity-only data (no host_target — i.e. a
+  # prior host's leftover) skipped the resume path AND discovery, so the
+  # daemon fell through to host mode and created a DUPLICATE #general
+  # gist alongside the existing one.
+  #
+  # The right gate is "no host_target": if the prior CONFIG was a host
+  # (no host_target), we should still attempt discovery on the next
+  # connect — maybe someone else became the new host since we last ran,
+  # or our prior #general gist is still authoritative and we should join
+  # ourselves into it as a peer (the existing-room flow handles that).
   local _did_room_discovery=0
-  if [ -z "$target" ] && [ ! -f "$CONFIG" ] && \
+  local _saved_host_target=""
+  [ -f "$CONFIG" ] && _saved_host_target=$(get_config_val host_target "")
+  if [ -z "$target" ] && [ -z "$_saved_host_target" ] && \
      [ "${AIRC_NO_DISCOVERY:-0}" != "1" ] && \
      command -v gh >/dev/null 2>&1; then
 
