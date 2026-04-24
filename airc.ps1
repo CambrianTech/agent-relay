@@ -1114,12 +1114,12 @@ function Invoke-Part {
 
 # -- cmd_channel --------------------------------------------------------
 function Invoke-Channel {
-    param([string[]]$Args)
+    param([string[]]$Argv)
     $dir = if ($env:AIRC_DIR) { $env:AIRC_DIR } else { Join-Path $env:USERPROFILE '.airc-src' }
     $channelFile = Join-Path $dir '.channel'
     $current = if (Test-Path $channelFile) { (Get-Content $channelFile -Raw).Trim() } else { 'main' }
     if (-not $current) { $current = 'main' }
-    $target = if ($Args -and $Args.Count -gt 0) { $Args[0] } else { '' }
+    $target = if ($Argv -and $Argv.Count -gt 0) { $Argv[0] } else { '' }
     if (-not $target) {
         Write-Host "  Channel: $current"
         Write-Host '  Available channels (any branch on origin can be a channel):'
@@ -1136,10 +1136,10 @@ function Invoke-Channel {
 
 # -- cmd_logs -----------------------------------------------------------
 function Invoke-Logs {
-    param([string[]]$Args)
+    param([string[]]$Argv)
     Ensure-Init
     $count = 20
-    if ($Args -and $Args.Count -gt 0 -and $Args[0] -match '^\d+$') { $count = [int]$Args[0] }
+    if ($Argv -and $Argv.Count -gt 0 -and $Argv[0] -match '^\d+$') { $count = [int]$Argv[0] }
     $hostTarget = Get-ConfigVal -Key 'host_target' -Default ''
     if ($hostTarget) {
         $rhome = Get-RemoteHome
@@ -1158,9 +1158,9 @@ function Invoke-Logs {
 
 # -- cmd_reminder -------------------------------------------------------
 function Invoke-Reminder {
-    param([string[]]$Args)
+    param([string[]]$Argv)
     Ensure-Init
-    $arg = if ($Args -and $Args.Count -gt 0) { $Args[0] } else { 'status' }
+    $arg = if ($Argv -and $Argv.Count -gt 0) { $Argv[0] } else { 'status' }
     $reminderFile = Join-Path $AIRC_WRITE_DIR 'reminder'
     switch -Regex ($arg) {
         '^(off|0)$'  {
@@ -1188,9 +1188,9 @@ function Invoke-Reminder {
 
 # -- cmd_status ---------------------------------------------------------
 function Invoke-Status {
-    param([string[]]$Args)
+    param([string[]]$Argv)
     Ensure-Init
-    $probe = ($Args -and $Args -contains '--probe')
+    $probe = ($Argv -and $Argv -contains '--probe')
     $myName     = Get-Name
     $hostTarget = Get-ConfigVal -Key 'host_target' -Default ''
     $hostName   = Get-ConfigVal -Key 'host_name'   -Default ''
@@ -1256,9 +1256,9 @@ function Invoke-Status {
 # -- cmd_teardown -------------------------------------------------------
 # Bash uses pgrep -P + kill. Windows: taskkill /T /F walks the tree.
 function Invoke-Teardown {
-    param([string[]]$Args)
-    $flush = ($Args -contains '--flush')
-    $all   = ($Args -contains '--all')
+    param([string[]]$Argv)
+    $flush = ($Argv -contains '--flush')
+    $all   = ($Argv -contains '--all')
     $killed = $false
 
     if ($all) {
@@ -1336,8 +1336,8 @@ function Invoke-Disconnect {
 
 # -- cmd_rename / cmd_nick ----------------------------------------------
 function Invoke-Rename {
-    param([string[]]$Args)
-    $newName = if ($Args -and $Args.Count -gt 0) { $Args[0] } else { '' }
+    param([string[]]$Argv)
+    $newName = if ($Argv -and $Argv.Count -gt 0) { $Argv[0] } else { '' }
     if (-not $newName -or $newName -in @('-h','--help')) {
         Write-Host 'Usage: airc nick <new-name>'
         Write-Host '  Renames this identity and broadcasts [rename] to peers.'
@@ -1353,26 +1353,26 @@ function Invoke-Rename {
     Set-ConfigVal -Updates @{ name = $newName }
     Write-Host "  Renamed: $oldName -> $newName"
     $myHost = "$($env:USERNAME)@$(Get-AircHost)"
-    try { Invoke-Send -Args @("[rename] old=$oldName new=$newName host=$myHost") | Out-Null } catch { }
+    try { Invoke-Send -Argv @("[rename] old=$oldName new=$newName host=$myHost") | Out-Null } catch { }
 }
 
 # -- cmd_send / cmd_msg -------------------------------------------------
 # Local-mirror-first, then SSH append to host's messages.jsonl.
 # Auth-vs-network failure distinction (per fix #17).
 function Invoke-Send {
-    param([string[]]$Args)
-    if (-not $Args -or $Args.Count -eq 0) {
+    param([string[]]$Argv)
+    if (-not $Argv -or $Argv.Count -eq 0) {
         Die 'Usage: airc msg <message>  or  airc msg @peer <message>'
     }
-    $first = $Args[0]
+    $first = $Argv[0]
     $peerName = 'all'
     $msg = ''
     if ($first.StartsWith('@')) {
         $peerName = $first.Substring(1)
-        if ($Args.Count -lt 2) { Die 'Usage: airc msg @peer <message>' }
-        $msg = ($Args[1..($Args.Count - 1)] -join ' ')
+        if ($Argv.Count -lt 2) { Die 'Usage: airc msg @peer <message>' }
+        $msg = ($Argv[1..($Argv.Count - 1)] -join ' ')
     } else {
-        $msg = ($Args -join ' ')
+        $msg = ($Argv -join ' ')
     }
     Ensure-Init
 
@@ -1462,17 +1462,17 @@ function Invoke-Send {
 
 # -- cmd_ping -----------------------------------------------------------
 function Invoke-Ping {
-    param([string[]]$Args)
-    if (-not $Args -or $Args.Count -eq 0) { Die 'Usage: airc ping @peer [timeout_secs]' }
-    $first = $Args[0]
+    param([string[]]$Argv)
+    if (-not $Argv -or $Argv.Count -eq 0) { Die 'Usage: airc ping @peer [timeout_secs]' }
+    $first = $Argv[0]
     if (-not $first.StartsWith('@')) { Die 'Usage: airc ping @peer (broadcast ping not supported)' }
     $peerName = $first.Substring(1)
-    $timeout  = if ($Args.Count -gt 1 -and $Args[1] -match '^\d+$') { [int]$Args[1] } else { 10 }
+    $timeout  = if ($Argv.Count -gt 1 -and $Argv[1] -match '^\d+$') { [int]$Argv[1] } else { 10 }
     Ensure-Init
 
     $pingId = [guid]::NewGuid().ToString()
     $startTime = Get-Date
-    Invoke-Send -Args @("@$peerName", "[PING:$pingId]") | Out-Null
+    Invoke-Send -Argv @("@$peerName", "[PING:$pingId]") | Out-Null
     Write-Host "ping sent to $peerName (id=$pingId) - waiting up to ${timeout}s for pong..."
 
     while ($true) {
@@ -1501,10 +1501,10 @@ function Invoke-Ping {
 
 # -- cmd_send_file ------------------------------------------------------
 function Invoke-SendFile {
-    param([string[]]$Args)
-    if (-not $Args -or $Args.Count -lt 2) { Die 'Usage: airc send-file <peer> <path>' }
-    $peerName = $Args[0]
-    $filepath = $Args[1]
+    param([string[]]$Argv)
+    if (-not $Argv -or $Argv.Count -lt 2) { Die 'Usage: airc send-file <peer> <path>' }
+    $peerName = $Argv[0]
+    $filepath = $Argv[1]
     if (-not (Test-Path $filepath)) { Die "File not found: $filepath" }
     Ensure-Init
     $hostTarget = Get-ConfigVal -Key 'host_target' -Default ''
@@ -1518,20 +1518,20 @@ function Invoke-SendFile {
         $filepath, "${targetHost}:${rhome}/files/${myName}/${filename}" 2>&1
     if ($LASTEXITCODE -ne 0) { Die "scp failed for $filename" }
     $size = (Get-Item $filepath).Length
-    Invoke-Send -Args @("@$peerName", "Sent file: $filename ($size bytes)") | Out-Null
+    Invoke-Send -Argv @("@$peerName", "Sent file: $filename ($size bytes)") | Out-Null
     Write-Host "Sent $filename ($size bytes)"
 }
 
 # -- cmd_update / cmd_canary --------------------------------------------
 function Invoke-Update {
-    param([string[]]$Args)
+    param([string[]]$Argv)
     $dir = if ($env:AIRC_DIR) { $env:AIRC_DIR } else { Join-Path $env:USERPROFILE '.airc-src' }
     $channelFile = Join-Path $dir '.channel'
     $requested = ''
-    for ($i = 0; $i -lt $Args.Count; $i++) {
-        switch ($Args[$i]) {
-            '--channel'  { $requested = $Args[$i + 1]; $i++ }
-            '-c'         { $requested = $Args[$i + 1]; $i++ }
+    for ($i = 0; $i -lt $Argv.Count; $i++) {
+        switch ($Argv[$i]) {
+            '--channel'  { $requested = $Argv[$i + 1]; $i++ }
+            '-c'         { $requested = $Argv[$i + 1]; $i++ }
             '--canary'   { $requested = 'canary' }
             '--main'     { $requested = 'main' }
         }
@@ -1571,8 +1571,8 @@ function Invoke-Update {
 # launchd / systemd analog on Windows is the Task Scheduler. We register
 # a per-user task that runs at logon, restarts on failure.
 function Invoke-Daemon {
-    param([string[]]$Args)
-    $action = if ($Args -and $Args.Count -gt 0) { $Args[0] } else { 'status' }
+    param([string[]]$Argv)
+    $action = if ($Argv -and $Argv.Count -gt 0) { $Argv[0] } else { 'status' }
     $taskName = 'AIRC'
     switch ($action) {
         'install' {
@@ -1624,7 +1624,7 @@ function Invoke-Tests {
 # The big one. host vs joiner branching, gh discovery, mnemonic resolver,
 # pair handshake (TCP), monitor launch.
 function Invoke-Connect {
-    param([string[]]$Args)
+    param([string[]]$Argv)
     # Flag parsing
     $useGist = $true
     $roomName = 'general'
@@ -1632,13 +1632,13 @@ function Invoke-Connect {
     $resolvedRoomName = ''
     $resolvedGistId   = ''
     $positional = @()
-    for ($i = 0; $i -lt $Args.Count; $i++) {
-        switch -Regex ($Args[$i]) {
+    for ($i = 0; $i -lt $Argv.Count; $i++) {
+        switch -Regex ($Argv[$i]) {
             '^(--gist|-gist)$' { $useGist = $true }
             '^(--no-gist|-no-gist)$' { $useGist = $false }
-            '^(--room|-room)$' { $roomName = $Args[$i + 1]; $useRoom = $true; $i++ }
+            '^(--room|-room)$' { $roomName = $Argv[$i + 1]; $useRoom = $true; $i++ }
             '^(--no-general|-no-general|--no-room|-no-room)$' { $useRoom = $false }
-            default { $positional += $Args[$i] }
+            default { $positional += $Argv[$i] }
         }
     }
     $target = if ($positional.Count -gt 0) { $positional[0] } else { '' }
@@ -1861,7 +1861,7 @@ function Invoke-Connect {
                 Write-Host "  Re-launching into host mode for #$resolvedRoomName ..."
                 $env:AIRC_NO_DISCOVERY = '1'
                 if ($preservedName) { $env:AIRC_NAME = $preservedName }
-                Invoke-Connect -Args @('--room', $resolvedRoomName)
+                Invoke-Connect -Argv @('--room', $resolvedRoomName)
                 return
             }
             Die "Can't reach ${peerHostOnly}:$peerPort. Is the host running 'airc connect'?"
@@ -2171,16 +2171,16 @@ try {
         { $_ -in @('tests','test') }                   { Invoke-Tests; break }
 
         # Connection lifecycle
-        { $_ -in @('connect','setup','start','join','resume') } { Invoke-Connect -Args $rest; break }
+        { $_ -in @('connect','setup','start','join','resume') } { Invoke-Connect -Argv $rest; break }
 
         # Messaging
-        { $_ -in @('send','msg','say','privmsg') }    { Invoke-Send -Args $rest; break }
-        'send-file'                                    { Invoke-SendFile -Args $rest; break }
-        'ping'                                         { Invoke-Ping -Args $rest; break }
+        { $_ -in @('send','msg','say','privmsg') }    { Invoke-Send -Argv $rest; break }
+        'send-file'                                    { Invoke-SendFile -Argv $rest; break }
+        'ping'                                         { Invoke-Ping -Argv $rest; break }
 
         # Identity / peers
-        { $_ -in @('rename','nick') }                 { Invoke-Rename -Args $rest; break }
-        'reminder'                                     { Invoke-Reminder -Args $rest; break }
+        { $_ -in @('rename','nick') }                 { Invoke-Rename -Argv $rest; break }
+        'reminder'                                     { Invoke-Reminder -Argv $rest; break }
         'peers'                                        { Invoke-Peers; break }
 
         # Rooms / discovery
@@ -2189,20 +2189,20 @@ try {
         'part'                                         { Invoke-Part; break }
 
         # Lifecycle / disconnect
-        { $_ -in @('teardown','stop','flush') }       { Invoke-Teardown -Args $rest; break }
+        { $_ -in @('teardown','stop','flush') }       { Invoke-Teardown -Argv $rest; break }
         { $_ -in @('disconnect','quit','leave','unbind') } { Invoke-Disconnect; break }
 
         # Diagnostic
-        'logs'                                         { Invoke-Logs -Args $rest; break }
-        'status'                                       { Invoke-Status -Args $rest; break }
+        'logs'                                         { Invoke-Logs -Argv $rest; break }
+        'status'                                       { Invoke-Status -Argv $rest; break }
 
         # Updates / channels
-        { $_ -in @('update','upgrade','pull') }       { Invoke-Update -Args $rest; break }
-        'channel'                                      { Invoke-Channel -Args $rest; break }
-        'canary'                                       { Invoke-Update -Args (@('--channel','canary') + $rest); break }
+        { $_ -in @('update','upgrade','pull') }       { Invoke-Update -Argv $rest; break }
+        'channel'                                      { Invoke-Channel -Argv $rest; break }
+        'canary'                                       { Invoke-Update -Argv (@('--channel','canary') + $rest); break }
 
         # Daemon (Task Scheduler on Windows)
-        { $_ -in @('daemon','autostart','service') }  { Invoke-Daemon -Args $rest; break }
+        { $_ -in @('daemon','autostart','service') }  { Invoke-Daemon -Argv $rest; break }
 
         # Monitor (rare standalone use)
         'monitor'                                      { Start-AircMonitor -MyName (Get-Name); break }
