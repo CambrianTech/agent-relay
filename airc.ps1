@@ -710,17 +710,28 @@ for line in sys.stdin:
         ping_id = ping_match.group(1)
         my_current = current_name()
         if to == my_current:
-            import subprocess
+            import subprocess, sys
             try:
-                # Windows: airc.cmd is on PATH after install; absolute
-                # path passed via AIRC_CMD_PATH for robustness when PATH
-                # isn't inherited (daemons / scheduled tasks).
-                subprocess.Popen(
-                    [airc_cmd, "send", f"@{fr}", f"[PONG:{ping_id}]"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    shell=False,
-                )
+                pong_msg = f"[PONG:{ping_id}]"
+                if sys.platform == "win32":
+                    # Windows CreateProcess can't run .cmd files directly
+                    # when shell=False -- it only handles real PE binaries.
+                    # Route through cmd.exe /c so airc.cmd interprets
+                    # correctly. shell=False is fine here since we control
+                    # every argv element (peer name + uuid).
+                    subprocess.Popen(
+                        ["cmd.exe", "/c", airc_cmd, "send", f"@{fr}", pong_msg],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        shell=False,
+                    )
+                else:
+                    subprocess.Popen(
+                        [airc_cmd, "send", f"@{fr}", pong_msg],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        shell=False,
+                    )
             except Exception:
                 pass
         continue
