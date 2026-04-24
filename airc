@@ -87,17 +87,64 @@ get_config_val() {
 }
 
 get_host() {
-  # Prefer Tailscale IP, fall back to hostname
+  # Address-resolution priority for the host endpoint baked into the room
+  # gist (and inline join strings):
+  #   1. Tailscale IP (100.x.y.z) — works internet-wide for tailnet members
+  #   2. LAN IP (192.168.*, 10.*, 172.16-31.*) — works for same-LAN peers
+  #      with no Tailscale required. This is the path Joel wanted: same
+  #      office, no Tailscale, gh + LAN-routable host = mesh works.
+  #   3. hostname — last-resort, only resolves cross-machine when mDNS
+  #      (.local) or DNS happens to know the name.
+  # AIRC_NO_TAILSCALE=1 forces the LAN/hostname fallback even when
+  # Tailscale is installed. Useful for testing the fallback path AND
+  # for users who want to bind the room to a LAN IP for same-LAN
+  # coordination without dragging guests into their tailnet.
   local ts_bin=""
-  if command -v tailscale >/dev/null 2>&1; then
-    ts_bin="tailscale"
-  elif [ -x "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ]; then
-    ts_bin="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+  if [ "${AIRC_NO_TAILSCALE:-0}" != "1" ]; then
+    if command -v tailscale >/dev/null 2>&1; then
+      ts_bin="tailscale"
+    elif [ -x "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ]; then
+      ts_bin="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+    fi
   fi
   if [ -n "$ts_bin" ]; then
     local ts_ip; ts_ip=$("$ts_bin" ip -4 2>/dev/null || true)
     [ -n "$ts_ip" ] && echo "$ts_ip" && return
   fi
+
+  # LAN IP via UDP-socket trick: open a UDP socket toward a public IP
+  # (no actual packet sent — UDP connect just chooses the route), then
+  # ask getsockname() which interface IP would be used. Works on macOS,
+  # Linux, WSL2 without parsing platform-specific ifconfig/ip output.
+  # Returns one of 192.168.*, 10.*, 172.16-31.* on a typical home/office
+  # LAN. Returns 127.0.0.1 if no internet route is available — which we
+  # treat as "no LAN" and fall through to hostname.
+  if command -v python3 >/dev/null 2>&1; then
+    local lan_ip
+    lan_ip=$(python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    s.settimeout(0.5)
+    s.connect(('8.8.8.8', 80))
+    ip = s.getsockname()[0]
+    # Only emit if it looks like a routable LAN address. 127.0.0.1 means
+    # no default route; we want hostname fallback in that case.
+    if ip and not ip.startswith('127.'):
+        print(ip)
+except Exception:
+    pass
+finally:
+    s.close()
+" 2>/dev/null)
+    if [ -n "$lan_ip" ]; then
+      # Sanity: must look like an IPv4 address (skip exotic surprises).
+      case "$lan_ip" in
+        [0-9]*.[0-9]*.[0-9]*.[0-9]*) echo "$lan_ip" && return ;;
+      esac
+    fi
+  fi
+
   hostname
 }
 
@@ -356,6 +403,16 @@ try:
 except Exception:
     pass
 
+# Room name for the chat-line prefix. Read once at startup; a rename
+# of the room would require a fresh airc connect to pick up. Default
+# is "general"; legacy single-pair invite scope shows "1:1" as the
+# visual marker.
+room_path = os.path.join(scope_dir, "room_name")
+try:
+    room_name = open(room_path).read().strip() or "general"
+except Exception:
+    room_name = "1:1"
+
 def current_name():
     """Read identity name fresh from config.json each time so a rename
     during the session immediately takes effect for own-send filtering.
@@ -502,10 +559,19 @@ for line in sys.stdin:
         # Suppress to keep the chat surface clean.
         continue
     if fr in ("airc", "sys"):
-        label = "airc"
+        # System events (joins, parts, drain markers, auth failures) keep
+        # the airc-prefixed format — easy to scan past.
+        print(f"[#{room_name}] airc: {msg}", flush=True)
     else:
-        label = fr
-    print(f"[{ts}] {label}: {msg}", flush=True)
+        # Real chat: compact IRC-feel format.
+        # Broadcast:  [#general] bigmama: hello everyone
+        # DM:         [#general] bigmama → alice: hey
+        # Joel 2026-04-24: "the goings on of our agents is fascinating
+        # to humans" — keep it readable, drop the verbose ISO timestamp.
+        if to and to not in ("all", ""):
+            print(f"[#{room_name}] {fr} → {to}: {msg}", flush=True)
+        else:
+            print(f"[#{room_name}] {fr}: {msg}", flush=True)
 '
 }
 
@@ -738,13 +804,21 @@ cmd_connect() {
     } >&2
     exit 3
   ' PIPE
-  if [ -z "${AIRC_BACKGROUND_OK:-}" ]; then
-    # Heartbeat to stdout every 60s. If nobody reads, the next write
-    # triggers SIGPIPE → trap above fires → airc exits loudly. Background
-    # subshell so it doesn't block the main connect flow. Killed by the
-    # main trap (EXIT/INT/TERM) along with the rest of the descendants.
+  # Heartbeat to stdout for SIGPIPE-pipe-death detection. OFF BY DEFAULT
+  # as of 2026-04-24 — at 60s it was filling Claude Code chat history
+  # with a notification per minute per peer, drowning real peer events.
+  # Joel: "I'd rather only see the messages."
+  #
+  # Real peer traffic still triggers SIGPIPE on pipe death, so we lose
+  # detection only when the channel is genuinely silent for a long time.
+  # That tradeoff is worth it for the cleaner Monitor surface.
+  #
+  # Set AIRC_HEARTBEAT_SEC=<seconds> to opt back in (tests, diagnostic
+  # sessions, one-shot-bash launchers that need the safety net). 0 or
+  # unset = no heartbeat.
+  if [ -z "${AIRC_BACKGROUND_OK:-}" ] && [ -n "${AIRC_HEARTBEAT_SEC:-}" ] && [ "$AIRC_HEARTBEAT_SEC" -gt 0 ] 2>/dev/null; then
     (
-      while sleep 60; do
+      while sleep "$AIRC_HEARTBEAT_SEC"; do
         echo "  [airc heartbeat $(date -u +%H:%M:%SZ)]"
       done
     ) &
@@ -852,12 +926,17 @@ cmd_connect() {
             else
               echo "  (no #${saved_room} gist on this gh — host was likely cross-account or already cleaned)"
             fi
+            # Preserve identity name across re-exec — without this the
+            # name re-derives from cwd and can drift if the path resolves
+            # with different case (macOS HFS+/APFS case-insensitive but
+            # case-preserving), causing peers to see us as a "new" peer.
+            local _preserved_name; _preserved_name=$(get_config_val name "")
             # Wipe joiner state so re-exec falls into host mode cleanly.
             rm -f "$CONFIG"
             rm -f "$AIRC_WRITE_DIR/room_name"
             echo "  Re-execing into host mode for #${saved_room}..."
             echo ""
-            exec env AIRC_NO_DISCOVERY=1 "$0" connect --room "$saved_room"
+            exec env AIRC_NO_DISCOVERY=1 ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect --room "$saved_room"
           fi
           # No saved room (legacy 1:1 invite scope) OR no gh: fall through to
           # the existing retry-in-monitor behavior. Monitor's retry loop
@@ -964,6 +1043,44 @@ cmd_connect() {
         echo "  Host a new mesh:   AIRC_NO_DISCOVERY=1 airc connect --no-general"
         exit 0
       fi
+    fi
+  fi
+
+  # ── Mnemonic resolver (humanhash → gist id, same gh account) ─────
+  # Joel's UX target: a friend (or your own other tab) can type
+  #   airc connect oregon-uncle-bravo-eleven
+  # instead of pasting a 32-char hex gist id. Humanhash is one-way
+  # (XOR-fold of the gist id bytes), so we can't reverse it directly —
+  # but we CAN walk gh's gist list, hash each id, and pick the match.
+  #
+  # Detection: target looks like a hyphen-separated 3+ word phrase of
+  # lowercase alphabetic tokens (matches the humanhash dictionary
+  # convention — no digits, no underscores). Example acceptable form:
+  # `oregon-uncle-bravo-eleven`. Reject `2f6a907224f4...` (it's a hex id),
+  # `gist:abc123` (handled below), inline invites with `@`, etc.
+  #
+  # Scope: same-gh-account only (we list OUR own gists). Cross-account
+  # (Friend on a different gh) requires the `user/mnemonic` form which
+  # is roadmap. For now the friend pastes the gist id directly when
+  # accounts differ.
+  if [ -n "$target" ] && echo "$target" | grep -qE '^[a-z]+(-[a-z]+){2,}$'; then
+    if ! command -v gh >/dev/null 2>&1; then
+      die "Mnemonic '$target' lookup needs the 'gh' CLI. Install gh + 'gh auth login', or use the gist id directly: airc connect <id>"
+    fi
+    local _matched_gist_id=""
+    while IFS=$'\t' read -r _gid _; do
+      [ -z "$_gid" ] && continue
+      local _hh; _hh=$(humanhash "$_gid" 2>/dev/null)
+      if [ "$_hh" = "$target" ]; then
+        _matched_gist_id="$_gid"
+        break
+      fi
+    done < <(gh gist list --limit 50 2>/dev/null | awk -F'\t' '/airc room:|airc invite for/ { print $1 "\t" $2 }')
+    if [ -n "$_matched_gist_id" ]; then
+      echo "  Resolved mnemonic '$target' → gist $_matched_gist_id"
+      target="$_matched_gist_id"
+    else
+      die "Mnemonic '$target' didn't match any airc gist on this gh account. If your friend's gist is on a different gh, paste the gist id directly: airc connect <id>"
     fi
   fi
 
@@ -1208,6 +1325,10 @@ print(data.decode().strip())
           echo "  ⚠  Couldn't remove stale gist (already gone? not on this gh account?)."
           echo "     New host will publish a fresh #${resolved_room_name} gist anyway."
         fi
+        # Preserve identity name across re-exec (same reason as the resume
+        # path's self-heal — without this, derive_name re-runs from cwd
+        # and can drift on case-aliasing, peers see a "new" peer).
+        local _preserved_name; _preserved_name=$(get_config_val name "")
         # Wipe the CONFIG we just wrote — it points at the dead host and
         # would trigger 'resume joiner' on next airc connect, looping back
         # into this same failure.
@@ -1218,7 +1339,7 @@ print(data.decode().strip())
         # exec replaces the current bash process — clean handoff. AIRC_NO_DISCOVERY=1
         # ensures the new instance doesn't try to re-discover the just-deleted gist
         # (gh's gist-list cache might still show it for a few seconds).
-        exec env AIRC_NO_DISCOVERY=1 "$0" connect --room "$resolved_room_name"
+        exec env AIRC_NO_DISCOVERY=1 ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect --room "$resolved_room_name"
       fi
       # Either not a room flow, or no gh, or no resolved_room_name → original die.
       die "Can't reach $peer_host_only:$peer_port. Is the host running 'airc connect'?"
@@ -2845,10 +2966,11 @@ for line in sys.stdin:
 
 case "${1:-help}" in
   connect|setup|start|join|resume) shift; cmd_connect "$@" ;;
-  send)      shift; cmd_send "$@" ;;
+  send|msg|say)   shift; cmd_send "$@" ;;
+  privmsg)   shift; cmd_send "$@" ;;
   send-file) shift; cmd_send_file "$@" ;;
   ping)      shift; cmd_ping "$@" ;;
-  rename)    shift; cmd_rename "$@" ;;
+  rename|nick) shift; cmd_rename "$@" ;;
   reminder)  shift; cmd_reminder "$@" ;;
   peers)     shift; cmd_peers "$@" ;;
   invite|share|join-string) cmd_invite ;;
@@ -2863,33 +2985,37 @@ case "${1:-help}" in
   doctor|tests|test) shift; cmd_doctor "$@" ;;
   daemon|autostart|service) shift; cmd_daemon "$@" ;;
   teardown|stop|flush) shift; cmd_teardown "$@" ;;
-  disconnect|leave|unbind) cmd_disconnect ;;
+  disconnect|quit|leave|unbind) cmd_disconnect ;;
   monitor)   shift; monitor "$@" ;;
   debug-scope) echo "$AIRC_WRITE_DIR" ;;
   debug-name)  resolve_name ;;
+  debug-host)  get_host ;;
   help|--help|-h)
     echo "AIRC — Agentic Internet Relay Chat for AI peers"
+    echo "(IRC verbs work as primary; airc-classic names also accepted)"
     echo ""
-    echo "  airc connect                    Auto-#general: join the room on your gh account, or host it"
-    echo "  airc connect --room <name>      Join (or host) a named channel instead of #general"
-    echo "  airc connect --no-general       Single-pair invite mode (legacy 1:1 invite)"
-    echo "  airc connect <gist-id>          Join via shared room/invite gist (cross-account)"
-    echo "  airc connect <name@user@host>   Join via inline invite string (legacy)"
-    echo "  airc rooms / list / ls          List open rooms + invites on your gh account"
-    echo "  airc part                       Leave current room (host: deletes room gist)"
-    echo "  airc update [--channel <name>]  Pull latest on current channel; switch with --channel canary|main"
-    echo "  airc channel [<name>]           Show or set release channel (main = stable, canary = pre-merge testing)"
-    echo "  airc canary                     Shortcut: airc update --channel canary"
-    echo "  airc tests / doctor [scenario]  Run integration suite (88 assertions across 11 scenarios)"
-    echo "  airc daemon [install|status|uninstall|log]  Auto-resume across sleep/wake/crash via launchd (mac) or systemd (linux)"
-    echo "  airc send <peer> <message>      Send a message"
-    echo "  airc ping @peer [timeout]       Monitor-liveness probe (ping/pong, 10s default)"
-    echo "  airc rename <new-name>          Rename this session (notifies peers)"
-    echo "  airc reminder <seconds>         Nudge if silent (off/pause/300)"
+    echo "  airc join                       Auto-#general: enter the room on your gh account, or host it"
+    echo "  airc join --room <name>         Enter (or host) a named channel instead of #general"
+    echo "  airc join <gist-id>             Enter via shared gist id (cross-account)"
+    echo "  airc join <mnemonic>            Enter via humanhash like oregon-uncle-bravo-eleven (same gh account)"
+    echo "  airc list / rooms / ls          List open rooms + invites on your gh account"
+    echo "  airc part                       Leave the current room"
+    echo "  airc msg / send <text>          Broadcast to the current room"
+    echo "  airc msg / send @<peer> <text>  DM a peer (still in the shared log)"
+    echo "  airc nick / rename <new>        Rename this session (notifies peers)"
+    echo "  airc quit / disconnect          Leave the mesh (keep identity for next time)"
     echo "  airc peers                      List connected peers"
-    echo "  airc status [--probe]           Liveness: monitor, queue, last send/recv (add --probe for SSH check)"
-    echo "  airc doctor [tabs|scope|all]    Self-test: pairing, send, rename, scope"
-    echo "  airc teardown [--flush] [--all] Kill scope's airc processes (--flush wipes state; --all = nuke every airc on this machine, ignoring scope)"
+    echo "  airc ping @peer [timeout]       Monitor-liveness probe (ping/pong)"
+    echo ""
+    echo "Operations:"
+    echo "  airc update [--channel <name>]  Pull latest; switch channel with --channel canary|main"
+    echo "  airc channel [<name>]           Show or set release channel"
+    echo "  airc canary                     Shortcut: airc update --channel canary"
+    echo "  airc daemon [install|status|uninstall|log]  Autostart via launchd (mac) / systemd (linux)"
+    echo "  airc tests / doctor [scenario]  Run integration suite + environment health"
+    echo "  airc status [--probe]           Liveness snapshot (--probe for SSH check)"
+    echo "  airc reminder <seconds>         Nudge if silent (off/pause/300)"
+    echo "  airc teardown [--flush] [--all] Kill scope's airc processes (--flush wipes state)"
     echo ""
     echo "Identity resolution (highest priority first):"
     echo "  AIRC_NAME env var > config.json name > cwd basename > hostname"
