@@ -251,10 +251,60 @@ monitor() {
     local rhome; rhome=$(remote_home)
     local ssh_key="$IDENTITY_DIR/ssh_key"
     local ssh_opts="-i $ssh_key -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=3"
+    # Monitor escalation (no-claude-left-behind): count consecutive watchdog
+    # timeouts (formatter exit code 2 = no inbound in WATCHDOG_SEC). After
+    # ESCALATE_AFTER consecutive timeouts, the host is genuinely gone (sleep
+    # without launchd, hard crash, network gone). Exit airc connect with a
+    # distinct code so the platform daemon (launchd / systemd Restart=always)
+    # respawns us into a fresh airc connect — that re-enters the resume path
+    # which now self-heals (PR #46): probes the dead host, gives up, deletes
+    # the stale gist, takes over as the new host of #general. First peer to
+    # complete this loop wins; the others discover the new gist on their next
+    # cold-restart and join as peers. Standard distributed-systems leader
+    # election with optimistic conflict resolution via gh-create.
+    local consecutive_timeouts=0
+    local ESCALATE_AFTER=3   # ~9 minutes of dead host (3 × WATCHDOG_SEC=180)
     while true; do
+      local cycle_start; cycle_start=$(date +%s)
       ssh $ssh_opts "$host_target" "tail $tail_pos -F $rhome/messages.jsonl 2>/dev/null" 2>/dev/null | monitor_formatter "$my_name" || true
+      local fmt_exit="${PIPESTATUS[1]:-0}"
+      local cycle_end; cycle_end=$(date +%s)
+      local cycle_lifetime=$((cycle_end - cycle_start))
+
       # Subsequent reconnects use the now-persisted offset updated by the formatter.
       tail_pos="-n +$(($(cat "$offset_file" 2>/dev/null || echo 0) + 1))"
+
+      # Count this iteration as a "timeout" if formatter exited with code 2
+      # (its watchdog-no-inbound exit) OR the whole pipe died in under 30s
+      # (likely SSH refused / connection reset — host gone). Anything else,
+      # especially a long-lived formatter that received traffic, resets.
+      if [ "$fmt_exit" = "2" ] || [ "$cycle_lifetime" -lt 30 ]; then
+        consecutive_timeouts=$((consecutive_timeouts + 1))
+      else
+        consecutive_timeouts=0
+      fi
+
+      if [ "$consecutive_timeouts" -ge "$ESCALATE_AFTER" ]; then
+        # Only escalate if we have a saved room name (the substrate use case);
+        # legacy 1:1 invite scopes shouldn't auto-promote — they were
+        # explicit pairings, not channel members.
+        local saved_room=""
+        [ -f "$AIRC_WRITE_DIR/room_name" ] && saved_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
+        if [ -n "$saved_room" ]; then
+          echo ""
+          echo "  ⚠  Host of #${saved_room} dead for $consecutive_timeouts consecutive cycles" >&2
+          echo "  ⚠  Exiting airc connect — daemon restart will trigger self-heal" >&2
+          echo "  ⚠  (per the no-claude-left-behind protocol — first agent back becomes new host)" >&2
+          # Specific exit code so postmortems can tell why we left. launchd /
+          # systemd Restart=always treat any non-zero exit as restart-worthy.
+          exit 99
+        else
+          # Legacy 1:1 invite scope. Don't auto-promote, but warn the user
+          # so they can manually re-pair if the host is genuinely gone.
+          echo "  ⚠  $consecutive_timeouts consecutive watchdog timeouts on legacy invite scope — host may be down" >&2
+          consecutive_timeouts=0   # reset to avoid spamming
+        fi
+      fi
       sleep 3
     done
   else
@@ -613,6 +663,17 @@ cmd_connect() {
   local use_gist=1   # default ON; runtime probe later checks gh availability
   local room_name="general"
   local use_room=1   # default ON — auto-#general substrate
+  # Declared at function scope so set -u doesn't bite when JOIN MODE runs
+  # without a prior gist parser (inline-invite path skips the parser
+  # entirely; resolved_room_name only gets a value when we resolved a
+  # kind:room gist envelope).
+  local resolved_room_name=""
+  # _resolved_gist_id is captured by the gist resolver when discovery resolves
+  # a kind:"room" gist. Used by JOIN MODE's self-heal path: if the pair
+  # handshake fails because the host listed in the room gist is unreachable
+  # (sleep/crash/network), the joiner deletes the stale gist and re-execs
+  # itself in host mode — first-agent-back-in becomes the new host.
+  local _resolved_gist_id=""
   local positional=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -762,6 +823,45 @@ cmd_connect() {
           fi
           die "Resume aborted — re-pair required"
         else
+          # Non-auth probe failure = TCP unreachable / timeout / network blip.
+          # If we have a saved room_name (i.e. we were in a #general-style
+          # persistent channel), this is likely the prior host going away.
+          # Per Joel's "no claude left behind" rule, take over as new host.
+          # First-agent-back wins; the prior host (if it returns) will
+          # discover OUR fresh gist on next reconnect and join as a peer.
+          local saved_room=""
+          [ -f "$AIRC_WRITE_DIR/room_name" ] && saved_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
+          if [ -n "$saved_room" ] && command -v gh >/dev/null 2>&1; then
+            echo ""
+            echo "  ⚠  Host of #${saved_room} unreachable on resume — self-healing as new host..."
+            echo "     (saved pair: ${prior_name} @ ${prior_host_target} — likely went away)"
+            # Best-effort: delete any stale `airc room: <name>` gists on our
+            # gh account. We don't know the gist id from saved state (the
+            # joiner doesn't track that), so we sweep by description match.
+            # If the gist isn't on our gh (the host was a peer on a different
+            # account), gh-list returns nothing and we silently skip.
+            local stale_ids; stale_ids=$(gh gist list --limit 50 2>/dev/null \
+              | awk -F'\t' -v re="airc room: ${saved_room}\$" '$2 ~ re { print $1 }')
+            if [ -n "$stale_ids" ]; then
+              while IFS= read -r _gid; do
+                [ -z "$_gid" ] && continue
+                gh gist delete "$_gid" --yes 2>/dev/null \
+                  && echo "  ✓ Removed stale gist $_gid" \
+                  || echo "  ⚠  Couldn't delete gist $_gid (already gone? not on this account?)"
+              done <<< "$stale_ids"
+            else
+              echo "  (no #${saved_room} gist on this gh — host was likely cross-account or already cleaned)"
+            fi
+            # Wipe joiner state so re-exec falls into host mode cleanly.
+            rm -f "$CONFIG"
+            rm -f "$AIRC_WRITE_DIR/room_name"
+            echo "  Re-execing into host mode for #${saved_room}..."
+            echo ""
+            exec env AIRC_NO_DISCOVERY=1 "$0" connect --room "$saved_room"
+          fi
+          # No saved room (legacy 1:1 invite scope) OR no gh: fall through to
+          # the existing retry-in-monitor behavior. Monitor's retry loop
+          # handles transient outages correctly for the legacy case.
           echo "  Host probe failed (non-auth). Monitor will retry in background." >&2
           echo "  SSH stderr: ${probe_stderr:-<none>}" >&2
         fi
@@ -793,8 +893,23 @@ cmd_connect() {
   # Skipped if `gh` isn't available (degraded → host invite-only) or
   # AIRC_NO_DISCOVERY=1 (explicit opt-out). With `--no-general` the room
   # path is skipped and we go straight to single-pair invite host mode.
+  #
+  # IMPORTANT: discovery used to be gated on `[ ! -f CONFIG ]` to avoid
+  # running on resume. But that broke daemon installs into stale-state
+  # scopes: a CONFIG with identity-only data (no host_target — i.e. a
+  # prior host's leftover) skipped the resume path AND discovery, so the
+  # daemon fell through to host mode and created a DUPLICATE #general
+  # gist alongside the existing one.
+  #
+  # The right gate is "no host_target": if the prior CONFIG was a host
+  # (no host_target), we should still attempt discovery on the next
+  # connect — maybe someone else became the new host since we last ran,
+  # or our prior #general gist is still authoritative and we should join
+  # ourselves into it as a peer (the existing-room flow handles that).
   local _did_room_discovery=0
-  if [ -z "$target" ] && [ ! -f "$CONFIG" ] && \
+  local _saved_host_target=""
+  [ -f "$CONFIG" ] && _saved_host_target=$(get_config_val host_target "")
+  if [ -z "$target" ] && [ -z "$_saved_host_target" ] && \
      [ "${AIRC_NO_DISCOVERY:-0}" != "1" ] && \
      command -v gh >/dev/null 2>&1; then
 
@@ -880,19 +995,42 @@ cmd_connect() {
   # if JSON parse fails. Lets pre-envelope gists keep working.
   if [ -n "$target" ] && ! echo "$target" | grep -q '@'; then
     local gist_id="${target#gist:}"
+    # Capture for self-heal in JOIN MODE: if the host in this gist turns
+    # out to be unreachable, JOIN MODE deletes the gist by this id + takes
+    # over as the new host of the same room.
+    _resolved_gist_id="$gist_id"
     # Gist IDs are hex strings, typically 20-32 chars but accept any
     # plausible length so future GH ID schemes don't break us.
     if echo "$gist_id" | grep -qE '^[a-zA-Z0-9]{6,40}$'; then
       echo "  Resolving gist $gist_id ..."
       local raw_content=""
-      if command -v gh >/dev/null 2>&1; then
+      # Prefer `gh api` over `gh gist view --raw` — the latter prepends
+      # the gist description as a header line ("airc room: general\n\n{...}")
+      # which breaks JSON parse downstream. `gh api` returns the file
+      # content cleanly. This bug bit hard during daemon-install dogfood:
+      # parser fell through to the @.*@ regex fallback which captured the
+      # malformed JSON `"invite": "..."` line (quotes and all), pair
+      # handshake failed on garbage host info, and self-heal didn't fire
+      # because resolved_room_name was never extracted via the jq path.
+      if command -v gh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        raw_content=$(gh api "gists/$gist_id" 2>/dev/null \
+                      | jq -r '.files | to_entries[0].value.content // empty' 2>/dev/null)
+      fi
+      # Fallback path 1: gh without jq → degraded gh gist view --raw, with
+      # a description-strip in the consumer below.
+      if [ -z "$raw_content" ] && command -v gh >/dev/null 2>&1; then
         raw_content=$(gh gist view "$gist_id" --raw 2>/dev/null)
       fi
+      # Fallback path 2: anonymous curl + jq for environments without gh.
       if [ -z "$raw_content" ] && command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-        # Anonymous GitHub API call. Works for public + secret gists
-        # given the ID. No auth needed for read.
         raw_content=$(curl -fsSL "https://api.github.com/gists/$gist_id" 2>/dev/null \
                       | jq -r '.files | to_entries[0].value.content // empty' 2>/dev/null)
+      fi
+      # Last-resort cleanup: if raw_content still has the description-header
+      # leak from a degraded gh-view path, strip lines before the first '{'
+      # (room/invite envelopes are JSON, always start with '{').
+      if [ -n "$raw_content" ] && ! printf '%s' "$raw_content" | head -c 1 | grep -q '{'; then
+        raw_content=$(printf '%s' "$raw_content" | awk '/^\{/{flag=1} flag')
       fi
       if [ -z "$raw_content" ]; then
         die "Failed to fetch gist '$gist_id'. Check the ID, network, and (if private) 'gh auth login'."
@@ -902,7 +1040,6 @@ cmd_connect() {
       # field, dispatch on `kind`. Otherwise, treat raw_content as the
       # legacy raw-invite-string format (backward compat).
       local resolved=""
-      local resolved_room_name=""   # set when kind==room, used to remember which room we joined
       if command -v jq >/dev/null 2>&1; then
         local airc_ver kind
         airc_ver=$(printf '%s' "$raw_content" | jq -r '.airc // empty' 2>/dev/null)
@@ -1014,6 +1151,7 @@ EOF
     my_sign_pub=$(cat "$IDENTITY_DIR/public.pem" 2>/dev/null)
 
     local response
+    local _pair_ok=1
     response=$(python3 -c "
 import socket, json, sys
 payload = json.dumps({
@@ -1035,7 +1173,56 @@ while True:
     data += chunk
 sock.close()
 print(data.decode().strip())
-" 2>&1) || die "Can't reach $peer_host_only:$peer_port. Is the host running 'airc connect'?"
+" 2>&1) || _pair_ok=0
+
+    if [ "$_pair_ok" = "0" ]; then
+      # ── Self-heal: stale-host takeover ─────────────────────────────
+      # If discovery handed us a kind:room gist AND the host listed in it
+      # is unreachable, the most likely cause is the prior host went away
+      # (laptop sleep, crash, network blip). Per Joel: "no claude left
+      # behind" — first agent back in becomes the new host of #general.
+      #
+      # Mechanics:
+      #   1. Delete the stale gist (we have gh perms because it's on our
+      #      own gh account, same auth as the discovery that found it).
+      #   2. Tear down the half-written CONFIG that pointed at the dead
+      #      host (else resume on next start would loop into the same
+      #      stale pair).
+      #   3. exec into a fresh airc connect in HOST mode for the same
+      #      room name. AIRC_NO_DISCOVERY=1 so we don't re-find the gist
+      #      we just deleted (gh propagation lag).
+      #
+      # Only fires when ALL three are true:
+      #   - We resolved a kind:room gist (resolved_room_name + _resolved_gist_id non-empty)
+      #   - gh CLI is available (to delete the stale gist)
+      #   - Pair handshake failed (TCP unreachable / timeout)
+      # If any condition isn't met, fall through to the original die().
+      if [ -n "$resolved_room_name" ] && [ -n "$_resolved_gist_id" ] \
+         && command -v gh >/dev/null 2>&1; then
+        echo ""
+        echo "  ⚠  Host of #${resolved_room_name} unreachable — self-healing as new host..."
+        echo "     (prior host's gist: $_resolved_gist_id)"
+        if gh gist delete "$_resolved_gist_id" --yes 2>/dev/null; then
+          echo "  ✓ Stale gist removed."
+        else
+          echo "  ⚠  Couldn't remove stale gist (already gone? not on this gh account?)."
+          echo "     New host will publish a fresh #${resolved_room_name} gist anyway."
+        fi
+        # Wipe the CONFIG we just wrote — it points at the dead host and
+        # would trigger 'resume joiner' on next airc connect, looping back
+        # into this same failure.
+        rm -f "$CONFIG"
+        rm -f "$AIRC_WRITE_DIR/room_name"
+        echo "  Re-execing into host mode for #${resolved_room_name}..."
+        echo ""
+        # exec replaces the current bash process — clean handoff. AIRC_NO_DISCOVERY=1
+        # ensures the new instance doesn't try to re-discover the just-deleted gist
+        # (gh's gist-list cache might still show it for a few seconds).
+        exec env AIRC_NO_DISCOVERY=1 "$0" connect --room "$resolved_room_name"
+      fi
+      # Either not a room flow, or no gh, or no resolved_room_name → original die.
+      die "Can't reach $peer_host_only:$peer_port. Is the host running 'airc connect'?"
+    fi
 
     # Authorize host's SSH pubkey (for the joiner->host auth direction).
     # NOTE: the handshake's ssh_pub is airc's USER identity key — not the
@@ -1192,6 +1379,18 @@ EOF
       echo "  On the other machine:"
       echo "    airc connect $_invite_long"
       _printed_long=1
+    fi
+
+    # Record room name + print substrate banner BEFORE the gist push
+    # attempt so cmd_part / status / diagnostics know the channel name
+    # even when the gist push is skipped (--no-gist) or fails (gh
+    # missing/unauthed). The gist_id is recorded only when an actual
+    # gist is created (see below). The "Hosting #<name>" banner is the
+    # signal both humans and the integration test use to confirm
+    # substrate framing took effect — emit unconditionally for room mode.
+    if [ "$use_room" = "1" ]; then
+      echo "$room_name" > "$AIRC_WRITE_DIR/room_name"
+      echo "  Hosting #${room_name} (gh-account substrate)."
     fi
 
     # ── Gist transport (--gist flag, issue #37) ────────────────────
@@ -1701,14 +1900,19 @@ cmd_rooms() {
 }
 
 # ── cmd_part: leave the current room ──────────────────────────────────
-# Issue #39. Two paths:
-#   - Host: delete the room gist (graceful channel teardown — joiners
-#     will see SSH die and re-host on next reconnect, IRC-style "ircd
-#     restart"). Then teardown local processes.
-#   - Joiner: just teardown local processes. Host's gist stays open for
-#     other joiners (we're one of N).
+# Issue #39. Two paths, distinguished by config.json's host_target:
+#   - Host (no host_target): delete the room gist if we created one, then
+#     teardown. Joiners watching us will see SSH die — IRC's "ircd
+#     restart" — and the next reconnect re-elects a new host.
+#   - Joiner (host_target set): just teardown local processes; host's
+#     gist stays open for other joiners (we're one of N).
 # Either way, local config + identity + peer records persist (use
 # `airc teardown --flush` for nuclear).
+#
+# Detection note: we use config.json::host_target as the host-vs-joiner
+# signal, NOT presence of room_gist_id. The gist file may be absent for
+# a legitimate host case (`--no-gist`, or gh push failed) — falling back
+# to "you're a joiner" would be wrong.
 cmd_part() {
   ensure_init
 
@@ -1717,22 +1921,29 @@ cmd_part() {
   local room_name="(unnamed)"
   [ -f "$room_name_file" ] && room_name=$(cat "$room_name_file")
 
-  if [ -f "$gist_id_file" ]; then
-    # We were the host. Delete the room gist so future `airc connect`
-    # in this gh account doesn't keep trying to pair against a dead
-    # SSH endpoint.
-    local gid; gid=$(cat "$gist_id_file")
-    if command -v gh >/dev/null 2>&1; then
-      echo "  Host of #${room_name} parting — deleting room gist ${gid}..."
-      gh gist delete "$gid" --yes 2>/dev/null \
-        && echo "  ✓ Room gist deleted." \
-        || echo "  ⚠  Couldn't delete gist ${gid} (already gone? gh auth?). Continuing teardown."
+  local host_target; host_target=$(get_config_val host_target "")
+
+  if [ -z "$host_target" ]; then
+    # ── Host path ──
+    if [ -f "$gist_id_file" ]; then
+      local gid; gid=$(cat "$gist_id_file")
+      if command -v gh >/dev/null 2>&1; then
+        echo "  Host of #${room_name} parting — deleting room gist ${gid}..."
+        gh gist delete "$gid" --yes 2>/dev/null \
+          && echo "  ✓ Room gist deleted." \
+          || echo "  ⚠  Couldn't delete gist ${gid} (already gone? gh auth?). Continuing teardown."
+      else
+        echo "  ⚠  gh CLI not available — can't delete room gist ${gid} automatically."
+        echo "     Delete it manually:  gh gist delete ${gid} --yes"
+      fi
     else
-      echo "  ⚠  gh CLI not available — can't delete room gist ${gid} automatically."
-      echo "     Delete it manually:  gh gist delete ${gid} --yes"
+      # Host but no gist (--no-gist or gh-push failed). Nothing to delete
+      # in the gh namespace; just clean local state.
+      echo "  Host of #${room_name} parting (no gist was published; nothing to clean up in gh)."
     fi
     rm -f "$gist_id_file" "$room_name_file"
   else
+    # ── Joiner path ──
     echo "  Joiner of #${room_name} parting — host's gist stays open for others."
     rm -f "$room_name_file"
   fi
@@ -2298,6 +2509,300 @@ else:
   fi
 }
 
+# ── cmd_daemon: install / manage the OS auto-restart for `airc connect` ────
+# Issue followup to #39 substrate: the channel must auto-resume across machine
+# sleep/wake/crash so users walk away and come back to a live mesh. Without
+# this, every laptop sleep kills airc + the user must remember to restart it.
+#
+# Implementation: install a platform-native autostart that wraps `airc connect`
+# with KeepAlive/Restart=always. AIRC_BACKGROUND_OK=1 is set in the env so
+# airc's heartbeat-stdout-pipe-trap doesn't exit-3 under launchd/systemd
+# (which have no notification-consumer reading stdout).
+#
+# Subcommands:
+#   airc daemon install    Install + start the autostart entry
+#   airc daemon uninstall  Stop + remove the autostart entry
+#   airc daemon status     Show install state + running pid + log path
+#   airc daemon log [N]    Tail the daemon stdout log
+#
+# Scope: defaults to the GLOBAL scope ($HOME/.airc), since the daemon is the
+# user's "always-on" mesh presence — not tied to a specific project dir. If
+# the user wants a per-project always-on daemon, they pass AIRC_HOME=<dir>
+# in the environment when running install (and the generated unit/plist
+# will carry that scope).
+cmd_daemon() {
+  local action="${1:-status}"
+  shift 2>/dev/null || true
+  case "$action" in
+    install)   cmd_daemon_install "$@" ;;
+    uninstall|remove|stop) cmd_daemon_uninstall "$@" ;;
+    status)    cmd_daemon_status "$@" ;;
+    log|logs)  cmd_daemon_log "$@" ;;
+    *)         die "Usage: airc daemon [install|uninstall|status|log]" ;;
+  esac
+}
+
+# Detect the OS: darwin / linux / wsl / unknown.
+_daemon_os() {
+  case "$(uname -s)" in
+    Darwin) echo "darwin" ;;
+    Linux)
+      # WSL2 detection — systemd may or may not be enabled; we still treat
+      # it as linux (user must have [boot] systemd=true in wsl.conf).
+      if grep -qi 'microsoft\|wsl' /proc/version 2>/dev/null; then
+        echo "wsl"
+      else
+        echo "linux"
+      fi
+      ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+# Resolve the absolute path to airc binary that should run under the daemon.
+# install.sh symlinks $HOME/.local/bin/airc → $AIRC_DIR/airc; we want the
+# real path so a future `airc update` (which mutates $AIRC_DIR/airc in
+# place) is picked up by launchd/systemd without re-installing the unit.
+_daemon_airc_path() {
+  local airc_link="${HOME}/.local/bin/airc"
+  if [ -L "$airc_link" ] || [ -x "$airc_link" ]; then
+    echo "$airc_link"
+  elif [ -x "${AIRC_DIR:-$HOME/.airc-src}/airc" ]; then
+    echo "${AIRC_DIR:-$HOME/.airc-src}/airc"
+  else
+    echo "/usr/local/bin/airc"  # last-resort guess; install will fail loud if wrong
+  fi
+}
+
+# The scope the daemon will run under. If AIRC_HOME is set at install time,
+# that's recorded in the unit/plist so future starts use the same scope.
+_daemon_scope() {
+  echo "${AIRC_HOME:-$HOME/.airc}"
+}
+
+cmd_daemon_install() {
+  local os; os=$(_daemon_os)
+  local airc_bin; airc_bin=$(_daemon_airc_path)
+  local scope; scope=$(_daemon_scope)
+  mkdir -p "$scope"
+
+  case "$os" in
+    darwin) _daemon_install_launchd "$airc_bin" "$scope" ;;
+    linux|wsl) _daemon_install_systemd "$airc_bin" "$scope" "$os" ;;
+    *) die "Daemon install not supported on $(uname -s). Manual workaround: run 'airc connect' under your platform's preferred autostart mechanism." ;;
+  esac
+}
+
+_daemon_install_launchd() {
+  local airc_bin="$1" scope="$2"
+  local plist_dir="$HOME/Library/LaunchAgents"
+  local plist_path="$plist_dir/com.cambriantech.airc.plist"
+  mkdir -p "$plist_dir"
+  cat > "$plist_path" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cambriantech.airc</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${airc_bin}</string>
+        <string>connect</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AIRC_BACKGROUND_OK</key>
+        <string>1</string>
+        <key>AIRC_HOME</key>
+        <string>${scope}</string>
+        <key>HOME</key>
+        <string>${HOME}</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:${HOME}/.local/bin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${scope}/daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>${scope}/daemon.err</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>
+PLIST
+  echo "  Wrote $plist_path"
+  # Bootout first to reset any prior load (idempotent install).
+  launchctl bootout "gui/$(id -u)/com.cambriantech.airc" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$plist_path" 2>&1 \
+    || die "launchctl bootstrap failed. Plist written but not loaded; check Console.app for errors."
+  launchctl enable "gui/$(id -u)/com.cambriantech.airc" 2>/dev/null || true
+  echo "  ✓ Loaded into launchd (gui/$(id -u)/com.cambriantech.airc)"
+  echo "  airc will now auto-start at login + restart on crash + survive sleep/wake."
+  echo "  Logs:   $scope/daemon.log"
+  echo "  Status: airc daemon status"
+  echo ""
+  echo "  Note: gh keychain access — if 'airc canary' / gist push fails under"
+  echo "        launchd, the gh keychain may not be unlocked at boot. Workaround:"
+  echo "        run 'gh auth status' once after login to unlock, then airc daemon"
+  echo "        will pick up gh credentials on next restart."
+}
+
+_daemon_install_systemd() {
+  local airc_bin="$1" scope="$2" os="$3"
+  local unit_dir="$HOME/.config/systemd/user"
+  local unit_path="$unit_dir/airc.service"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    if [ "$os" = "wsl" ]; then
+      die "systemctl not found. Enable systemd in WSL: edit /etc/wsl.conf to add [boot]\nsystemd=true, then 'wsl --shutdown' from PowerShell + restart your distro."
+    else
+      die "systemctl not found. Daemon install requires systemd."
+    fi
+  fi
+  # Probe the user-level systemd bus BEFORE writing the unit. WSL2 ships
+  # systemctl on PATH but typically has init (not systemd) as PID 1, so
+  # `systemctl --user` returns "Failed to connect to bus" — we'd write
+  # the unit then fail to load it, leaving cruft on disk. Detect early.
+  if ! systemctl --user is-system-running >/dev/null 2>&1 \
+     && ! systemctl --user list-units >/dev/null 2>&1; then
+    if [ "$os" = "wsl" ]; then
+      cat >&2 <<EOF
+ERROR: systemctl is on PATH but the user-level systemd bus isn't reachable
+       (Failed to connect to bus). On WSL2 this means systemd isn't running
+       as PID 1 — the default Ubuntu image launches with init instead.
+
+Enable systemd in WSL:
+  1. In your WSL distro, edit /etc/wsl.conf and add:
+
+       [boot]
+       systemd=true
+
+  2. From PowerShell on Windows:    wsl --shutdown
+  3. Reopen your WSL terminal. Confirm with:    ps -p 1 -o comm=    (should print "systemd")
+  4. Re-run:    airc daemon install
+
+Until systemd is enabled, airc daemon can't auto-resume on this WSL distro.
+A manual fallback for now:  run 'airc connect' in a tmux/screen session that
+won't get killed by your WSL shell exit.
+EOF
+      return 1
+    else
+      die "systemctl present but user-level systemd bus unreachable. Check: systemctl --user status (and ensure systemd is PID 1 on this host)."
+    fi
+  fi
+  mkdir -p "$unit_dir"
+  cat > "$unit_path" <<UNIT
+[Unit]
+Description=airc — agentic IRC chat for AI peers (auto-resume mesh)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${airc_bin} connect
+Restart=always
+RestartSec=5
+Environment="AIRC_BACKGROUND_OK=1"
+Environment="AIRC_HOME=${scope}"
+StandardOutput=append:${scope}/daemon.log
+StandardError=append:${scope}/daemon.err
+
+[Install]
+WantedBy=default.target
+UNIT
+  echo "  Wrote $unit_path"
+  systemctl --user daemon-reload || die "systemctl --user daemon-reload failed."
+  systemctl --user enable --now airc.service \
+    || die "systemctl --user enable --now airc.service failed."
+  echo "  ✓ Loaded into systemd-user (airc.service)"
+  echo "  airc will now auto-start at login + restart on crash."
+  echo "  Logs:   $scope/daemon.log  (or: journalctl --user -u airc -f)"
+  echo "  Status: airc daemon status"
+  echo ""
+  echo "  Note: systemd-user units stop at logout unless lingering is enabled."
+  echo "        For 'always on across logout' (typical for an always-up mesh):"
+  echo "          sudo loginctl enable-linger \$USER"
+}
+
+cmd_daemon_uninstall() {
+  local os; os=$(_daemon_os)
+  case "$os" in
+    darwin)
+      local plist_path="$HOME/Library/LaunchAgents/com.cambriantech.airc.plist"
+      launchctl bootout "gui/$(id -u)/com.cambriantech.airc" 2>/dev/null \
+        && echo "  ✓ Unloaded from launchd" \
+        || echo "  (was not loaded)"
+      [ -f "$plist_path" ] && rm "$plist_path" && echo "  ✓ Removed $plist_path" \
+        || echo "  (no plist on disk)"
+      ;;
+    linux|wsl)
+      systemctl --user disable --now airc.service 2>/dev/null \
+        && echo "  ✓ Stopped + disabled airc.service" \
+        || echo "  (was not enabled)"
+      local unit_path="$HOME/.config/systemd/user/airc.service"
+      [ -f "$unit_path" ] && rm "$unit_path" && systemctl --user daemon-reload && echo "  ✓ Removed $unit_path" \
+        || echo "  (no unit on disk)"
+      ;;
+    *) echo "  Daemon uninstall not supported on $(uname -s)."; return 1 ;;
+  esac
+}
+
+cmd_daemon_status() {
+  local os; os=$(_daemon_os)
+  case "$os" in
+    darwin)
+      local plist_path="$HOME/Library/LaunchAgents/com.cambriantech.airc.plist"
+      if [ -f "$plist_path" ]; then
+        echo "  Plist:   $plist_path"
+        # launchctl print returns rich state; grep the key fields.
+        local state; state=$(launchctl print "gui/$(id -u)/com.cambriantech.airc" 2>/dev/null \
+          | grep -E 'state =|pid =|last exit code' | head -3)
+        if [ -n "$state" ]; then
+          echo "  Loaded:  yes"
+          printf '%s\n' "$state" | sed 's/^[[:space:]]*/    /'
+        else
+          echo "  Loaded:  no (plist present but not bootstrapped — try 'airc daemon install' to reload)"
+        fi
+        local scope; scope=$(_daemon_scope)
+        echo "  Logs:    $scope/daemon.log"
+      else
+        echo "  No daemon installed. Run: airc daemon install"
+      fi
+      ;;
+    linux|wsl)
+      local unit_path="$HOME/.config/systemd/user/airc.service"
+      if [ -f "$unit_path" ]; then
+        echo "  Unit:    $unit_path"
+        local active; active=$(systemctl --user is-active airc.service 2>/dev/null)
+        local enabled; enabled=$(systemctl --user is-enabled airc.service 2>/dev/null)
+        echo "  Active:  $active"
+        echo "  Enabled: $enabled"
+        local scope; scope=$(_daemon_scope)
+        echo "  Logs:    $scope/daemon.log  (journalctl --user -u airc -f for live)"
+      else
+        echo "  No daemon installed. Run: airc daemon install"
+      fi
+      ;;
+    *) echo "  Daemon status not supported on $(uname -s)." ;;
+  esac
+}
+
+cmd_daemon_log() {
+  local n="${1:-50}"
+  local scope; scope=$(_daemon_scope)
+  local log="$scope/daemon.log"
+  if [ ! -f "$log" ]; then
+    echo "  No log at $log. Daemon may not have started yet."
+    return 1
+  fi
+  tail -"$n" "$log"
+}
+
 cmd_doctor() {
   # Self-diagnose: run the bundled integration test script.
   # Install resolves it under AIRC_DIR/test; fall back to a sibling dir
@@ -2355,7 +2860,8 @@ case "${1:-help}" in
   canary) shift; cmd_update --channel canary "$@" ;;
   logs)      shift; cmd_logs "$@" ;;
   status)    shift; cmd_status "$@" ;;
-  doctor)    shift; cmd_doctor "$@" ;;
+  doctor|tests|test) shift; cmd_doctor "$@" ;;
+  daemon|autostart|service) shift; cmd_daemon "$@" ;;
   teardown|stop|flush) shift; cmd_teardown "$@" ;;
   disconnect|leave|unbind) cmd_disconnect ;;
   monitor)   shift; monitor "$@" ;;
@@ -2375,6 +2881,7 @@ case "${1:-help}" in
     echo "  airc channel [<name>]           Show or set release channel (main = stable, canary = pre-merge testing)"
     echo "  airc canary                     Shortcut: airc update --channel canary"
     echo "  airc tests / doctor [scenario]  Run integration suite (88 assertions across 11 scenarios)"
+    echo "  airc daemon [install|status|uninstall|log]  Auto-resume across sleep/wake/crash via launchd (mac) or systemd (linux)"
     echo "  airc send <peer> <message>      Send a message"
     echo "  airc ping @peer [timeout]       Monitor-liveness probe (ping/pong, 10s default)"
     echo "  airc rename <new-name>          Rename this session (notifies peers)"
