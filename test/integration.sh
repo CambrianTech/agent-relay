@@ -73,11 +73,22 @@ cleanup_known_hosts() {
 cleanup_all() { cleanup_procs; cleanup_dirs; cleanup_known_hosts; }
 
 # Boot a host. Args: home, name, port
+#
+# Defaults to --no-general --no-gist for two reasons:
+# (1) These existing scenarios test the LOWER-layer single-pair invite
+#     behavior, not the IRC substrate. With #39's defaults, bare
+#     `airc connect` would create a real `airc room: general` gist on
+#     the user's gh account and pollute the test environment for every
+#     subsequent scenario that bare-connects.
+# (2) Tests must run gh-free in CI; --no-gist is the explicit opt-out.
+# Scenarios that DO want substrate behavior (scenario_room) call airc
+# directly with their own flags rather than going through spawn_host.
 spawn_host() {
   local home="$1" name="$2" port="$3"
   mkdir -p "$home"
   ( cd "$home" && AIRC_HOME="$home/state" AIRC_NAME="$name" AIRC_PORT="$port" \
-      "$AIRC" connect > "$home/out.log" 2>&1 & )
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --no-general --no-gist > "$home/out.log" 2>&1 & )
   local i
   for i in 1 2 3 4 5; do
     sleep 1
@@ -87,10 +98,15 @@ spawn_host() {
 }
 
 # Join a host. Args: home, name, join-string
+#
+# AIRC_NO_DISCOVERY=1 also for tests — the joiner's target is always an
+# inline invite string in the existing scenarios; we don't want it
+# probing gh for a #general gist that may have been created out-of-band.
 spawn_joiner() {
   local home="$1" name="$2" join="$3"
   mkdir -p "$home"
   ( cd "$home" && AIRC_HOME="$home/state" AIRC_NAME="$name" \
+      AIRC_NO_DISCOVERY=1 \
       "$AIRC" connect "$join" > "$home/out.log" 2>&1 & )
   local i
   for i in 1 2 3 4 5 6; do
@@ -293,7 +309,8 @@ scenario_reminder() {
   local home=/tmp/airc-it-r
   mkdir -p "$home"
   ( cd "$home" && AIRC_HOME="$home/state" AIRC_NAME=hb-host AIRC_PORT=7549 AIRC_REMINDER=2 \
-      "$AIRC" connect > "$home/out.log" 2>&1 & )
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --no-general --no-gist > "$home/out.log" 2>&1 & )
   local i
   for i in 1 2 3 4 5; do sleep 1; grep -q 'Hosting as' "$home/out.log" 2>/dev/null && break; done
 
@@ -392,7 +409,8 @@ scenario_resilience() {
   # PID 1 always exists but can't be our parent, and pgrep -P 999999 always returns 1.
   echo "999999" > "$sp_home/state/airc.pid"
   ( cd "$sp_home" && AIRC_HOME="$sp_home/state" AIRC_NAME=stalepid-host AIRC_PORT=7549 \
-      "$AIRC" connect > "$sp_home/out.log" 2>&1 & )
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --no-general --no-gist > "$sp_home/out.log" 2>&1 & )
   local i
   for i in 1 2 3 4 5 6; do sleep 1; grep -q 'Hosting as' "$sp_home/out.log" 2>/dev/null && break; done
   grep -q 'Hosting as' "$sp_home/out.log" && pass "stale pidfile: cmd_connect recovers and reaches Hosting" \
@@ -482,7 +500,8 @@ scenario_reconnect() {
   # (Can't use spawn_host as-is because it mkdir's and overwrites state.
   #  Instead re-invoke connect directly pointing at the same state.)
   ( cd /tmp/airc-it-rec-h && AIRC_HOME=/tmp/airc-it-rec-h/state AIRC_NAME=alpha AIRC_PORT=7549 \
-      "$AIRC" connect >> /tmp/airc-it-rec-h/out.log 2>&1 & )
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --no-general --no-gist >> /tmp/airc-it-rec-h/out.log 2>&1 & )
   local i
   for i in 1 2 3 4 5 6 7 8; do
     sleep 1
@@ -786,6 +805,123 @@ scenario_resume_stale_auth() {
   cleanup_all
 }
 
+# ── Scenario: room (#39 — IRC-style #general substrate) ────────────────
+# Validates the room-mode flag plumbing, host-vs-joiner detection in
+# cmd_part, and that --no-gist still records local room state. Doesn't
+# touch GitHub at all (no gh dependency); all wire-level pairing reuses
+# the long-invite handshake the rest of the suite already proves.
+#
+# What we DO test:
+#   - --room flag accepted; banner reports "Hosting #<name> (gh-account substrate)"
+#   - room_name file written under AIRC_HOME (even with --no-gist)
+#   - joiner pairs via inline invite and bidirectional send works
+#   - cmd_part on host: detects host via config.host_target absence, runs
+#     teardown, removes room_name file, doesn't try to gh-delete (no
+#     gist_id stored under --no-gist)
+#   - cmd_part on joiner: reports joiner status, removes room_name only,
+#     leaves identity intact
+#
+# What we explicitly DON'T test (out of scope; covered by manual e2e
+# w/ real gh + the next PR's multi-room work):
+#   - Discovery of an existing #general gist on the gh account
+#   - Persistence of a room gist after pair (the gist itself isn't
+#     created here — `--no-gist` keeps the test gh-free)
+#   - Multi-joiner room (one host, N joiners) — single-joiner here
+#     proves the flag path; N-joiner is a topology test, not a flag test
+scenario_room() {
+  section "room: #39 IRC-style substrate (--room + cmd_part, no gh)"
+  cleanup_all
+
+  local rname="test-irc-$$"
+
+  # ── Host alpha in room mode, gist push disabled so the test runs
+  #    in any environment (CI, gh-less workstations).
+  mkdir -p /tmp/airc-it-h
+  ( cd /tmp/airc-it-h && AIRC_HOME=/tmp/airc-it-h/state AIRC_NAME=alpha AIRC_PORT=7549 \
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --no-gist --room "$rname" > /tmp/airc-it-h/out.log 2>&1 & )
+  local i
+  for i in 1 2 3 4 5; do
+    sleep 1
+    grep -q 'Hosting as' /tmp/airc-it-h/out.log 2>/dev/null && break
+  done
+  grep -q 'Hosting as' /tmp/airc-it-h/out.log \
+    && pass "alpha hosting in room mode (--room ${rname}, --no-gist)" \
+    || { fail "alpha host failed to start in room mode"; cleanup_all; return; }
+
+  # Banner asserts substrate framing: "Hosting #<name>" must appear so
+  # users (and the AI agent) can tell which channel they're on.
+  grep -qE "Hosting #${rname}" /tmp/airc-it-h/out.log \
+    && pass "alpha banner reports #${rname} (substrate framing)" \
+    || fail "alpha banner missing 'Hosting #${rname}' line"
+
+  # room_name file MUST be on disk even with --no-gist. cmd_part + status
+  # + diagnostics rely on it.
+  [ -f /tmp/airc-it-h/state/room_name ] && [ "$(cat /tmp/airc-it-h/state/room_name)" = "$rname" ] \
+    && pass "alpha room_name file recorded ($(cat /tmp/airc-it-h/state/room_name))" \
+    || fail "alpha room_name file missing or wrong value"
+
+  # No gist was pushed → no room_gist_id (this is the bug we just fixed:
+  # cmd_part previously used gist_id presence as the host-vs-joiner
+  # signal, which would misclassify --no-gist hosts as joiners).
+  [ ! -f /tmp/airc-it-h/state/room_gist_id ] \
+    && pass "alpha has no room_gist_id (--no-gist as expected)" \
+    || fail "alpha unexpectedly wrote room_gist_id under --no-gist"
+
+  # ── Joiner beta pairs via inline invite (long form, gh-free).
+  local join; join=$(read_join_string /tmp/airc-it-h)
+  [ -n "$join" ] && pass "alpha join string captured for beta to use" \
+                 || { fail "no join string in alpha log"; cleanup_all; return; }
+
+  spawn_joiner /tmp/airc-it-j beta "$join" \
+    && pass "beta joined alpha's room" \
+    || { fail "beta join failed"; cleanup_all; return; }
+
+  # Bidirectional send still works through a room (room-ness is purely
+  # at the discovery + lifecycle layer; the wire is unchanged).
+  sleep 3
+  as_home /tmp/airc-it-j send @alpha "room-msg-from-beta" >/dev/null 2>&1 \
+    && pass "beta → alpha send through room works" \
+    || fail "beta → alpha send through room FAILED"
+  sleep 3
+  grep -q 'room-msg-from-beta' /tmp/airc-it-h/out.log \
+    && pass "alpha received beta's message through room" \
+    || fail "alpha did NOT receive beta's message"
+
+  # ── cmd_part on JOINER (beta).
+  # Joiner has host_target in config → cmd_part takes joiner branch:
+  # removes room_name only, doesn't touch gist (we have none anyway),
+  # then runs teardown.
+  local part_out
+  part_out=$(as_home /tmp/airc-it-j part 2>&1)
+  echo "$part_out" | grep -q 'Joiner of #' \
+    && pass "beta cmd_part identifies as joiner (config.host_target detection)" \
+    || fail "beta cmd_part DID NOT identify as joiner: $part_out"
+  echo "$part_out" | grep -qE 'gh.*delete|gist delete' \
+    && fail "beta cmd_part attempted gh delete (joiner shouldn't)" \
+    || pass "beta cmd_part correctly skipped gh delete (joiner)"
+  [ ! -f /tmp/airc-it-j/state/room_name ] \
+    && pass "beta room_name removed after part" \
+    || fail "beta room_name still present after part"
+
+  # ── cmd_part on HOST (alpha).
+  # Host has no host_target → cmd_part takes host branch. With --no-gist
+  # there's no gist_id, so it should report "no gist was published"
+  # rather than mis-routing into joiner branch (the bug we just fixed).
+  part_out=$(as_home /tmp/airc-it-h part 2>&1)
+  echo "$part_out" | grep -q 'Host of #' \
+    && pass "alpha cmd_part identifies as host (config no host_target)" \
+    || fail "alpha cmd_part DID NOT identify as host: $part_out"
+  echo "$part_out" | grep -q 'no gist was published' \
+    && pass "alpha cmd_part correctly noted absent gist (--no-gist host case)" \
+    || fail "alpha cmd_part didn't acknowledge --no-gist case: $part_out"
+  [ ! -f /tmp/airc-it-h/state/room_name ] \
+    && pass "alpha room_name removed after part" \
+    || fail "alpha room_name still present after part"
+
+  cleanup_all
+}
+
 case "$MODE" in
   tabs)         scenario_tabs  ;;
   scope)        scenario_scope ;;
@@ -797,8 +933,9 @@ case "$MODE" in
   status)       scenario_status ;;
   auth_failure) scenario_auth_failure ;;
   resume_stale_auth) scenario_resume_stale_auth ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|all]"; exit 2 ;;
+  room)         scenario_room ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|all]"; exit 2 ;;
 esac
 
 echo
