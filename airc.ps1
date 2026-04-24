@@ -499,9 +499,9 @@ function Get-FreeAircPort {
 # Bash uses pgrep -P + kill. Windows: taskkill /T /F walks the process
 # tree (children of children too) and force-kills. One call.
 function Stop-ProcessTree {
-    param([int]$Pid)
-    if (-not $Pid -or $Pid -le 0) { return }
-    & taskkill /PID $Pid /T /F 2>$null | Out-Null
+    param([int]$ProcId)
+    if (-not $ProcId -or $ProcId -le 0) { return }
+    & taskkill /PID $ProcId /T /F 2>$null | Out-Null
 }
 
 # -- PID file management ------------------------------------------------
@@ -1295,7 +1295,7 @@ function Invoke-Teardown {
         }
         foreach ($p in $procs) {
             Write-Host "  --all: killing PID $($p.ProcessId) ($($p.Name))"
-            Stop-ProcessTree -Pid $p.ProcessId
+            Stop-ProcessTree -ProcId $p.ProcessId
             $killed = $true
         }
         if (-not $killed) { Write-Host '  --all: no machine-wide airc processes to kill.' }
@@ -1310,7 +1310,7 @@ function Invoke-Teardown {
         }
         if ($alivePids.Count -gt 0) {
             Write-Host "  killing scope $AIRC_WRITE_DIR : $($alivePids -join ' ')"
-            foreach ($p in $alivePids) { Stop-ProcessTree -Pid $p }
+            foreach ($p in $alivePids) { Stop-ProcessTree -ProcId $p }
             $killed = $true
         }
         Remove-Item (Join-Path $AIRC_WRITE_DIR 'airc.pid') -Force -ErrorAction SilentlyContinue
@@ -1328,7 +1328,7 @@ function Invoke-Teardown {
             # Heuristic: only kill if the owner is pwsh/python/airc-related.
             if ($owner.Name -match '^(pwsh|python|powershell)$') {
                 Write-Host "  freeing stale port $port (PID $($c.OwningProcess) - $($owner.Name))"
-                Stop-ProcessTree -Pid $c.OwningProcess
+                Stop-ProcessTree -ProcId $c.OwningProcess
                 $killed = $true
             }
         }
@@ -1690,7 +1690,7 @@ function Invoke-Connect {
     if ($stalePids.Count -gt 0) {
         foreach ($p in $stalePids) {
             if (Get-Process -Id $p -ErrorAction SilentlyContinue) {
-                Stop-ProcessTree -Pid $p
+                Stop-ProcessTree -ProcId $p
             }
         }
         Remove-Item (Join-Path $AIRC_WRITE_DIR 'airc.pid') -Force -ErrorAction SilentlyContinue
