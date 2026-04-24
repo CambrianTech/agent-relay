@@ -793,16 +793,32 @@ for line in sys.stdin:
         continue
     if pong_match:
         continue
-    PREVIEW_LEN = 100
-    msg_preview = msg.replace("\n", " ").strip()
-    if len(msg_preview) > PREVIEW_LEN:
-        msg_preview = msg_preview[:PREVIEW_LEN] + "..."
-    if fr in ("airc", "sys"):
-        print(f"airc: [#{room_name}] {msg_preview}", flush=True)
-    elif to and to not in ("all", ""):
-        print(f"airc: [#{room_name}] {fr} -> {to}: {msg_preview}", flush=True)
-    else:
-        print(f"airc: [#{room_name}] {fr}: {msg_preview}", flush=True)
+    # No length cap -- consumers (Claude Code Monitor, Codex, log
+    # tailers, etc.) decide their own display truncation. Truncating in
+    # the substrate forced everyone downstream to fall back to
+    # `airc logs` to see the actual content (anti-pattern Joel called
+    # out 2026-04-24). Newlines collapsed to spaces so each emitted
+    # event is still a single line, but full body always reaches the
+    # consumer.
+    msg_one_line = (msg or "").replace("\n", " ").replace("\r", " ").strip()
+    try:
+        if fr in ("airc", "sys"):
+            print(f"airc: [#{room_name}] {msg_one_line}", flush=True)
+        elif to and to not in ("all", ""):
+            print(f"airc: [#{room_name}] {fr} -> {to}: {msg_one_line}", flush=True)
+        else:
+            print(f"airc: [#{room_name}] {fr}: {msg_one_line}", flush=True)
+    except Exception as e:
+        # Belt-and-suspenders -- the UTF-8 reconfigure at the top should
+        # already neutralize encoding errors, but if some other I/O
+        # error fires we never want one bad message to take the whole
+        # monitor down. Surface to stderr (which the PS retry loop
+        # captures) and keep going.
+        try:
+            sys.stderr.write(f"[airc:formatter] skipped one line: {e}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
 '@
 
 # Run the formatter against a stream of inbound JSONL lines on its stdin.
@@ -1529,9 +1545,23 @@ function Invoke-Send {
     $peerName = 'all'
     $msg = ''
     if ($first.StartsWith('@')) {
-        $peerName = $first.Substring(1)
-        if ($Argv.Count -lt 2) { Die 'Usage: airc msg @peer <message>' }
-        $msg = ($Argv[1..($Argv.Count - 1)] -join ' ')
+        # Two valid shapes:
+        #   airc msg @peer body words ...    (shell-split: 2+ args)
+        #   airc msg "@peer body words ..."  (whole thing one arg, e.g.
+        #                                     when called via cmd.exe
+        #                                     wrapper or with a quoted
+        #                                     argument from PowerShell)
+        # Detect the single-arg case by checking whether $first contains
+        # whitespace; split on the first run of whitespace if so.
+        if ($Argv.Count -ge 2) {
+            $peerName = $first.Substring(1)
+            $msg = ($Argv[1..($Argv.Count - 1)] -join ' ')
+        } elseif ($first -match '^@(\S+)\s+(.+)$') {
+            $peerName = $matches[1]
+            $msg = $matches[2]
+        } else {
+            Die 'Usage: airc msg @peer <message>'
+        }
     } else {
         $msg = ($Argv -join ' ')
     }
