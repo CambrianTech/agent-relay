@@ -855,14 +855,74 @@ After install, open a NEW terminal so PATH refreshes (or re-run airc).
                 $hostTarget, $remoteCmd
             )
             # Capture ssh stderr to a per-scope log so we can diagnose
-            # silent failures of the long-running tail. Without this,
-            # `2>$null` swallowed every error and the formatter just
-            # never received input -- looks identical to a healthy idle
-            # channel for 150s, then watchdog fires and we loop.
+            # silent failures of the long-running tail.
             $sshErr = Join-Path $AIRC_WRITE_DIR 'monitor_ssh.log'
-            & ssh @tailArgs 2>$sshErr `
-              | & $script:PythonResolved.Bin @($script:PythonResolved.Args + @('-u', '-c', $script:MonitorFormatterPython))
-            $fmtExit = $LASTEXITCODE
+
+            # PowerShell's native-command `|` pipeline buffers text between
+            # ssh.exe and python.exe in a way that never flushes on a
+            # long-running stream producer -- the formatter received ZERO
+            # stdin bytes for 150s while ssh's stdout had plenty (host was
+            # posting every few seconds). Watchdog fired every cycle and
+            # nothing ever got mirrored or auto-ponged.
+            #
+            # Replace the PS pipeline with explicit [Diagnostics.Process]
+            # handles + an async stream copy. ssh stdout reads go straight
+            # to python stdin with no PS/StringObject layer in between.
+            $sshInfo = [System.Diagnostics.ProcessStartInfo]::new('ssh.exe')
+            foreach ($a in $tailArgs) { [void]$sshInfo.ArgumentList.Add($a) }
+            $sshInfo.RedirectStandardOutput = $true
+            $sshInfo.RedirectStandardError  = $true
+            $sshInfo.UseShellExecute        = $false
+            $sshInfo.CreateNoWindow         = $true
+            $sshProc = [System.Diagnostics.Process]::new()
+            $sshProc.StartInfo = $sshInfo
+            [void]$sshProc.Start()
+
+            # Formatter lives on disk as a .py file so we can pass it as
+            # argv (cleaner than -c with a multi-line heredoc that PS
+            # might re-escape through CreateProcess).
+            $pyFile = Join-Path $AIRC_WRITE_DIR 'monitor_formatter.py'
+            [System.IO.File]::WriteAllText(
+                $pyFile,
+                $script:MonitorFormatterPython,
+                [System.Text.UTF8Encoding]::new($false)
+            )
+            $pyInfo = [System.Diagnostics.ProcessStartInfo]::new($script:PythonResolved.Bin)
+            foreach ($pa in ($script:PythonResolved.Args + @('-u', $pyFile))) {
+                [void]$pyInfo.ArgumentList.Add($pa)
+            }
+            $pyInfo.RedirectStandardInput = $true
+            $pyInfo.UseShellExecute       = $false
+            $pyInfo.CreateNoWindow        = $true
+            # Pass through PEERS_DIR + AIRC_CMD_PATH explicitly.
+            $pyInfo.EnvironmentVariables['PEERS_DIR']     = $env:PEERS_DIR
+            $pyInfo.EnvironmentVariables['AIRC_CMD_PATH'] = $env:AIRC_CMD_PATH
+            $pyProc = [System.Diagnostics.Process]::new()
+            $pyProc.StartInfo = $pyInfo
+            [void]$pyProc.Start()
+
+            # Async-forward ssh stderr to the log file (non-blocking).
+            $sshErrStream = [System.IO.File]::Open($sshErr, [System.IO.FileMode]::Create)
+            $sshErrTask = $sshProc.StandardError.BaseStream.CopyToAsync($sshErrStream)
+
+            # Pump ssh stdout -> python stdin synchronously; this is the
+            # hot path for every inbound line from the remote tail.
+            try {
+                while ($true) {
+                    $line = $sshProc.StandardOutput.ReadLine()
+                    if ($null -eq $line) { break }
+                    $pyProc.StandardInput.WriteLine($line)
+                    $pyProc.StandardInput.Flush()
+                }
+            } catch { } finally {
+                try { $pyProc.StandardInput.Close() } catch { }
+            }
+            $pyProc.WaitForExit()
+            $fmtExit = $pyProc.ExitCode
+            try { $sshProc.WaitForExit(1000) | Out-Null } catch { }
+            if (-not $sshProc.HasExited) { try { $sshProc.Kill() } catch { } }
+            try { $sshErrTask.Wait(1000) | Out-Null } catch { }
+            try { $sshErrStream.Close() } catch { }
             $cycleLifetime = ((Get-Date) - $cycleStart).TotalSeconds
 
             if ($fmtExit -eq 2) {
