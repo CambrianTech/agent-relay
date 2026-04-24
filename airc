@@ -8,6 +8,26 @@
 
 set -euo pipefail
 
+# Cross-platform Python invocation. macOS / Linux / WSL all ship `python3`
+# on PATH; Git Bash on Windows typically has `python` only (the launcher
+# from python.org). Resolve once at startup; every `python3 ...` invocation
+# downstream goes through this wrapper. Hard fail if neither is present
+# (we genuinely need Python — the inline heredocs for monitor formatting
+# and pair handshake are not yet ported to pure shell).
+if ! command -v python3 >/dev/null 2>&1; then
+  if command -v python >/dev/null 2>&1; then
+    # Define a wrapper function that callers see as `python3`.
+    python3() { command python "$@"; }
+    export -f python3 2>/dev/null || true
+  else
+    echo "ERROR: airc requires python3 (or python on Windows/Git Bash)." >&2
+    echo "  macOS:    brew install python3" >&2
+    echo "  Linux:    apt install python3 / dnf install python3" >&2
+    echo "  Windows:  install from python.org or Microsoft Store" >&2
+    exit 1
+  fi
+fi
+
 # One-time migration from pre-rename ~/.agent-relay → ~/.airc. Fires when user
 # is on vanilla defaults, the old dir exists as a real dir (not a symlink we
 # already left), and ~/.airc doesn't. Leaves a symlink ~/.agent-relay → ~/.airc
@@ -412,7 +432,7 @@ import sys, json, os, re, time, signal
 # the python exit; the bash probe is what decides whether the user
 # sees a notification.
 WATCHDOG_SEC = 150
-def _watchdog_exit(signum, frame):
+def _watchdog_exit(signum=None, frame=None):
     # Diagnostic to stderr only. The bash retry loop owns the
     # user-visible notification — it probes the host on fmt_exit=2
     # to decide whether silence means "healthy idle" (silent reset)
@@ -421,8 +441,28 @@ def _watchdog_exit(signum, frame):
     sys.stderr.write(f"[airc:monitor] no inbound in {WATCHDOG_SEC}s — exiting for probe\\n")
     sys.stderr.flush()
     os._exit(2)
-signal.signal(signal.SIGALRM, _watchdog_exit)
-signal.alarm(WATCHDOG_SEC)
+
+# Cross-platform watchdog. POSIX (mac/linux/WSL) gets signal.SIGALRM
+# which is cheaper (single-thread, kernel-armed). Windows Python has
+# no SIGALRM so we fall back to threading.Timer — same exit semantics,
+# slight overhead from the timer thread. Either way the fmt_exit=2
+# contract is preserved.
+try:
+    signal.signal(signal.SIGALRM, _watchdog_exit)
+    signal.alarm(WATCHDOG_SEC)
+    def _arm_watchdog():
+        signal.alarm(WATCHDOG_SEC)
+except (AttributeError, ValueError):
+    import threading
+    _wd_timer_holder = [None]
+    def _arm_watchdog():
+        if _wd_timer_holder[0] is not None:
+            _wd_timer_holder[0].cancel()
+        t = threading.Timer(WATCHDOG_SEC, _watchdog_exit)
+        t.daemon = True
+        t.start()
+        _wd_timer_holder[0] = t
+    _arm_watchdog()
 
 peers_dir = os.environ.get("PEERS_DIR", "")
 scope_dir = os.path.dirname(peers_dir)
@@ -524,8 +564,9 @@ except Exception:
 
 for line in sys.stdin:
     # Any inbound line — real message, heartbeat, whatever — means the
-    # channel is alive. Reset the watchdog.
-    signal.alarm(WATCHDOG_SEC)
+    # channel is alive. Reset the watchdog (POSIX: re-arms SIGALRM;
+    # Windows: cancels + restarts threading.Timer).
+    _arm_watchdog()
     line = line.strip()
     if not line: continue
     offset_counter += 1
