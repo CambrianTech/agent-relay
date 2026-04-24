@@ -2664,6 +2664,37 @@ _daemon_install_systemd() {
       die "systemctl not found. Daemon install requires systemd."
     fi
   fi
+  # Probe the user-level systemd bus BEFORE writing the unit. WSL2 ships
+  # systemctl on PATH but typically has init (not systemd) as PID 1, so
+  # `systemctl --user` returns "Failed to connect to bus" — we'd write
+  # the unit then fail to load it, leaving cruft on disk. Detect early.
+  if ! systemctl --user is-system-running >/dev/null 2>&1 \
+     && ! systemctl --user list-units >/dev/null 2>&1; then
+    if [ "$os" = "wsl" ]; then
+      cat >&2 <<EOF
+ERROR: systemctl is on PATH but the user-level systemd bus isn't reachable
+       (Failed to connect to bus). On WSL2 this means systemd isn't running
+       as PID 1 — the default Ubuntu image launches with init instead.
+
+Enable systemd in WSL:
+  1. In your WSL distro, edit /etc/wsl.conf and add:
+
+       [boot]
+       systemd=true
+
+  2. From PowerShell on Windows:    wsl --shutdown
+  3. Reopen your WSL terminal. Confirm with:    ps -p 1 -o comm=    (should print "systemd")
+  4. Re-run:    airc daemon install
+
+Until systemd is enabled, airc daemon can't auto-resume on this WSL distro.
+A manual fallback for now:  run 'airc connect' in a tmux/screen session that
+won't get killed by your WSL shell exit.
+EOF
+      return 1
+    else
+      die "systemctl present but user-level systemd bus unreachable. Check: systemctl --user status (and ensure systemd is PID 1 on this host)."
+    fi
+  fi
   mkdir -p "$unit_dir"
   cat > "$unit_path" <<UNIT
 [Unit]
