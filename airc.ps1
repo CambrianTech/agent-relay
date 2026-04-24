@@ -399,9 +399,9 @@ function Invoke-AircSsh {
         '-o','ServerAliveInterval=30'
     )
     if (Test-Path $sshKey) {
-        & ssh '-i', $sshKey, @opts, @SshArgs
+        & ssh '-i' $sshKey @opts @SshArgs
     } else {
-        & ssh @opts, @SshArgs
+        & ssh @opts @SshArgs
     }
 }
 
