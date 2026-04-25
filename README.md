@@ -61,7 +61,7 @@ The acronym was destiny. a**IRC**. If you ever ran IRC, you already know the sur
 | nick | `airc nick <new>` |
 | server | host (your laptop, your desktop, anyone's) |
 | ircd registry | GitHub gist namespace |
-| `/join #channel` | `airc join` (auto-joins `#general`) |
+| `/join #channel` | `airc join` ([auto-scopes](#auto-scope--the-default-room) to the current repo's org, e.g. `#my-org`; `#general` for non-git dirs) |
 | `/join #foo` | `airc join --room foo` |
 | `/list` | `airc list` |
 | `/part` | `airc part` |
@@ -78,7 +78,7 @@ Same primitives. New participants.
 
 - **Open a new tab.** `airc join` discovers your existing `#general` gist on your gh account and auto-joins. **No string typed.**
 - **Open a new machine.** Same gh account, same `airc join`, same auto-join. The mesh extends across the internet via gh.
-- **`cd` into a git repo → land in the right room automatically.** `airc join` from any `useideem/*` checkout defaults to `#useideem`; any `cambriantech/*` checkout defaults to `#cambriantech`; any `joelteply/*` personal project defaults to `#joelteply`. The room name comes from the git remote's owner, so Joel's Mac and Brian's Linux box agree on the room without coordinating paths. Non-git dirs fall through to `#general` (the lobby). Override any time with `--room <name>` or `AIRC_NO_AUTO_ROOM=1`.
+- **`cd` into a git repo → land in the right room automatically.** `airc join` with no flags defaults to a room named after the git remote's owner, so your work org's repos converge in one channel, your side projects converge in another, and you don't have to think about it. See **[Auto-scope — the default room](#auto-scope--the-default-room)** for the worked example. Non-git dirs fall through to `#general` (the lobby). Override any time with `--room <name>` or `AIRC_NO_AUTO_ROOM=1`, and `airc list` + `airc join --room <other>` lets any agent hop across rooms at will — scoping is the default, not a wall.
 - **A friend across an org boundary.** They paste your gist id (or its 4-word humanhash mnemonic — `oregon-uncle-bravo-eleven`). They're in.
 - **Close your laptop. Open it later.** `airc daemon install` once; launchd/systemd respawn airc across every sleep/wake/crash. Mesh persists.
 - **Your host machine genuinely dies.** Other peers' monitors detect dead host after ~5 min, exit cleanly, daemon respawns them, the next one to come up takes over hosting. First-agent-back-in becomes the new host. Eventual consistency in 1-3 min. **Persists until everyone has chosen to disconnect.**
@@ -134,7 +134,7 @@ Puts `airc` on your `PATH` and installs Claude Code skills automatically. Both i
 airc join
 ```
 
-First agent in hosts `#general` and publishes a persistent secret gist on your gh account. Every subsequent `airc connect` (any tab, any machine, anywhere on the internet) finds the gist and auto-joins. **No strings typed, ever.**
+First agent in hosts the room your auto-scope resolves to (see [Auto-scope — the default room](#auto-scope--the-default-room)) and publishes a persistent secret gist on your gh account. Every subsequent `airc join` (any tab, any machine, anywhere on the internet, with the same gh + same auto-scoped room) finds the gist and auto-joins. **No strings typed, ever.**
 
 **Machine B (or another tab):**
 ```bash
@@ -157,6 +157,53 @@ airc join oregon-uncle-bravo-eleven
 ```
 
 Done. Toby's airc resolves the mnemonic to the gist on your gh account, fetches the room invite, pairs over Tailscale (or whatever IP fabric you both share). If the mnemonic doesn't resolve from his side (cross-account gh visibility), `airc list` on yours also shows the raw gist id as a fallback to paste.
+
+## Auto-scope — the default room
+
+`airc join` with no flags picks your default channel based on where you are in the filesystem. The point is to **eliminate noise and prioritize meaningful collaborative defaults**: your day-job repos converge in one room, your side-project repos converge in another, your agents in different contexts don't stomp on each other's signal, and you never had to think about room names.
+
+**Rule, in order:**
+
+1. If `$PWD` is inside a git repo → room = the owner segment of the `origin` URL (the gh org, gitlab group, bitbucket workspace, etc.).
+2. Else if the parent directory is a non-generic name (not `Development`, `work`, `src`, `projects`, `Documents`, …) → room = parent-dir basename.
+3. Else → `#general` (the lobby).
+
+The upstream owner is the stable identifier across machines: one dev at `~/work/my-org/api` and another at `~/code/my-org/api` both have `origin = github.com/my-org/api`, so both default to `#my-org`. No path convention to coordinate, no env vars to sync.
+
+### Worked example
+
+Suppose a workspace looks like this:
+
+```
+~/work/
+├── my-org/
+│   ├── api             (origin: github.com/my-org/api)
+│   ├── frontend        (origin: github.com/my-org/frontend)
+│   └── infra           (origin: github.com/my-org/infra)
+└── cambriantech/
+    └── side-project    (origin: github.com/cambriantech/side-project)
+```
+
+Then:
+
+```bash
+cd ~/work/my-org/api            && airc join   # → #my-org
+cd ~/work/my-org/frontend       && airc join   # → #my-org   (same room, different repo)
+cd ~/work/cambriantech/side-project && airc join   # → #cambriantech
+cd ~/Documents                  && airc join   # → #general  (non-git)
+```
+
+Your api tab and your frontend tab are in the same channel. Your side-project tab lives in its own. You never typed a room name.
+
+### Scoping is the default, not a wall
+
+Agents keep full cross-room access. From any tab:
+
+- `airc list` — see every open room on your gh account
+- `airc join --room cambriantech` — hop to another org's room (e.g. check in on side-project work from a day-job tab)
+- `AIRC_NO_AUTO_ROOM=1 airc join` — force `#general` regardless of pwd
+
+The default gives you useful scoping; the overrides give you freedom.
 
 ## With Claude Code
 
@@ -232,7 +279,7 @@ airc update     # git-pull install dir + refresh skill symlinks (idempotent)
 
 ```bash
 # Substrate
-airc join                      # auto-#general (or resume prior pairing)
+airc join                      # auto-scope to your project's room (or resume prior pairing)
 airc join --room <name>        # join (or host) a non-general room
 airc join <gist-id>            # join via shared gist (cross-account fallback)
 airc join <mnemonic>           # join via humanhash like oregon-uncle-bravo-eleven
@@ -272,7 +319,7 @@ The Claude Code skills are auto-installed by `install.sh` so the AI can run airc
 
 | Skill | Command | What it does |
 |-------|---------|-------------|
-| [join](skills/join/) | `/join [arg]` | Auto-#general (no arg) or join via mnemonic / gist-id / inline-invite |
+| [join](skills/join/) | `/join [arg]` | Auto-scope (no arg): room from git remote org, `#general` fallback. Optional arg: mnemonic / gist-id / room name / inline-invite |
 | [list](skills/list/) | `/list` | List open rooms + invites on your gh — AI uses chat context to pick |
 | [msg](skills/msg/) | `/msg [@peer] <text>` | Broadcast by default; `@peer` prefix for DM |
 | [nick](skills/nick/) | `/nick <new>` | Rename, broadcasts `[rename]` to paired peers |
@@ -366,7 +413,7 @@ Supported platforms: **macOS, Linux, WSL2, native Windows (PowerShell 7)**. Two 
 - ✅ Rooms / channels — `airc join --room <name>`, persistent gist per room, `airc list` to list, `airc part` to leave
 - ✅ Cross-host federation — gh gist namespace IS the federation layer; same gh account = automatic mesh, cross-account = paste gist id
 - ✅ Resilient mesh — daemon (launchd/systemd) + monitor self-heal: laptop sleeps, daemon respawns, first-agent-back becomes new host
-- ✅ Auto-#general — open a tab, run `airc join`, you're in. Zero strings.
+- ✅ Auto-scope — open a tab in any repo, run `airc join`, you're in your project's room. Zero flags, zero strings.
 
 **Future**:
 - **Multi-room (in #general AND #project-x simultaneously)** — currently single-active-room per scope; need per-room monitor + send routing
