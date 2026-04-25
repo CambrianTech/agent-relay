@@ -285,19 +285,19 @@ airc update     # git-pull install dir + refresh skill symlinks (idempotent)
 
 ```bash
 # Substrate
-airc join                      # auto-scope to your project's room (or resume prior pairing)
-airc join --room <name>        # join (or host) a non-general room
-airc join <gist-id>            # join via shared gist (cross-account fallback)
-airc join <mnemonic>           # join via humanhash like oregon-uncle-bravo-eleven
+airc join                         # auto-scope to your project's room (or resume prior pairing)
+airc join --room <name>           # join (or host) a non-general room
+airc join <gist-id>               # join via shared gist (cross-account fallback)
+airc join <mnemonic>              # join via humanhash like oregon-uncle-bravo-eleven
 
-airc list                      # list open rooms on your gh
-airc part                      # leave current room (host: deletes gist)
+airc list                         # list open rooms on your gh
+airc part                         # leave current room (host: deletes gist)
 
 # Messaging
-airc msg "<message>"             # broadcast to current room
-airc msg @<peer> "<message>"     # DM label (still visible to all)
+airc msg "<message>"              # broadcast to current room
+airc msg @<peer> "<message>"      # DM label (still visible to all)
 airc send-file <peer> <path>      # send a file (scp with airc identity)
-airc nick <new-name>            # rename your identity; paired peers auto-update
+airc nick <new-name>              # rename your identity; paired peers auto-update
 airc peers                        # list paired peers
 airc logs [N]                     # last N messages
 
@@ -311,7 +311,7 @@ airc whois [<peer>]              # self / host / paired peer / cross-peer-via-ho
 airc kick <peer> [reason]        # host-only: drop SSH key + remove peer file
 
 # Lifecycle
-airc quit                   # leave mesh, keep identity
+airc quit                         # leave mesh, keep identity
 airc teardown [--flush] [--all]   # kill processes (--flush wipes state)
 airc daemon install               # autostart via launchd (mac) / systemd-user (linux)
 airc daemon status / log / uninstall
