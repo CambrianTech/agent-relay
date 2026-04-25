@@ -310,6 +310,12 @@ is_peer_offline_in_tailnet() {
   # user's time blocking on a predictable failure.
   local target_host="${1:-}"
   [ -z "$target_host" ] && return 1
+  # Strip leading user@ if present — host_target is stored as `user@host`
+  # in config.json, but the CGNAT match below only recognizes strings
+  # starting with 100.x. Without this strip, every call from a resume
+  # path silently bypassed the CGNAT gate (issue #78 root cause, caught
+  # in PR #84 Copilot review).
+  target_host="${target_host##*@}"
   # CGNAT range only. LAN / DNS targets fall through to the normal path.
   case "$target_host" in
     100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) ;;
@@ -347,6 +353,10 @@ advise_tailscale_if_down() {
   [ "${AIRC_NO_TAILSCALE:-0}" = "1" ] && return 0
   local target_host="${1:-}"
   [ -z "$target_host" ] && return 0
+  # Strip leading user@ if present — host_target from config.json is
+  # `user@host` form. Without this strip, every resume-path call
+  # silently bypassed the CGNAT gate (Copilot caught this on PR #84).
+  target_host="${target_host##*@}"
   case "$target_host" in
     100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) ;;
     *) return 0 ;;

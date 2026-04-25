@@ -221,6 +221,10 @@ function Test-PeerOfflineInTailnet {
     # is_peer_offline_in_tailnet (commit 64b604d).
     param([string]$TargetHost)
     if (-not $TargetHost) { return $false }
+    # Strip leading user@ if present — host_target from config.json is
+    # `user@host` form. Without this strip, every resume-path call
+    # silently bypassed the CGNAT gate (Copilot caught this on PR #84).
+    if ($TargetHost -match '@') { $TargetHost = ($TargetHost -split '@')[-1] }
     if (-not (Test-CgnatIp -Ip $TargetHost)) { return $false }
     $ts = Resolve-TailscaleBin
     if (-not $ts) { return $false }
@@ -250,6 +254,10 @@ function Advise-TailscaleIfDown {
     param([string]$TargetHost)
     if ($env:AIRC_NO_TAILSCALE -eq '1') { return $false }
     if (-not $TargetHost) { return $false }
+    # Strip leading user@ if present — host_target from config.json is
+    # `user@host` form. Without this strip, every resume-path call
+    # silently bypassed the CGNAT gate (Copilot caught this on PR #84).
+    if ($TargetHost -match '@') { $TargetHost = ($TargetHost -split '@')[-1] }
     if (-not (Test-CgnatIp -Ip $TargetHost)) { return $false }
 
     $ts = Resolve-TailscaleBin
