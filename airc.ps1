@@ -608,7 +608,10 @@ function Test-GhAvailable {
 function Get-GhGistList {
     param([int]$Limit = 50)
     if (-not (Test-GhAvailable)) { return @() }
-    # `gh gist list --limit N` outputs TAB-separated: id, description, files, visibility, updated
+    # `gh gist list --limit N` outputs TAB-separated: id, description, files, visibility, updated_at
+    # Pre-#82 we read $cols[3] (visibility) into Updated -- a display bug
+    # where rooms list showed "updated: secret" instead of an actual time.
+    # Fixed here on the way to adding stale-marker logic.
     $raw = & gh gist list --limit $Limit 2>$null
     if ($LASTEXITCODE -ne 0 -or -not $raw) { return @() }
     $rows = @()
@@ -619,10 +622,44 @@ function Get-GhGistList {
         $rows += [pscustomobject]@{
             Id          = $cols[0]
             Description = $cols[1]
-            Updated     = if ($cols.Count -gt 3) { $cols[3] } else { '' }
+            Updated     = if ($cols.Count -gt 4) { $cols[4] } else { '' }
         }
     }
     return $rows
+}
+
+# Convert ISO 8601 timestamp into relative-time string ("12m ago",
+# "3h ago", "2d ago"). Falls back to raw timestamp on parse failure.
+# #82 — used by Invoke-Rooms to display gist activity.
+function _FormatRelativeTime {
+    param([string]$Ts)
+    if (-not $Ts) { return '(unknown)' }
+    try {
+        $dt = [datetime]::Parse($Ts).ToUniversalTime()
+    } catch {
+        return $Ts
+    }
+    $diff = ([datetime]::UtcNow - $dt).TotalSeconds
+    if ($diff -lt 0)      { return $Ts }
+    if ($diff -lt 60)     { return "$([int]$diff)s ago" }
+    if ($diff -lt 3600)   { return "$([int]($diff / 60))m ago" }
+    if ($diff -lt 86400)  { return "$([int]($diff / 3600))h ago" }
+    return "$([int]($diff / 86400))d ago"
+}
+
+# Return $true if ISO timestamp is older than AIRC_STALE_HOURS
+# (default 24h). #82 — used to mark abandoned rooms.
+function _IsStale {
+    param([string]$Ts)
+    if (-not $Ts) { return $false }
+    $thresholdHours = if ($env:AIRC_STALE_HOURS) { [int]$env:AIRC_STALE_HOURS } else { 24 }
+    try {
+        $dt = [datetime]::Parse($Ts).ToUniversalTime()
+    } catch {
+        return $false
+    }
+    $diffSec = ([datetime]::UtcNow - $dt).TotalSeconds
+    return ($diffSec -gt ($thresholdHours * 3600))
 }
 
 # Fetch the content of the first file in a gist by ID. Uses `gh api` over
@@ -1453,10 +1490,12 @@ function Invoke-Rooms {
     foreach ($m in $matches) {
         $marker = if ($m.Kind -eq 'room') { '#' } else { '(1:1)' }
         $hh = Get-Humanhash -HexInput $m.Id
-        Write-Host "    $marker $($m.Description)"
+        $ageStr = _FormatRelativeTime -Ts $m.Updated
+        $stale = if (_IsStale -Ts $m.Updated) { '  (stale)' } else { '' }
+        Write-Host "    $marker $($m.Description)$stale"
         Write-Host "      id:       $($m.Id)"
         Write-Host "      mnemonic: $hh"
-        Write-Host "      updated:  $($m.Updated)"
+        Write-Host "      updated:  $ageStr"
         Write-Host ''
     }
     Write-Host '  Join (auto on same gh account): airc connect'

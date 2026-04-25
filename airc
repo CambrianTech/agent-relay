@@ -2971,10 +2971,14 @@ cmd_rooms() {
   # Match BOTH the persistent IRC-style rooms (#39, prefix `airc room:`)
   # and the legacy single-pair invites (#37/#38, prefix `airc invite for`).
   # Show kind explicitly so the AI / human can tell them apart.
+  # gh gist list columns: id  description  files  visibility  updated_at
+  # Use $5 (timestamp) for the updated field — pre-#82 we were using
+  # $4 (visibility, "secret") under the "updated:" label, which is a
+  # display bug fixed here on the way to adding stale markers.
   local raw; raw=$(gh gist list --limit 50 2>/dev/null \
     | awk -F'\t' '
-        /airc room:/        { print "room\t"   $1 "\t" $2 "\t" $4 }
-        /airc invite for/   { print "invite\t" $1 "\t" $2 "\t" $4 }
+        /airc room:/        { print "room\t"   $1 "\t" $2 "\t" $5 }
+        /airc invite for/   { print "invite\t" $1 "\t" $2 "\t" $5 }
       ')
   local count; count=$(printf '%s' "$raw" | grep -c . || true)
   if [ "$count" = "0" ]; then
@@ -2993,12 +2997,62 @@ cmd_rooms() {
       room)   marker="#" ;;     # persistent channel
       invite) marker="(1:1)" ;; # ephemeral pairing
     esac
-    printf '    %s %s\n      id:       %s\n      mnemonic: %s\n      updated:  %s\n\n' \
-      "$marker" "$desc" "$id" "$hh" "$updated"
+    local age_str; age_str=$(_format_relative_time "$updated")
+    local stale_marker=""
+    if _is_stale "$updated"; then
+      stale_marker="  (stale)"
+    fi
+    printf '    %s %s%s\n      id:       %s\n      mnemonic: %s\n      updated:  %s\n\n' \
+      "$marker" "$desc" "$stale_marker" "$id" "$hh" "$age_str"
   done
   echo "  Join (auto-resolves on same gh account): airc connect"
   echo "  Join by id (cross-account share):        airc connect <id>"
   echo ""
+}
+
+# Convert an ISO 8601 timestamp into a relative-time string ("12m ago",
+# "3h ago", "2d ago"). Handles both macOS BSD date and GNU/Linux date
+# syntax differences. Falls back to the raw timestamp on parse failure.
+# Used by cmd_rooms to display gist activity (#82).
+_format_relative_time() {
+  local ts="${1:-}"
+  [ -z "$ts" ] && { echo "(unknown)"; return; }
+  local epoch
+  if epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null); then
+    : # BSD/macOS
+  elif epoch=$(date -u -d "$ts" +%s 2>/dev/null); then
+    : # GNU/Linux/WSL
+  else
+    echo "$ts"
+    return
+  fi
+  local now; now=$(date -u +%s)
+  local diff=$((now - epoch))
+  if [ "$diff" -lt 0 ]; then echo "$ts"; return; fi
+  if [ "$diff" -lt 60 ]; then       echo "${diff}s ago"
+  elif [ "$diff" -lt 3600 ]; then   echo "$((diff / 60))m ago"
+  elif [ "$diff" -lt 86400 ]; then  echo "$((diff / 3600))h ago"
+  else                              echo "$((diff / 86400))d ago"
+  fi
+}
+
+# Return 0 if the given ISO timestamp is older than AIRC_STALE_HOURS
+# (default 24h). Used to mark abandoned rooms in cmd_rooms output (#82).
+_is_stale() {
+  local ts="${1:-}"
+  local threshold_hours="${AIRC_STALE_HOURS:-24}"
+  [ -z "$ts" ] && return 1
+  local epoch
+  if epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null); then
+    :
+  elif epoch=$(date -u -d "$ts" +%s 2>/dev/null); then
+    :
+  else
+    return 1
+  fi
+  local now; now=$(date -u +%s)
+  local diff=$((now - epoch))
+  [ "$diff" -gt $((threshold_hours * 3600)) ]
 }
 
 # ── cmd_part: leave the current room ──────────────────────────────────
