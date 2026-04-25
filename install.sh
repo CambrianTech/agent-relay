@@ -182,20 +182,22 @@ ensure_prereqs() {
     fi
   done
   if [ ${#missing[@]} -gt 0 ]; then
-    info "Installing missing prereqs via $mgr: ${missing[*]}"
     if [ ${#pkgs[@]} -gt 0 ]; then
+      info "Installing missing prereqs via $mgr: ${pkgs[*]}"
       if install_with_pkgmgr "$mgr" "${pkgs[@]}"; then
         ok "Auto-installable prereqs installed"
       else
         warn "Package install reported failure; airc may not run until you fix: ${missing[*]}"
       fi
+    else
+      warn "Missing prereqs not auto-installable on $mgr: ${missing[*]}"
     fi
     if [ ${#unmappable[@]} -gt 0 ]; then
-      warn "These prereqs aren't auto-installable on $mgr: ${unmappable[*]}"
+      warn "These prereqs need manual install on $mgr: ${unmappable[*]}"
       case "$mgr" in
         winget)
           warn "  ssh / ssh-keygen: Settings -> Apps -> Optional Features -> Add OpenSSH Client"
-          warn "  openssl: bundled with Git for Windows -- 'winget install Git.Git' will provide it" ;;
+          warn "  openssl: bundled with Git for Windows -- 'winget install Git.Git' provides it" ;;
       esac
     fi
   else

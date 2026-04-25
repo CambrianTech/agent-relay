@@ -1318,13 +1318,22 @@ cmd_connect() {
       local _saved_room_resume=""
       [ -f "$AIRC_WRITE_DIR/room_name" ] && _saved_room_resume=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
       if [ -n "$_saved_gist_id" ] && command -v gh >/dev/null 2>&1; then
-        # Guard: only proceed if gh auth is healthy. If not, skip the
-        # check entirely — the regular SSH probe below handles network/
-        # auth issues with their own diagnosis. We never want a flaky
-        # network to be misread as "the host's gist disappeared."
-        if gh auth status >/dev/null 2>&1; then
-          # Probe with --silent so gh's own error text doesn't pollute
-          # our output. Capture stderr for 404-vs-other classification.
+        # Two-step gh-health gate. Both required before treating any 404
+        # as authoritative gist-deletion (else a scope-less token's auth
+        # error gets mis-classified):
+        #   (a) gh auth status passes (token is valid)
+        #   (b) gh has gist scope (matching the doctor --connect chain)
+        # Without (b), gist API calls return 401/403/404 depending on
+        # token state — could spuriously trigger teardown.
+        local _gh_healthy=0
+        if gh auth status >/dev/null 2>&1 \
+           && gh auth status 2>&1 | grep -qiE '(scopes|token scopes):.*\bgist\b'; then
+          _gh_healthy=1
+        fi
+        if [ "$_gh_healthy" = "1" ]; then
+          # Capture stderr for 404-vs-other classification. stdout is
+          # redirected to /dev/null so gh's normal output doesn't pollute
+          # our terminal regardless of outcome.
           local _gist_probe_err; _gist_probe_err=$(mktemp -t airc-gist-probe.XXXXXX)
           gh api "gists/$_saved_gist_id" >/dev/null 2>"$_gist_probe_err"
           local _gist_probe_rc=$?

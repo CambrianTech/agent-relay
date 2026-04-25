@@ -2151,8 +2151,18 @@ function Invoke-Connect {
             if ((Test-Path $savedGistFile) -and (Get-Command gh -ErrorAction SilentlyContinue)) {
                 $savedGistId = (Get-Content $savedGistFile -Raw -ErrorAction SilentlyContinue).Trim()
                 if ($savedGistId) {
+                    # Two-step gh-health gate (matching bash + doctor --connect):
+                    # auth must pass AND gist scope must be present. Without
+                    # both, gh api errors get mis-classified.
+                    $ghHealthy = $false
                     & gh auth status 2>$null | Out-Null
                     if ($LASTEXITCODE -eq 0) {
+                        $authStatus = & gh auth status 2>&1 | Out-String
+                        if ($authStatus -match '(?i)(?:Token scopes|scopes):.*\bgist\b') {
+                            $ghHealthy = $true
+                        }
+                    }
+                    if ($ghHealthy) {
                         # Capture stderr to distinguish 404 from other failures.
                         $probeErrFile = [System.IO.Path]::GetTempFileName()
                         & gh api "gists/$savedGistId" 1>$null 2>$probeErrFile
