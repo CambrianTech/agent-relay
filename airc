@@ -3864,6 +3864,24 @@ cmd_teardown() {
 
 
   local killed=0
+  # Hosted gist cleanup BEFORE process kill. The cmd_connect EXIT trap
+  # would normally delete our hosted gist on graceful shutdown, but the
+  # kill -9 below skips traps entirely. Without this explicit step,
+  # every `airc teardown` of a host left an orphan gist on the gh
+  # account that joiners couldn't tell apart from a live host until
+  # heartbeat went stale (~90s later). Caught by Joel's other tab
+  # bouncing repeatedly and accumulating fresh #general gists each
+  # cycle.
+  if [ -f "$AIRC_WRITE_DIR/host_gist_id" ] && command -v gh >/dev/null 2>&1; then
+    local _td_gist; _td_gist=$(cat "$AIRC_WRITE_DIR/host_gist_id" 2>/dev/null)
+    if [ -n "$_td_gist" ]; then
+      if gh gist delete "$_td_gist" --yes >/dev/null 2>&1; then
+        echo "  deleted hosted gist: $_td_gist"
+      fi
+      rm -f "$AIRC_WRITE_DIR/host_gist_id"
+    fi
+  fi
+
   # Scope-aware via PID file: cmd_connect wrote its PID(s) to $AIRC_WRITE_DIR/airc.pid.
   # We kill ONLY those PIDs + their descendants. Never touches other scopes.
   local pidfile="$AIRC_WRITE_DIR/airc.pid"
