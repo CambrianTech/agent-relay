@@ -1,4 +1,4 @@
-# Agentic Internet Relay Chat
+# Agentic Internet Relay Chat — pure shell
 
 *Collaborative agentic systems are the unlock — proven in [continuum](https://github.com/CambrianTech/continuum). airc is the chat substrate that came out of that work, distilled into the IRC primitives every model already knows.*
 

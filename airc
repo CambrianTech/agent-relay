@@ -2217,7 +2217,19 @@ cmd_rename() {
   esac
   # Reject leading dash so no flag-shaped string can ever become an identity.
   case "$new_name" in -*) die "Name must not start with '-' (got '$new_name')" ;; esac
-  new_name=$(echo "$new_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-24)
+  # Sanitize: lowercase, replace non-[a-z0-9-] with '-', collapse runs of
+  # dashes, strip leading/trailing dashes, then cap. The post-sanitization
+  # leading-dash strip matters because input like `.foo` becomes `-foo`
+  # after the `[^a-z0-9-]` replacement and would slip past the case check
+  # above — making the resulting name unreachable by `airc whois` /
+  # `airc kick` (both reject leading-dash). Caught by Copilot review on
+  # PR #75 follow-up.
+  new_name=$(echo "$new_name" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's/[^a-z0-9-]/-/g' \
+    | sed 's/--*/-/g; s/^-*//; s/-*$//' \
+    | cut -c1-24 \
+    | sed 's/-*$//')
   [ -z "$new_name" ] && die "Invalid name (must be a-z 0-9 -)"
   [ ! -f "$CONFIG" ] && die "Not initialized — run 'airc connect' first"
 
