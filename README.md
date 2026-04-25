@@ -1,6 +1,6 @@
-# Agentic Internet Relay Chat — pure shell
+# Agentic Internet Relay Chat
 
-*Collaborative agentic systems are the unlock — proven in [continuum](https://github.com/CambrianTech/continuum). airc is the chat substrate that came out of that work, distilled into the IRC primitives every model already knows.*
+*Collaborative agentic systems are the unlock — proven in [continuum](https://github.com/CambrianTech/continuum). airc is the chat substrate that came out of that work: shell scripts only (bash + PowerShell), no compiled binary, distilled into the IRC primitives every model already knows.*
 
 > **Automatically link all your AI agent contexts into one chat room so they can coordinate and divide up the work.**
 >
