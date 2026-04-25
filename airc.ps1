@@ -1140,7 +1140,24 @@ Identity resolution (highest priority first):
 # -- cmd_doctor ---------------------------------------------------------
 # User-emphasized: "if they dont have gh for example doctor would say
 # hey get that". Concrete winget commands so the user can copy-paste.
+# Three modes (mirrors bash):
+#   airc doctor              -- environment health (default)
+#   airc doctor --connect    -- pre-flight before airc connect (#80)
+#   airc doctor --tests      -- run integration suite
 function Invoke-Doctor {
+    param([string[]]$Argv = @())
+    if ($Argv -and $Argv.Count -gt 0) {
+        switch ($Argv[0]) {
+            { $_ -in @('--tests','-t','tests','test','run','suite') } {
+                Invoke-Tests
+                return
+            }
+            { $_ -in @('--connect','-c','connect') } {
+                Invoke-DoctorConnectPreflight
+                return
+            }
+        }
+    }
     Write-Host ''
     Write-Host '  airc doctor - environment health'
     Write-Host '  --------------------------------'
@@ -1220,6 +1237,126 @@ function Invoke-Doctor {
         Write-Host "  $($script:DoctorIssues.Count) prereq(s) missing - see fix lines above."
         Write-Host '  Fastest path: re-run install.ps1 (it auto-installs via winget):'
         Write-Host '    iwr https://raw.githubusercontent.com/CambrianTech/airc/canary/install.ps1 | iex'
+    }
+    Write-Host ''
+}
+
+# -- airc doctor --connect ---------------------------------------------
+# Issue #80: pre-flight check before airc connect. Runs default prereq
+# probes PLUS connect-specific checks (gh gist API reachable, tailscale
+# UP if cached host is CGNAT, port available, cached host reachable).
+# Use case: airc doctor --connect; if exit 0, airc connect.
+function Invoke-DoctorConnectPreflight {
+    Write-Host ''
+    Write-Host '  airc doctor --connect -- pre-flight checks'
+    Write-Host '  ------------------------------------------'
+    Write-Host ''
+    $script:DoctorIssues = @()
+
+    function Probe($Name, $TestBlock, $FixHint) {
+        if (& $TestBlock) {
+            Write-Host "  [ok] $Name"
+        } else {
+            Write-Host "  [MISSING] $Name"
+            Write-Host "         Fix: $FixHint"
+            $script:DoctorIssues += $Name
+        }
+    }
+
+    # Required prereqs (mirror default doctor)
+    Probe 'PowerShell 7+' {
+        $PSVersionTable.PSVersion.Major -ge 7
+    } 'winget install --id Microsoft.PowerShell  (then re-launch in pwsh)'
+    Probe 'git' {
+        Get-Command git -ErrorAction SilentlyContinue
+    } 'winget install --id Git.Git'
+    Probe 'python' {
+        $r = Resolve-PythonBin
+        $null -ne $r
+    } 'winget install --id Python.Python.3.12'
+    Probe 'gh (GitHub CLI)' {
+        Get-Command gh -ErrorAction SilentlyContinue
+    } 'winget install --id GitHub.cli  (then: gh auth login -s gist)'
+    Probe 'gh authenticated (gist scope)' {
+        if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { return $false }
+        & gh auth status 2>$null | Out-Null
+        $LASTEXITCODE -eq 0
+    } 'gh auth login -s gist'
+    Probe 'ssh (OpenSSH client)' {
+        Get-Command ssh -ErrorAction SilentlyContinue
+    } 'Settings -> Apps -> Optional Features -> Add -> OpenSSH Client'
+    Probe 'ssh-keygen' {
+        Get-Command ssh-keygen -ErrorAction SilentlyContinue
+    } 'Comes with OpenSSH Client (see above)'
+    Probe 'openssl' {
+        $null -ne $script:OpenSSLBin
+    } 'winget install --id Git.Git  (Git for Windows bundles openssl)'
+
+    # Connect-specific: github gists API reachable
+    Probe 'github gists API reachable' {
+        if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { return $false }
+        & gh api user 2>$null | Out-Null
+        $LASTEXITCODE -eq 0
+    } 'check internet, then re-run gh auth login -s gist'
+
+    # Connect-specific: tailscale state when cached host_target is CGNAT
+    $priorHostTarget = (Get-ConfigVal -Key 'host_target' -Default '')
+    $priorHostOnly = if ($priorHostTarget -match '@') { ($priorHostTarget -split '@')[-1] } else { $priorHostTarget }
+    if ($priorHostOnly -and (Test-CgnatIp -Ip $priorHostOnly)) {
+        $tsBin = Resolve-TailscaleBin
+        if ($tsBin) {
+            & $tsBin status 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host '  [ok] tailscale UP (cached host_target is tailnet CGNAT)'
+            } else {
+                Write-Host "  [BLOCKED] tailscale CLI installed but DOWN -- cached host is tailnet, can't reach"
+                Write-Host '         Fix: tailscale up'
+                $script:DoctorIssues += 'tailscale-down'
+            }
+        } else {
+            Write-Host "  [BLOCKED] tailscale CLI missing -- cached host is tailnet, can't reach"
+            Write-Host '         Fix: winget install --id tailscale.tailscale  (then: tailscale up)'
+            $script:DoctorIssues += 'tailscale-missing'
+        }
+    } else {
+        Probe 'tailscale (optional)' {
+            $null -ne (Resolve-TailscaleBin)
+        } 'winget install --id tailscale.tailscale  (LAN-only mode works without it)'
+    }
+
+    # Connect-specific: AIRC_PORT free
+    $targetPort = if ($env:AIRC_PORT) { [int]$env:AIRC_PORT } else { 7547 }
+    try {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $targetPort)
+        $listener.Start()
+        $listener.Stop()
+        Write-Host "  [ok] port $targetPort available for hosting"
+    } catch {
+        Write-Host "  [info] port $targetPort busy -- airc will auto-shift to next free port"
+    }
+
+    # Connect-specific: cached host_target reachable (resume scenario)
+    if ($priorHostTarget) {
+        $sshKey = Join-Path $IDENTITY_DIR 'ssh_key'
+        if (Test-Path $sshKey) {
+            $probeOut = & ssh -i $sshKey -o StrictHostKeyChecking=accept-new `
+                              -o ConnectTimeout=3 -o BatchMode=yes `
+                              $priorHostTarget 'echo __PROBE_OK__' 2>$null
+            if ($probeOut -match '__PROBE_OK__') {
+                Write-Host "  [ok] cached host $priorHostTarget reachable + auth works"
+            } else {
+                Write-Host "  [warn] cached host $priorHostTarget not reachable -- may need re-pair"
+                Write-Host '         Fix: airc teardown --flush; airc join (fresh pairing)'
+            }
+        }
+    }
+
+    Write-Host ''
+    if ($script:DoctorIssues.Count -eq 0) {
+        Write-Host '  [READY] -- airc connect should work.'
+    } else {
+        Write-Host "  [BLOCKED] on $($script:DoctorIssues.Count) issue(s) -- fix the items above before 'airc connect'."
+        exit 1
     }
     Write-Host ''
 }
@@ -2447,7 +2584,7 @@ try {
         # Info
         { $_ -in @('version','--version','-v') }      { Invoke-Version; break }
         { $_ -in @('help','--help','-h') }            { Invoke-Help; break }
-        'doctor'                                       { Invoke-Doctor; break }
+        'doctor'                                       { Invoke-Doctor -Argv $rest; break }
         { $_ -in @('tests','test') }                   { Invoke-Tests; break }
 
         # Connection lifecycle
