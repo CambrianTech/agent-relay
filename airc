@@ -2313,20 +2313,15 @@ JSON
               done
             ) &
             local _hb_pid=$!
-            # Track the heartbeat-loop PID so cmd_teardown can kill it
-            # cleanly. Also written to the airc.pid line so teardown's
-            # tree-walk picks it up.
-            echo "$_hb_pid" >> "$AIRC_WRITE_DIR/airc.pid"
-
-            # Graceful-exit trap: on EXIT/SIGINT/SIGTERM, kill the
-            # heartbeat + delete the gist. Doesn't help kill -9 (which
-            # is exactly what the heartbeat itself is the answer for),
-            # but covers Ctrl-C and normal teardown — gist gets cleaned
-            # up so peers don't even hit the stale window.
-            trap "
-              kill $_hb_pid 2>/dev/null
-              gh gist delete '$_gist_id' --yes >/dev/null 2>&1
-            " EXIT INT TERM
+            # Stash heartbeat-loop PID + gist-id in scope-local files so
+            # the canonical exit-trap (set later in cmd_connect, around
+            # line 2498) can reap them. We don't set our own EXIT trap
+            # here because bash traps are last-set-wins per shell — the
+            # later trap would clobber us, leaving the gist orphaned on
+            # graceful Ctrl-C. Instead, the canonical trap reads these
+            # state files and cleans everything up in one place.
+            echo "$_hb_pid"  >  "$AIRC_WRITE_DIR/heartbeat.pid"
+            echo "$_gist_id" >  "$AIRC_WRITE_DIR/host_gist_id"
 
             echo "  Hosting #${room_name} (gh-account substrate)."
             echo "  Other agents on your gh account auto-join via:  airc connect"
@@ -2488,15 +2483,29 @@ except Exception:
     done &
     PAIR_PID=$!
 
-    # Write PID file so `airc teardown` can find us later. Record both us and
-    # the PAIR_PID (the backgrounded TCP-accept loop) so teardown can reap both.
-    echo "$$ $PAIR_PID" > "$AIRC_WRITE_DIR/airc.pid"
+    # Write PID file so `airc teardown` can find us later. Record us, the
+    # PAIR_PID (TCP-accept loop), and the heartbeat-loop PID (if hosting a
+    # room with a gist) so teardown can reap all three.
+    _hb_pid_persisted=""
+    [ -f "$AIRC_WRITE_DIR/heartbeat.pid" ] && _hb_pid_persisted=$(cat "$AIRC_WRITE_DIR/heartbeat.pid" 2>/dev/null)
+    echo "$$ $PAIR_PID $_hb_pid_persisted" > "$AIRC_WRITE_DIR/airc.pid"
     # Clean exit on tab close (SIGTERM/SIGINT from Claude Code's Monitor tool
     # going away, or any other signal): reap the accept loop, its python
-    # listener, and any active ssh tail — don't leave orphans holding the
-    # port or the SSH session.
+    # listener, the heartbeat loop, AND delete our hosted gist if any —
+    # don't leave orphans holding the port, the SSH session, or a stale
+    # gist pointing at a corpse. Single canonical trap (was previously
+    # split between this site + the gist-publish site, but bash traps are
+    # last-set-wins per shell so the split lost the gist-cleanup half).
     trap '
-      rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null
+      _exit_hb_pid=""
+      _exit_gist_id=""
+      [ -f "$AIRC_WRITE_DIR/heartbeat.pid" ] && _exit_hb_pid=$(cat "$AIRC_WRITE_DIR/heartbeat.pid" 2>/dev/null)
+      [ -f "$AIRC_WRITE_DIR/host_gist_id" ] && _exit_gist_id=$(cat "$AIRC_WRITE_DIR/host_gist_id" 2>/dev/null)
+      [ -n "$_exit_hb_pid" ] && kill $_exit_hb_pid 2>/dev/null
+      if [ -n "$_exit_gist_id" ] && command -v gh >/dev/null 2>&1; then
+        gh gist delete "$_exit_gist_id" --yes >/dev/null 2>&1
+      fi
+      rm -f "$AIRC_WRITE_DIR/airc.pid" "$AIRC_WRITE_DIR/heartbeat.pid" "$AIRC_WRITE_DIR/host_gist_id" 2>/dev/null
       for p in $PAIR_PID $(pgrep -P $PAIR_PID 2>/dev/null) $(pgrep -P $$ 2>/dev/null); do
         kill $p 2>/dev/null
       done
