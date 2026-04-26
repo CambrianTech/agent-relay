@@ -100,7 +100,33 @@ cleanup_known_hosts() {
   fi
 }
 
-cleanup_all() { cleanup_procs; cleanup_dirs; cleanup_known_hosts; }
+# Reap any orphan room gists left over from prior test runs that
+# kill -9'd before EXIT traps could fire (which is most of them under
+# the test harness's pkill cleanup). Without this, `airc list` on the
+# user's gh account piles up dozens of `airc room: sars-test-NNNN /
+# pks-test-NNNN / etc` entries — confusing during dogfood and slowly
+# filling gist quota. Skipped silently if gh isn't authed (CI without
+# gh) or has no gist scope. Filters by description-prefix to avoid
+# touching real rooms (#general / #useideem / #cambriantech etc).
+cleanup_test_gists() {
+  command -v gh >/dev/null 2>&1 || return 0
+  gh auth status >/dev/null 2>&1 || return 0
+  gh auth status 2>&1 | grep -qiE '(scopes|token scopes):.*\bgist\b' || return 0
+  # Test-scope room name prefixes — keep this list in sync with
+  # scenarios that publish real gists. Anything not on this list is
+  # left alone (real rooms or someone else's tests).
+  local _test_prefix_re='airc room: (sars-test-|pks-test-|pks-debug|debug-room|sidecar-test-|solo-test-|ronly-test-|new-room|myproject|hb-test-|bounce-test-|ttl-test-|test-irc-|useideem-test-|stalepid-)'
+  local _ids
+  _ids=$(gh gist list --limit 50 2>/dev/null | awk -F'\t' -v re="$_test_prefix_re" '$2 ~ re { print $1 }')
+  if [ -n "$_ids" ]; then
+    while IFS= read -r _gid; do
+      [ -z "$_gid" ] && continue
+      gh gist delete "$_gid" --yes >/dev/null 2>&1 || true
+    done <<< "$_ids"
+  fi
+}
+
+cleanup_all() { cleanup_procs; cleanup_dirs; cleanup_known_hosts; cleanup_test_gists; }
 
 # Boot a host. Args: home, name, port
 #
