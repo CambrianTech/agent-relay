@@ -852,11 +852,15 @@ spawn_general_sidecar_if_wanted() {
   ( env -u AIRC_PORT "${_env_args[@]}" "$0" connect --room general ) &
   local _sidecar_pid=$!
 
-  # Append to primary's pidfile so cmd_teardown kills the sidecar
-  # process tree along with the primary's. (Sidecar's own scope has
-  # its own pidfile for sidecar's descendants — that gets cleaned by
-  # the next sidecar's auto-stale-pidfile recovery on reconnect.)
-  echo "$_sidecar_pid" >> "$_primary_scope/airc.pid"
+  # Sidecar's own scope writes its own airc.pid for its bash + descendants.
+  # cmd_teardown walks $AIRC_WRITE_DIR.general/airc.pid explicitly to kill
+  # the sidecar tree, so we DON'T append the sidecar bash PID to the
+  # primary's airc.pid. Earlier (PR #122) we did — but that broke
+  # cmd_part, which walks the same primary pidfile and ends up killing
+  # the sidecar too even though IRC semantics say `/part` should leave
+  # only the current channel and keep others (e.g. #general) alive.
+  # Pidfiles per scope; cmd_teardown is the only path that walks both.
+  :
 }
 
 # Resolve this session's peer name.
@@ -4078,6 +4082,12 @@ cmd_part() {
     rm -f "$room_name_file" "$gist_id_file"
   fi
 
+  # IRC `/part` semantics — leave THIS room only; the #general sidecar
+  # (or any other sibling subscription) keeps running. cmd_teardown
+  # respects AIRC_TEARDOWN_PART_ONLY=1 by skipping its sidecar block,
+  # so the kill is scope-local. cmd_teardown without this guard remains
+  # the "kill everything in this scope tree" command.
+  local AIRC_TEARDOWN_PART_ONLY=1
   cmd_teardown
 }
 
@@ -4369,8 +4379,15 @@ cmd_teardown() {
   # #general gist on the gh account AND an orphan sidecar process that
   # the primary's pidfile descendant-walk wouldn't catch (sidecar's
   # bash isn't a child of cmd_teardown — it was forked detached).
+  #
+  # Guard: AIRC_TEARDOWN_PART_ONLY=1 (set by cmd_part) skips the sidecar
+  # block. IRC `/part` should leave only the current channel; the
+  # sidecar (#general lobby) should keep running. cmd_teardown without
+  # this flag is the "kill everything in this scope tree" semantic.
   local _sidecar_scope="${AIRC_WRITE_DIR}.general"
-  if [ -d "$_sidecar_scope" ]; then
+  if [ "${AIRC_TEARDOWN_PART_ONLY:-0}" = "1" ]; then
+    : # cmd_part path — skip sidecar
+  elif [ -d "$_sidecar_scope" ]; then
     if [ -f "$_sidecar_scope/host_gist_id" ] && command -v gh >/dev/null 2>&1; then
       local _td_sc_gist; _td_sc_gist=$(cat "$_sidecar_scope/host_gist_id" 2>/dev/null)
       if [ -n "$_td_sc_gist" ]; then
@@ -4420,6 +4437,34 @@ cmd_teardown() {
         [ -n "$kids" ] && all_pids="$all_pids $kids"
       done
       all_pids=$(echo "$all_pids" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
+      # Part-only path: exclude the sidecar's bash + its descendants so
+      # `airc part` doesn't sweep them via the primary's child-tree.
+      # The sidecar's bash is forked from primary, so pgrep -P picks it
+      # up here; without exclusion we'd kill the sidecar in violation
+      # of IRC /part semantics (leave one channel, keep others alive).
+      if [ "${AIRC_TEARDOWN_PART_ONLY:-0}" = "1" ] && [ -n "$all_pids" ]; then
+        local _exclude_pids=""
+        local _sc_pidfile="${AIRC_WRITE_DIR}.general/airc.pid"
+        if [ -f "$_sc_pidfile" ]; then
+          local _sc_pids; _sc_pids=$(cat "$_sc_pidfile" 2>/dev/null | tr '\n' ' ')
+          for _scp in $_sc_pids; do
+            _exclude_pids="$_exclude_pids $_scp"
+            local _scp_kids; _scp_kids=$(pgrep -P "$_scp" 2>/dev/null | tr '\n' ' ' || true)
+            [ -n "$_scp_kids" ] && _exclude_pids="$_exclude_pids $_scp_kids"
+          done
+        fi
+        if [ -n "$_exclude_pids" ]; then
+          local _filtered=""
+          for _p in $all_pids; do
+            local _skip=0
+            for _ex in $_exclude_pids; do
+              [ "$_p" = "$_ex" ] && { _skip=1; break; }
+            done
+            [ "$_skip" = "0" ] && _filtered="$_filtered $_p"
+          done
+          all_pids=$(echo "$_filtered" | tr ' ' '\n' | grep -v '^$' || true)
+        fi
+      fi
       if [ -n "$all_pids" ]; then
         echo "  killing scope $AIRC_WRITE_DIR: $(echo $all_pids | tr '\n' ' ')"
         kill -9 $all_pids 2>/dev/null || true
