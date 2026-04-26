@@ -515,6 +515,46 @@ advise_tailscale_if_down() {
 
 timestamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+# tailscale_login_check_or_prompt: at the top of every cmd_connect, if
+# Tailscale is installed but the daemon reports Logged out / NeedsLogin,
+# tell the user + open the GUI sign-in (mac) / print 'tailscale up'
+# (linux/win). Non-fatal: returns 0 always. Same-machine + same-LAN
+# substrate paths still work without Tailscale; this prompt is for
+# the host-goal-is-mesh case Joel pointed at: "if you got it use it".
+#
+# Opt-out: AIRC_NO_TAILSCALE=1 (env var) — explicit user preference
+# for "I'm intentionally running without Tailscale; stop nagging."
+# Distinct from advise_tailscale_if_down which fires only on a
+# CGNAT-targeted SSH attempt; this one is the unconditional startup
+# nudge for both host and joiner roles.
+tailscale_login_check_or_prompt() {
+  [ "${AIRC_NO_TAILSCALE:-0}" = "1" ] && return 0
+  local ts_bin; ts_bin=$(resolve_tailscale_bin 2>/dev/null || true)
+  [ -z "$ts_bin" ] && return 0   # not installed; no nag (Tailscale truly optional)
+  local out; out=$("$ts_bin" status 2>&1)
+  case "$out" in
+    *"Logged out"*|*"NeedsLogin"*) ;;
+    *) return 0 ;;
+  esac
+  echo "" >&2
+  echo "  ⚠  Tailscale is installed but you're not signed in." >&2
+  echo "     Same-machine and same-LAN peers reach you fine; remote peers" >&2
+  echo "     (other machines on your gh account) can't until you sign in." >&2
+  case "$(uname -s)" in
+    Darwin)
+      if [ -d /Applications/Tailscale.app ]; then
+        echo "     Opening Tailscale.app — sign in there. (To opt out: AIRC_NO_TAILSCALE=1)" >&2
+        open -a Tailscale 2>/dev/null || true
+      else
+        echo "     Sign in:  tailscale up   (or set AIRC_NO_TAILSCALE=1 to opt out)" >&2
+      fi
+      ;;
+    *) echo "     Sign in:  tailscale up   (or set AIRC_NO_TAILSCALE=1 to opt out)" >&2 ;;
+  esac
+  echo "" >&2
+  return 0
+}
+
 # host_machine_id: stable per-machine identifier. Same machine, two
 # terminals: same value. Different machines: different. Used by the
 # multi-address gist envelope so a same-machine joiner knows to dial
@@ -1369,10 +1409,25 @@ cmd_connect() {
       --no-gist|-no-gist) use_gist=0; shift ;;
       --room|-room) room_name="${2:-general}"; use_room=1; room_explicit=1; shift 2 ;;
       --no-general|-no-general|--no-room|-no-room) use_room=0; shift ;;
+      --no-tailscale|-no-tailscale)
+        # Opt out of Tailscale entirely: skips the login prompt AND
+        # drops the tailscale entry from host_address_set so the
+        # gist envelope advertises only localhost+LAN. The flag is
+        # the primary user-facing API; AIRC_NO_TAILSCALE=1 stays as
+        # an internal toggle for code that already reads it.
+        export AIRC_NO_TAILSCALE=1
+        shift ;;
       *) positional+=("$1"); shift ;;
     esac
   done
   set -- "${positional[@]+"${positional[@]}"}"
+
+  # Tailscale-installed-but-logged-out nudge. Runs AFTER flag parsing
+  # so --no-tailscale takes effect. Default behavior: if Tailscale is
+  # installed, "just works" — prompt the user to sign in (Mac: opens
+  # Tailscale.app). The 90% case is "I have it and want it on";
+  # --no-tailscale is the explicit opt-out for the few who don't.
+  tailscale_login_check_or_prompt
 
   # `airc join` (no args) joins #general. Period. Auto-scope-by-git-remote
   # was a previous default that silently put agents in different cwds into
@@ -2430,7 +2485,7 @@ json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
     # substrate framing took effect — emit unconditionally for room mode.
     if [ "$use_room" = "1" ]; then
       echo "$room_name" > "$AIRC_WRITE_DIR/room_name"
-      echo "  No live #${room_name} found on your gh account — hosting fresh."
+      echo "  Hosting #${room_name} — no existing room on your gh account, fresh start."
       echo "  Other agents on your gh account who run 'airc join' will auto-join."
     fi
 
