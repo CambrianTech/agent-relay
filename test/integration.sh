@@ -2438,6 +2438,77 @@ JSON
   rm -rf /tmp/airc-it-srf
 }
 
+# ── Scenario: peers_cross_scope (sidecar peers visible from primary) ────
+# Pre-fix: `airc peers` walked only the current scope's peers/ dir, so a
+# tab in primary scope (e.g. #useideem) couldn't see who else was in the
+# #general lobby without `cd`'ing into the .general sidecar. Multi-room
+# presence is meaningless if the operator can't see who's in each room.
+#
+# Post-fix: cmd_peers walks the project scope AND every sibling .airc.<room>
+# scope, merging peer records by (name, host) and tagging each peer with
+# the rooms they're in. Same peer in both rooms shows as one line with
+# [#room1, #room2].
+scenario_peers_cross_scope() {
+  section "peers_cross_scope: airc peers aggregates across primary + sidecar scopes"
+  cleanup_all
+
+  local primary=/tmp/airc-it-pcs/state
+  local sidecar=/tmp/airc-it-pcs/state.general
+  mkdir -p "$primary/identity" "$primary/peers" "$sidecar/identity" "$sidecar/peers"
+  ssh-keygen -t ed25519 -f "$primary/identity/ssh_key" -N '' -q -C 'pcs-primary' 2>/dev/null
+  ssh-keygen -t ed25519 -f "$sidecar/identity/ssh_key" -N '' -q -C 'pcs-sidecar' 2>/dev/null
+  cat > "$primary/config.json" <<'JSON'
+{ "name": "alpha" }
+JSON
+  cat > "$sidecar/config.json" <<'JSON'
+{ "name": "alpha" }
+JSON
+  echo "myproject" > "$primary/room_name"
+  echo "general" > "$sidecar/room_name"
+
+  # Peer records: 'shared' is in both scopes; 'projonly' only in primary;
+  # 'lobbyonly' only in sidecar. Verifies merge + per-scope tagging.
+  cat > "$primary/peers/shared.json" <<'JSON'
+{"name":"shared","host":"joel@10.0.0.1","ssh_pub":"ssh-ed25519 AAAA"}
+JSON
+  cat > "$primary/peers/projonly.json" <<'JSON'
+{"name":"projonly","host":"joel@10.0.0.2","ssh_pub":"ssh-ed25519 BBBB"}
+JSON
+  cat > "$sidecar/peers/shared.json" <<'JSON'
+{"name":"shared","host":"joel@10.0.0.1","ssh_pub":"ssh-ed25519 AAAA"}
+JSON
+  cat > "$sidecar/peers/lobbyonly.json" <<'JSON'
+{"name":"lobbyonly","host":"joel@10.0.0.3","ssh_pub":"ssh-ed25519 CCCC"}
+JSON
+
+  local out
+  out=$(AIRC_HOME="$primary" "$AIRC" peers 2>&1)
+
+  echo "$out" | grep -qE 'shared.*joel@10.0.0.1.*\[#myproject.*#general\]|shared.*joel@10.0.0.1.*\[#general.*#myproject\]' \
+    && pass "shared peer shows tagged with BOTH rooms" \
+    || fail "shared peer missing dual-room tag (got: $(echo "$out" | grep shared))"
+
+  echo "$out" | grep -qE 'projonly.*joel@10.0.0.2.*\[#myproject\]' \
+    && pass "primary-only peer tagged with #myproject" \
+    || fail "projonly peer missing primary tag (got: $(echo "$out" | grep projonly))"
+
+  echo "$out" | grep -qE 'lobbyonly.*joel@10.0.0.3.*\[#general\]' \
+    && pass "sidecar-only peer visible from primary scope, tagged with #general" \
+    || fail "lobbyonly peer NOT visible from primary scope (got: $(echo "$out" | grep lobbyonly))"
+
+  # Same query from the sidecar scope should return the same merged set
+  # (operator perspective shouldn't change based on which scope they
+  # happen to invoke from).
+  local out2
+  out2=$(AIRC_HOME="$sidecar" "$AIRC" peers 2>&1)
+  echo "$out2" | grep -qE 'projonly' \
+    && pass "from sidecar scope: still sees primary-only peer" \
+    || fail "from sidecar scope: lost primary-only peer (got: $(echo "$out2" | head -3))"
+
+  rm -rf /tmp/airc-it-pcs
+  cleanup_all
+}
+
 case "$MODE" in
   tabs)         scenario_tabs  ;;
   scope)        scenario_scope ;;
@@ -2466,8 +2537,9 @@ case "$MODE" in
   resume_prints_connected_banner) scenario_resume_prints_connected_banner ;;
   general_sidecar_default) scenario_general_sidecar_default ;;
   send_room_flag) scenario_send_room_flag ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_room_overrides_resume; scenario_stale_auth_room_selfheal; scenario_send_dead_monitor_dies; scenario_resume_404_gist_no_silent_exit; scenario_resume_prints_connected_banner; scenario_general_sidecar_default; scenario_send_room_flag ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|room_overrides_resume|stale_auth_room_selfheal|send_dead_monitor_dies|resume_404_gist_no_silent_exit|resume_prints_connected_banner|general_sidecar_default|send_room_flag|all]"; exit 2 ;;
+  peers_cross_scope) scenario_peers_cross_scope ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_room_overrides_resume; scenario_stale_auth_room_selfheal; scenario_send_dead_monitor_dies; scenario_resume_404_gist_no_silent_exit; scenario_resume_prints_connected_banner; scenario_general_sidecar_default; scenario_send_room_flag; scenario_peers_cross_scope ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|room_overrides_resume|stale_auth_room_selfheal|send_dead_monitor_dies|resume_404_gist_no_silent_exit|resume_prints_connected_banner|general_sidecar_default|send_room_flag|peers_cross_scope|all]"; exit 2 ;;
 esac
 
 echo
