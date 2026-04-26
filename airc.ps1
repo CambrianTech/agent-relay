@@ -349,6 +349,26 @@ function Advise-TailscaleIfDown {
     return $true
 }
 
+# Test-TailscaleLoginOrPrompt: PS parity for bash tailscale_login_check_or_prompt.
+# Called at the top of Invoke-Connect. If Tailscale is installed but the
+# daemon reports Logged out / NeedsLogin, surface a non-fatal warning.
+# Same-machine + same-LAN substrate paths still work without Tailscale.
+# AIRC_NO_TAILSCALE=1 opts out (explicit "I'm running without it").
+function Test-TailscaleLoginOrPrompt {
+    if ($env:AIRC_NO_TAILSCALE -eq '1') { return }
+    $ts = Resolve-TailscaleBin
+    if (-not $ts) { return }   # not installed; no nag
+    $out = & $ts status 2>&1 | Out-String
+    if ($out -notmatch 'Logged out|NeedsLogin') { return }
+    Write-Host ''
+    Write-Host "  ! Tailscale is installed but you're not signed in."
+    Write-Host '     Same-machine and same-LAN peers reach you fine; remote peers'
+    Write-Host "     (other machines on your gh account) can't until you sign in."
+    Write-Host '     Click the Tailscale tray icon to sign in, or run:  tailscale up'
+    Write-Host '     (To opt out of this nag: set AIRC_NO_TAILSCALE=1)'
+    Write-Host ''
+}
+
 # -- get_host: tailscale IP > LAN IP > hostname -------------------------
 # Priority order matches bash: tailscale IP first (works across the whole
 # tailnet), LAN IP next (no Tailscale required for same-LAN mesh), then
@@ -2112,9 +2132,16 @@ function Invoke-Connect {
             '^(--no-gist|-no-gist)$' { $useGist = $false }
             '^(--room|-room)$' { $roomName = $Argv[$i + 1]; $useRoom = $true; $i++ }
             '^(--no-general|-no-general|--no-room|-no-room)$' { $useRoom = $false }
+            '^(--no-tailscale|-no-tailscale)$' { $env:AIRC_NO_TAILSCALE = '1' }
             default { $positional += $Argv[$i] }
         }
     }
+
+    # Tailscale-installed-but-logged-out nudge. AFTER flag parsing so
+    # --no-tailscale takes effect. Default: prompt to sign in if it's
+    # installed but logged out (90% case is "I want it on, just got
+    # logged out"). --no-tailscale is the explicit opt-out.
+    Test-TailscaleLoginOrPrompt
     $target = if ($positional.Count -gt 0) { $positional[0] } else { '' }
     $reminderInterval = if ($env:AIRC_REMINDER) { [int]$env:AIRC_REMINDER }
                        elseif ($positional.Count -gt 1) { [int]$positional[1] }
