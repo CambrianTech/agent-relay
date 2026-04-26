@@ -2509,6 +2509,80 @@ JSON
   cleanup_all
 }
 
+# ── Scenario: part_keeps_sidecar (IRC /part semantics) ──────────────────
+# Pre-fix: `airc part` from the primary scope called cmd_teardown which
+# (post-#122) cleaned both primary AND sidecar scopes — so leaving
+# #useideem also dropped #general unintentionally. IRC convention is
+# /part leaves ONE channel; the lobby should persist.
+#
+# Post-fix: cmd_part sets AIRC_TEARDOWN_PART_ONLY=1 before calling
+# cmd_teardown, which makes cmd_teardown skip the sidecar cleanup
+# block. Sidecar process + gist + scope dir survive.
+scenario_part_keeps_sidecar() {
+  section "part_keeps_sidecar: airc part leaves project room only, #general sidecar lives"
+  cleanup_all
+
+  local home1=/tmp/airc-it-pks/state
+  mkdir -p "$home1"
+
+  # Spawn primary with sidecar enabled (unset the global suppression).
+  ( cd /tmp/airc-it-pks && unset AIRC_NO_GENERAL && \
+      AIRC_HOME="$home1" AIRC_NAME=alpha AIRC_PORT=7575 \
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --no-gist --room pks-test-$$ > "$home1/out.log" 2>&1 & )
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    sleep 1
+    [ -f "${home1}.general/airc.pid" ] && [ -f "$home1/airc.pid" ] && break
+  done
+
+  [ -f "$home1/airc.pid" ] && [ -f "${home1}.general/airc.pid" ] \
+    && pass "primary + sidecar both running pre-part" \
+    || { fail "setup failed (primary or sidecar didn't start)"; cleanup_all; return; }
+
+  # Capture sidecar's bash PID so we can verify it survives the part.
+  # airc.pid in host mode contains multiple space-separated PIDs on
+  # one line ($$ $PAIR_PID $_hb_pid_persisted); we want just the
+  # main bash PID for the kill -0 check.
+  local _sc_pid; _sc_pid=$(awk '{print $1; exit}' "${home1}.general/airc.pid" 2>/dev/null)
+
+  # Run airc part on primary scope.
+  AIRC_HOME="$home1" "$AIRC" part >/dev/null 2>&1
+  sleep 1
+
+  # Primary's pidfile should be gone (parted).
+  [ ! -f "$home1/airc.pid" ] \
+    && pass "primary scope airc.pid removed by part" \
+    || fail "primary airc.pid still present after part"
+
+  # CRITICAL: sidecar should still be running.
+  if [ -n "$_sc_pid" ] && kill -0 "$_sc_pid" 2>/dev/null; then
+    pass "sidecar PID $_sc_pid still alive after primary's part"
+  else
+    fail "sidecar killed by primary's part (pre-fix bug regressed)"
+  fi
+
+  [ -d "${home1}.general" ] && [ -f "${home1}.general/airc.pid" ] \
+    && pass "sidecar scope dir + pidfile still present after part" \
+    || fail "sidecar scope wiped by part"
+
+  # Sidecar's room_name should still say 'general'.
+  [ -f "${home1}.general/room_name" ] && [ "$(cat "${home1}.general/room_name" 2>/dev/null)" = "general" ] \
+    && pass "sidecar room_name preserved" \
+    || fail "sidecar room_name lost"
+
+  # Now full teardown should reap the sidecar.
+  AIRC_HOME="$home1" "$AIRC" teardown >/dev/null 2>&1
+  sleep 1
+
+  ! kill -0 "$_sc_pid" 2>/dev/null \
+    && pass "subsequent airc teardown DOES reap the sidecar (full kill semantic preserved)" \
+    || fail "sidecar survived even airc teardown — over-skip bug"
+
+  rm -rf /tmp/airc-it-pks
+  cleanup_all
+}
+
 case "$MODE" in
   tabs)         scenario_tabs  ;;
   scope)        scenario_scope ;;
@@ -2538,8 +2612,9 @@ case "$MODE" in
   general_sidecar_default) scenario_general_sidecar_default ;;
   send_room_flag) scenario_send_room_flag ;;
   peers_cross_scope) scenario_peers_cross_scope ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_room_overrides_resume; scenario_stale_auth_room_selfheal; scenario_send_dead_monitor_dies; scenario_resume_404_gist_no_silent_exit; scenario_resume_prints_connected_banner; scenario_general_sidecar_default; scenario_send_room_flag; scenario_peers_cross_scope ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|room_overrides_resume|stale_auth_room_selfheal|send_dead_monitor_dies|resume_404_gist_no_silent_exit|resume_prints_connected_banner|general_sidecar_default|send_room_flag|peers_cross_scope|all]"; exit 2 ;;
+  part_keeps_sidecar) scenario_part_keeps_sidecar ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_room_overrides_resume; scenario_stale_auth_room_selfheal; scenario_send_dead_monitor_dies; scenario_resume_404_gist_no_silent_exit; scenario_resume_prints_connected_banner; scenario_general_sidecar_default; scenario_send_room_flag; scenario_peers_cross_scope; scenario_part_keeps_sidecar ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|room_overrides_resume|stale_auth_room_selfheal|send_dead_monitor_dies|resume_404_gist_no_silent_exit|resume_prints_connected_banner|general_sidecar_default|send_room_flag|peers_cross_scope|part_keeps_sidecar|all]"; exit 2 ;;
 esac
 
 echo
