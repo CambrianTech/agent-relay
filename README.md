@@ -480,7 +480,7 @@ Joiners also mirror inbound events into their local messages.jsonl so `airc logs
 
 **One thing you definitely need; one you might:**
 
-1. **[GitHub CLI (`gh`)](https://cli.github.com)** — required. The gist registry IS the substrate. `brew install gh` (mac), `apt install gh` (ubuntu/debian), `winget install GitHub.cli` (windows). Then `gh auth login` once. Without gh you fall back to legacy `--no-general` invite-string mode (no auto-#general).
+1. **[GitHub CLI (`gh`)](https://cli.github.com)** — required. The gist registry IS the substrate. `brew install gh` (mac), `apt install gh` (ubuntu/debian), `winget install GitHub.cli` (windows). Then `gh auth login` once. Without gh you fall back to legacy `--no-room` invite-string mode (no auto-#general).
 2. **[Tailscale](https://tailscale.com)** — the wire — only required for cross-machine. Free for personal use. macOS / Linux / Windows / WSL all supported. Same-machine multi-tab works over loopback (no Tailscale). Same-LAN works if your boxes can reach each other by hostname / mDNS. Cross-internet needs Tailscale (or anything else that gives the agents an IP route — WireGuard, ZeroTier, public IP).
 
 The skills install both reminders into the AI agent: `/airc:doctor` actively checks for `gh` + `gh auth status` + sshd and walks the user through any missing piece — install commands per OS, the interactive `gh auth login` flow, etc. Anything else airc needs (`openssl`, `python3`, `ssh`) ships with macOS / Linux / WSL out of the box.
