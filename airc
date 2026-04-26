@@ -793,6 +793,72 @@ remote_home() {
   echo "$h"
 }
 
+# Spawn the #general sidecar (issue #121) — a parallel `airc connect`
+# in a sibling scope (.general suffix) so the primary tab is in BOTH
+# its project room AND the lobby. Identity NICK is shared via AIRC_NAME;
+# ssh_key + peer records are per-scope. Each subscription gets its own
+# wire (the python formatter prefixes events with the scope's room_name,
+# so the user sees `[#useideem] X` and `[#general] Y` interleaved).
+#
+# Reads from cmd_connect's locals via bash's dynamic scoping:
+#   general_sidecar     1 = spawn, 0 = don't (--no-general / --room-only /
+#                       AIRC_GENERAL_SIDECAR=1 recursion guard already set it)
+#   room_name           skip if we ARE #general (avoid self-recursion)
+#   use_room            skip if legacy 1:1 invite mode (no substrate at all)
+#   AIRC_WRITE_DIR      primary scope dir; sidecar lives at ${this}.general
+#
+# Side effect: appends sidecar bash PID to primary's airc.pid so
+# cmd_teardown's process-tree walker reaps it. cmd_teardown also has
+# explicit sidecar-scope cleanup (gist + sidecar's own pidfile).
+spawn_general_sidecar_if_wanted() {
+  [ "$general_sidecar" = "1" ] || return 0
+  [ "$room_name" = "general" ] && return 0
+  [ "$use_room" = "1" ] || return 0
+
+  local _primary_scope="$AIRC_WRITE_DIR"
+  local _primary_name; _primary_name=$(get_name 2>/dev/null || echo "")
+  local _sidecar_scope="${_primary_scope}.general"
+
+  echo "  Sidecar: also subscribing to #general (--no-general to opt out)"
+
+  mkdir -p "$_sidecar_scope"
+
+  # Background subprocess. Inherits stdout from primary so its monitor
+  # events stream alongside primary's, naturally distinguished by the
+  # formatter's `[#room]` prefix. AIRC_GENERAL_SIDECAR=1 is the recursion
+  # guard the sidecar reads at the top of cmd_connect to avoid spawning
+  # ITS OWN sidecar (turtles all the way down).
+  # Explicit `--room general` is critical: without it, auto-scope from
+  # cwd's git remote would resolve to the SAME project room as primary
+  # (cwd is shared across the spawn), and we'd end up double-subscribed
+  # to one room instead of subscribed to two. AIRC_NO_AUTO_ROOM=1 is
+  # belt-and-suspenders — auto-scope is gated by --room not being
+  # explicit; --room general makes it explicit, but the env var
+  # documents intent.
+  #
+  # `env` invocation (not bash assignment-prefixes): bash parameter
+  # expansion `${foo:+VAR=val}` doesn't get treated as an assignment
+  # prefix because it's expanded after tokenization — bash sees
+  # `AIRC_NAME=alpha` as a command in that position, not an env var,
+  # and dies with "command not found". `env` always treats its args
+  # as VAR=val pairs. Caught the hard way by the first run of this
+  # helper on 2026-04-26.
+  local _env_args=(AIRC_HOME="$_sidecar_scope" AIRC_GENERAL_SIDECAR=1 AIRC_NO_AUTO_ROOM=1)
+  [ -n "$_primary_name" ] && _env_args+=("AIRC_NAME=$_primary_name")
+  # Unset primary's AIRC_PORT so sidecar doesn't fight for the same port —
+  # primary has it bound already, sidecar's auto-bump-loop would land on
+  # +1, but better to start the sidecar from the canonical default and
+  # let it find its own free port without the conflict-detect dance.
+  ( env -u AIRC_PORT "${_env_args[@]}" "$0" connect --room general ) &
+  local _sidecar_pid=$!
+
+  # Append to primary's pidfile so cmd_teardown kills the sidecar
+  # process tree along with the primary's. (Sidecar's own scope has
+  # its own pidfile for sidecar's descendants — that gets cleaned by
+  # the next sidecar's auto-stale-pidfile recovery on reconnect.)
+  echo "$_sidecar_pid" >> "$_primary_scope/airc.pid"
+}
+
 # Resolve this session's peer name.
 # Priority: AIRC_NAME env > config.json name > cwd basename > hostname.
 # Multiple sessions on one machine get distinct names by using different AIRC_WRITE_DIRs
@@ -1375,17 +1441,37 @@ cmd_connect() {
   # falls through to long-invite-only when gh is missing or unauthed, so
   # the host command never fails just because GitHub isn't reachable.
   #
-  # Issue #39 — IRC-style rooms (aIRC, get it):
-  #   --room <name>       : join (or host) a named room (default: 'general')
-  #   --no-general        : skip the auto-#general default (host an unnamed
-  #                         single-pair invite, today's invite-only flow)
-  #   --no-room           : alias for --no-general (kept for symmetry)
-  # Default behavior: every `airc connect` joins '#general' on the gh account.
-  # First in hosts, rest auto-join. Matches IRC's "everyone's in the lobby."
+  # Room flags (issue #39 + #121):
+  #   --room <name>       : join (or host) a named room (default: auto-scope
+  #                         from git org, falling back to 'general')
+  #   --no-room           : disable the substrate entirely; legacy 1:1
+  #                         invite-string flow (use_room=0). Inherits #38
+  #                         single-pair behavior. Aliased --no-general was
+  #                         removed for this — those have different meanings.
+  #   --no-general        : keep the project room, but DON'T also subscribe
+  #                         to the #general lobby. Project-only focus mode.
+  #                         (NEW; previously this was an alias for --no-room.)
+  #   --room-only <name>  : explicit project room + no general sidecar.
+  #                         Equivalent to `--room <name> --no-general`.
+  #
+  # Default behavior (issue #121): every `airc join` lands in BOTH the
+  # auto-scoped project room AND #general. The general sidecar runs in a
+  # sibling scope (.general suffix) under the same visible identity, so
+  # AIs cross-pollinate between projects via the lobby while keeping
+  # focused work in their project room. Set AIRC_GENERAL_SIDECAR=1 to
+  # signal "this IS the sidecar, don't recurse" — internal-only.
   local use_gist=1   # default ON; runtime probe later checks gh availability
   local room_name="general"
   local room_explicit=0  # set to 1 when user passes --room explicitly
   local use_room=1   # default ON — auto-#general substrate
+  local general_sidecar=1   # default ON (issue #121) — also subscribe to #general
+  # Recursion guard: when WE are the sidecar (spawned by another airc
+  # connect), don't spawn our own sidecar. Otherwise: turtles all the way.
+  [ "${AIRC_GENERAL_SIDECAR:-0}" = "1" ] && general_sidecar=0
+  # User-facing env opt-out, equivalent to --no-general flag. Useful
+  # for test harnesses that don't care about sidecar behavior, and
+  # for one-off scoped scripts that want to set it once and forget.
+  [ "${AIRC_NO_GENERAL:-0}" = "1" ] && general_sidecar=0
   # Declared at function scope so set -u doesn't bite when JOIN MODE runs
   # without a prior gist parser (inline-invite path skips the parser
   # entirely; resolved_room_name only gets a value when we resolved a
@@ -1416,7 +1502,20 @@ cmd_connect() {
       --gist|-gist) use_gist=1; shift ;;
       --no-gist|-no-gist) use_gist=0; shift ;;
       --room|-room) room_name="${2:-general}"; use_room=1; room_explicit=1; shift 2 ;;
-      --no-general|-no-general|--no-room|-no-room) use_room=0; shift ;;
+      --no-room|-no-room) use_room=0; shift ;;
+      --no-general|-no-general)
+        # NEW semantic (issue #121): keep the project room substrate,
+        # just don't ALSO subscribe to the #general lobby sidecar. This
+        # used to alias --no-room (disable substrate entirely); the
+        # behaviors are now distinct because dual-room presence is
+        # default and users need a way to opt out of just the lobby
+        # part without dropping back to legacy 1:1 invites.
+        general_sidecar=0; shift ;;
+      --room-only|-room-only)
+        # Combo: explicit project room + skip general sidecar. For
+        # focused work where lobby noise would distract.
+        room_name="${2:-general}"; use_room=1; room_explicit=1; general_sidecar=0
+        shift 2 ;;
       --no-tailscale|-no-tailscale)
         # Opt out of Tailscale entirely: skips the login prompt AND
         # drops the tailscale entry from host_address_set so the
@@ -1829,6 +1928,7 @@ cmd_connect() {
         rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null
         for p in $(pgrep -P $$ 2>/dev/null); do kill $p 2>/dev/null; done
       ' EXIT INT TERM
+      spawn_general_sidecar_if_wanted
       monitor
       return
     fi
@@ -2505,6 +2605,7 @@ json.dump(c, open('$CONFIG', 'w'), indent=2)
       for p in $(pgrep -P $$ 2>/dev/null); do kill $p 2>/dev/null; done
     ' EXIT INT TERM
 
+    spawn_general_sidecar_if_wanted
     echo "  Monitoring for messages..."
     monitor
 
@@ -3003,6 +3104,7 @@ except Exception:
       done
     ' EXIT INT TERM
 
+    spawn_general_sidecar_if_wanted
     echo "  Monitoring for messages..."
     monitor
     kill $PAIR_PID 2>/dev/null
@@ -4111,6 +4213,47 @@ cmd_teardown() {
         echo "  deleted hosted gist: $_td_gist"
       fi
       rm -f "$AIRC_WRITE_DIR/host_gist_id"
+    fi
+  fi
+
+  # Sidecar scope cleanup (issue #121 — multi-room presence).
+  # When the primary tab spawned a #general sidecar, that sidecar runs
+  # in a sibling .general scope with its own pidfile + (if hosting)
+  # its own host_gist_id. Mirror the primary's gist cleanup + pidfile
+  # kill there. Without this, killing the primary leaves an orphan
+  # #general gist on the gh account AND an orphan sidecar process that
+  # the primary's pidfile descendant-walk wouldn't catch (sidecar's
+  # bash isn't a child of cmd_teardown — it was forked detached).
+  local _sidecar_scope="${AIRC_WRITE_DIR}.general"
+  if [ -d "$_sidecar_scope" ]; then
+    if [ -f "$_sidecar_scope/host_gist_id" ] && command -v gh >/dev/null 2>&1; then
+      local _td_sc_gist; _td_sc_gist=$(cat "$_sidecar_scope/host_gist_id" 2>/dev/null)
+      if [ -n "$_td_sc_gist" ]; then
+        if gh gist delete "$_td_sc_gist" --yes >/dev/null 2>&1; then
+          echo "  deleted sidecar #general gist: $_td_sc_gist"
+        fi
+        rm -f "$_sidecar_scope/host_gist_id"
+      fi
+    fi
+    if [ -f "$_sidecar_scope/airc.pid" ]; then
+      local _sc_pids; _sc_pids=$(cat "$_sidecar_scope/airc.pid" 2>/dev/null | tr '\n' ' ')
+      if [ -n "$_sc_pids" ]; then
+        local _all_sc="$_sc_pids"
+        for _p in $_sc_pids; do
+          local _kids; _kids=$(pgrep -P "$_p" 2>/dev/null | tr '\n' ' ' || true)
+          [ -n "$_kids" ] && _all_sc="$_all_sc $_kids"
+        done
+        _all_sc=$(echo "$_all_sc" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
+        if [ -n "$_all_sc" ]; then
+          echo "  killing sidecar scope $_sidecar_scope: $(echo $_all_sc | tr '\n' ' ')"
+          kill -9 $_all_sc 2>/dev/null || true
+          killed=1
+        fi
+      fi
+      rm -f "$_sidecar_scope/airc.pid"
+    fi
+    if [ "$flush" = "1" ]; then
+      rm -rf "$_sidecar_scope"
     fi
   fi
 

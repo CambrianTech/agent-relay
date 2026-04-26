@@ -19,6 +19,13 @@ set -u
 AIRC="${AIRC:-$(cd "$(dirname "$0")/.." && pwd)/airc}"
 [ -x "$AIRC" ] || { echo "FATAL: $AIRC not executable"; exit 2; }
 
+# Suppress the #general sidecar globally for the test suite (issue #121).
+# Default behavior on canary spawns a sibling .general scope alongside
+# every airc connect; for tests that don't care about lobby presence
+# the sidecar adds latency, port pressure, and stdout noise. Tests that
+# DO exercise sidecar behavior `unset AIRC_NO_GENERAL` for their scope.
+export AIRC_NO_GENERAL=1
+
 RED=$'\033[0;31m'; GRN=$'\033[0;32m'; YLO=$'\033[0;33m'; RST=$'\033[0m'
 PASS=0; FAIL=0; TRACE=()
 
@@ -97,7 +104,7 @@ cleanup_all() { cleanup_procs; cleanup_dirs; cleanup_known_hosts; }
 
 # Boot a host. Args: home, name, port
 #
-# Defaults to --no-general --no-gist for two reasons:
+# Defaults to --no-room --no-gist for two reasons:
 # (1) These existing scenarios test the LOWER-layer single-pair invite
 #     behavior, not the IRC substrate. With #39's defaults, bare
 #     `airc connect` would create a real `airc room: general` gist on
@@ -111,7 +118,7 @@ spawn_host() {
   mkdir -p "$home"
   ( cd "$home" && AIRC_HOME="$home/state" AIRC_NAME="$name" AIRC_PORT="$port" \
       AIRC_NO_DISCOVERY=1 \
-      "$AIRC" connect --no-general --no-gist > "$home/out.log" 2>&1 & )
+      "$AIRC" connect --no-room --no-gist > "$home/out.log" 2>&1 & )
   local i
   for i in 1 2 3 4 5; do
     sleep 1
@@ -337,7 +344,7 @@ scenario_reminder() {
   mkdir -p "$home"
   ( cd "$home" && AIRC_HOME="$home/state" AIRC_NAME=hb-host AIRC_PORT=7549 AIRC_REMINDER=2 \
       AIRC_NO_DISCOVERY=1 \
-      "$AIRC" connect --no-general --no-gist > "$home/out.log" 2>&1 & )
+      "$AIRC" connect --no-room --no-gist > "$home/out.log" 2>&1 & )
   local i
   for i in 1 2 3 4 5; do sleep 1; grep -q 'Hosting as' "$home/out.log" 2>/dev/null && break; done
 
@@ -437,7 +444,7 @@ scenario_resilience() {
   echo "999999" > "$sp_home/state/airc.pid"
   ( cd "$sp_home" && AIRC_HOME="$sp_home/state" AIRC_NAME=stalepid-host AIRC_PORT=7549 \
       AIRC_NO_DISCOVERY=1 \
-      "$AIRC" connect --no-general --no-gist > "$sp_home/out.log" 2>&1 & )
+      "$AIRC" connect --no-room --no-gist > "$sp_home/out.log" 2>&1 & )
   local i
   for i in 1 2 3 4 5 6; do sleep 1; grep -q 'Hosting as' "$sp_home/out.log" 2>/dev/null && break; done
   grep -q 'Hosting as' "$sp_home/out.log" && pass "stale pidfile: cmd_connect recovers and reaches Hosting" \
@@ -528,7 +535,7 @@ scenario_reconnect() {
   #  Instead re-invoke connect directly pointing at the same state.)
   ( cd /tmp/airc-it-rec-h && AIRC_HOME=/tmp/airc-it-rec-h/state AIRC_NAME=alpha AIRC_PORT=7549 \
       AIRC_NO_DISCOVERY=1 \
-      "$AIRC" connect --no-general --no-gist >> /tmp/airc-it-rec-h/out.log 2>&1 & )
+      "$AIRC" connect --no-room --no-gist >> /tmp/airc-it-rec-h/out.log 2>&1 & )
   local i
   for i in 1 2 3 4 5 6 7 8; do
     sleep 1
@@ -1163,7 +1170,7 @@ scenario_identity() {
   # require ensure_init).
   ( cd "$home" && AIRC_HOME="$home/state" AIRC_NAME="$name" AIRC_PORT="$port" \
       AIRC_NO_DISCOVERY=1 \
-      "$AIRC" connect --no-general --no-gist > "$home/out.log" 2>&1 & )
+      "$AIRC" connect --no-room --no-gist > "$home/out.log" 2>&1 & )
   local i
   for i in 1 2 3 4 5; do
     sleep 1
@@ -2217,6 +2224,140 @@ scenario_resume_prints_connected_banner() {
   cleanup_all
 }
 
+# ── Scenario: general_sidecar_default (issue #121) ─────────────────────
+# Default-on multi-room presence: bare `airc join` from a project repo
+# should subscribe the tab to BOTH the auto-scoped project room AND
+# #general. The sidecar runs in a sibling .general scope; its bash PID
+# is appended to the primary's airc.pid so cmd_teardown reaps both.
+#
+# Tests:
+#   1. Default behavior: primary spawns a #general sidecar.
+#   2. --no-general flag: project-only, no sidecar.
+#   3. cmd_teardown cleans BOTH primary scope + sidecar scope (.general).
+#
+# Test bypasses gh by using AIRC_NO_DISCOVERY=1 + --no-gist on both
+# primary and (transitively) sidecar — both fall into host mode in
+# their respective rooms with no gist publish. The point isn't wire
+# behavior; it's process spawn + scope creation + teardown reaping.
+scenario_general_sidecar_default() {
+  section "general_sidecar_default: bare join spawns #general sidecar (issue #121)"
+  cleanup_all
+
+  # ── Test 1: default-on sidecar ────────────────────────────────────────
+  # The harness exports AIRC_NO_GENERAL=1 globally to suppress sidecar
+  # in other tests; here we explicitly unset it for the scope of this
+  # scenario.
+  local home1=/tmp/airc-it-sc1/state
+  mkdir -p "$home1"
+  ( cd /tmp/airc-it-sc1 && unset AIRC_NO_GENERAL && \
+      AIRC_HOME="$home1" AIRC_NAME=alpha AIRC_PORT=7570 \
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --no-gist --room sidecar-test-$$ > "$home1/out.log" 2>&1 & )
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    sleep 1
+    grep -qE 'Sidecar:.*also subscribing' "$home1/out.log" 2>/dev/null && break
+  done
+
+  grep -qE 'Sidecar:.*also subscribing to #general' "$home1/out.log" \
+    && pass "primary printed sidecar-spawn banner" \
+    || fail "no sidecar-spawn banner (got: $(head -10 "$home1/out.log" | tr '\n' '|'))"
+
+  # Wait for sidecar scope to exist + be populated
+  for i in 1 2 3 4 5 6 7 8; do
+    sleep 1
+    [ -f "${home1}.general/airc.pid" ] && [ -f "${home1}.general/room_name" ] && break
+  done
+
+  [ -d "${home1}.general" ] \
+    && pass "sidecar scope dir created at \${home}.general" \
+    || fail "sidecar scope dir absent"
+
+  [ -f "${home1}.general/room_name" ] && [ "$(cat "${home1}.general/room_name")" = "general" ] \
+    && pass "sidecar scope has room_name=general" \
+    || fail "sidecar scope room_name wrong (got: $(cat "${home1}.general/room_name" 2>/dev/null))"
+
+  # Sidecar PID should be appended to primary's airc.pid
+  grep -qE '^[0-9]+$' "$home1/airc.pid" \
+    && pass "primary airc.pid has at least one entry" \
+    || fail "primary airc.pid empty or malformed"
+
+  # Sidecar bash should be alive
+  local _sc_pid; _sc_pid=$(tail -1 "$home1/airc.pid" 2>/dev/null)
+  if [ -n "$_sc_pid" ] && kill -0 "$_sc_pid" 2>/dev/null; then
+    pass "sidecar PID ${_sc_pid} (last entry in primary's airc.pid) is alive"
+  else
+    fail "sidecar PID not alive (pid=${_sc_pid:-<empty>})"
+  fi
+
+  # ── Test 2: cmd_teardown reaps both ──────────────────────────────────
+  AIRC_HOME="$home1" "$AIRC" teardown >/dev/null 2>&1
+  sleep 1
+
+  ! kill -0 "$_sc_pid" 2>/dev/null \
+    && pass "teardown killed sidecar bash (PID ${_sc_pid})" \
+    || fail "sidecar still alive after teardown"
+
+  [ ! -f "${home1}.general/airc.pid" ] \
+    && pass "teardown cleared sidecar pidfile" \
+    || fail "sidecar pidfile still present after teardown"
+
+  cleanup_all
+  rm -rf /tmp/airc-it-sc1
+
+  # ── Test 3: --no-general opts out ────────────────────────────────────
+  local home2=/tmp/airc-it-sc2/state
+  mkdir -p "$home2"
+  ( cd /tmp/airc-it-sc2 && unset AIRC_NO_GENERAL && \
+      AIRC_HOME="$home2" AIRC_NAME=beta AIRC_PORT=7571 \
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --no-gist --room solo-test-$$ --no-general > "$home2/out.log" 2>&1 & )
+  for i in 1 2 3 4 5 6; do
+    sleep 1
+    grep -q 'Hosting #' "$home2/out.log" 2>/dev/null && break
+  done
+
+  ! grep -qE 'Sidecar:' "$home2/out.log" \
+    && pass "--no-general: no sidecar-spawn banner" \
+    || fail "--no-general didn't suppress sidecar (banner present)"
+
+  [ ! -d "${home2}.general" ] \
+    && pass "--no-general: no sidecar scope created" \
+    || fail "--no-general: sidecar scope still created at .general"
+
+  AIRC_HOME="$home2" "$AIRC" teardown >/dev/null 2>&1
+  cleanup_all
+  rm -rf /tmp/airc-it-sc2
+
+  # ── Test 4: --room-only is equivalent to --room + --no-general ───────
+  local home3=/tmp/airc-it-sc3/state
+  mkdir -p "$home3"
+  ( cd /tmp/airc-it-sc3 && unset AIRC_NO_GENERAL && \
+      AIRC_HOME="$home3" AIRC_NAME=gamma AIRC_PORT=7572 \
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --no-gist --room-only ronly-test-$$ > "$home3/out.log" 2>&1 & )
+  for i in 1 2 3 4 5 6; do
+    sleep 1
+    grep -q 'Hosting #' "$home3/out.log" 2>/dev/null && break
+  done
+
+  grep -qE 'Hosting #ronly-test-' "$home3/out.log" \
+    && pass "--room-only NAME: hosts the named room" \
+    || fail "--room-only didn't host the named room (got: $(grep Hosting "$home3/out.log" | head -1))"
+
+  ! grep -qE 'Sidecar:' "$home3/out.log" \
+    && pass "--room-only NAME: no sidecar (focused mode)" \
+    || fail "--room-only still spawned sidecar"
+
+  [ ! -d "${home3}.general" ] \
+    && pass "--room-only: no .general scope dir" \
+    || fail "--room-only: sidecar scope still created"
+
+  AIRC_HOME="$home3" "$AIRC" teardown >/dev/null 2>&1
+  cleanup_all
+  rm -rf /tmp/airc-it-sc3
+}
+
 case "$MODE" in
   tabs)         scenario_tabs  ;;
   scope)        scenario_scope ;;
@@ -2243,8 +2384,9 @@ case "$MODE" in
   send_dead_monitor_dies) scenario_send_dead_monitor_dies ;;
   resume_404_gist_no_silent_exit) scenario_resume_404_gist_no_silent_exit ;;
   resume_prints_connected_banner) scenario_resume_prints_connected_banner ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_room_overrides_resume; scenario_stale_auth_room_selfheal; scenario_send_dead_monitor_dies; scenario_resume_404_gist_no_silent_exit; scenario_resume_prints_connected_banner ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|room_overrides_resume|stale_auth_room_selfheal|send_dead_monitor_dies|resume_404_gist_no_silent_exit|resume_prints_connected_banner|all]"; exit 2 ;;
+  general_sidecar_default) scenario_general_sidecar_default ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_resume_stale_auth; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_room_overrides_resume; scenario_stale_auth_room_selfheal; scenario_send_dead_monitor_dies; scenario_resume_404_gist_no_silent_exit; scenario_resume_prints_connected_banner; scenario_general_sidecar_default ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|resume_stale_auth|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|room_overrides_resume|stale_auth_room_selfheal|send_dead_monitor_dies|resume_404_gist_no_silent_exit|resume_prints_connected_banner|general_sidecar_default|all]"; exit 2 ;;
 esac
 
 echo
