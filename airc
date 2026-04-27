@@ -771,6 +771,150 @@ sign_message() {
   rm -f "$tmpfile"
 }
 
+# ── Platform adapters ───────────────────────────────────────────────────
+#
+# Single-purpose helpers that hide platform-specific differences in the
+# process / port / filesystem APIs. Every callsite that needs "find
+# children of PID X" or "find PIDs listening on port Y" goes through
+# these helpers, NOT inline pgrep/lsof. That way:
+#
+#   1. The platform-specific implementation lives in ONE place per
+#      capability — adding a Windows fallback for `lsof` (e.g. via
+#      `netstat -ano`) means editing one helper, not 4+ callsites.
+#   2. The business logic above the adapter line stays platform-
+#      agnostic. Refactor risk drops.
+#   3. We hold the line on Joel's "fixing one platform shouldn't
+#      degrade another" rule (2026-04-26): without adapters, a Mac
+#      AI's tweak to a pgrep callsite easily diverges from the Linux
+#      AI's tweak. With adapters, both AIs touch the same helper.
+#
+# Each adapter takes simple inputs and emits a one-thing-per-line
+# stream, suitable for `while IFS= read -r` consumption. Callers can
+# `tr '\n' ' '` if they want space-separated, but the canonical
+# representation is newline-delimited (POSIX-friendly).
+#
+# Conventions:
+#   - `proc_*` — process / PID introspection
+#   - `port_*` — TCP port introspection
+#   - `file_*` — filesystem metadata
+#   - `detect_*` — environment classification
+
+# Return PIDs of direct children of $1, one per line.
+# Implementations: pgrep -P (POSIX/macOS/Linux), ps fallback for
+# environments without pgrep (Git Bash for Windows ships only msys
+# coreutils — no pgrep by default; the fallback uses `ps -axo pid,ppid`
+# which msys2 ps DOES support). Empty output if no children or pid is
+# already gone.
+proc_children() {
+  local pid="$1"
+  [ -z "$pid" ] && return 0
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -P "$pid" 2>/dev/null
+  else
+    # POSIX-portable fallback. Works on Git Bash (msys ps), Linux ps,
+    # macOS ps. Awk filters by ppid column.
+    ps -axo pid,ppid 2>/dev/null | awk -v p="$pid" '$2 == p { print $1 }'
+  fi
+}
+
+# Return parent PID of $1. Empty if $1 is gone.
+proc_parent() {
+  local pid="$1"
+  [ -z "$pid" ] && return 0
+  ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' '
+}
+
+# Return the command line of $1 (full argv, space-joined). Empty if gone.
+proc_cmdline() {
+  local pid="$1"
+  [ -z "$pid" ] && return 0
+  ps -p "$pid" -o command= 2>/dev/null
+}
+
+# Find airc-related PIDs owned by the current user matching a pattern.
+# Used by `airc teardown --all` to nuke every airc process.
+# Pattern is a regex passed to pgrep -f or to awk's =~.
+proc_airc_pids_matching() {
+  local pattern="$1"
+  [ -z "$pattern" ] && return 0
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -u "$(id -u)" -f "$pattern" 2>/dev/null
+  else
+    # Fallback: ps + awk. Less precise than pgrep -f (no anchored regex)
+    # but covers the same shape. Filter by user since msys ps -u option
+    # may not match POSIX semantics.
+    local me; me=$(whoami 2>/dev/null)
+    ps -axo pid,user,command 2>/dev/null \
+      | awk -v u="$me" -v p="$pattern" 'NR>1 && $2 == u && $0 ~ p { print $1 }'
+  fi
+}
+
+# Return PIDs listening on TCP port $1 (LISTEN state), one per line.
+# Implementations:
+#   1. lsof -tiTCP:<port> -sTCP:LISTEN — macOS, most BSDs, modern Linux
+#      with lsof installed.
+#   2. ss -tlnp — modern Linux distros (iproute2 default since ~2017),
+#      replaces deprecated netstat. Output post-processing extracts pid.
+#   3. netstat -ano — Windows native (cmd / PowerShell), and also a
+#      fallback on minimal Linux containers without lsof or ss. Output
+#      shape differs per platform; awk parses the LISTENING column.
+# Empty output = nobody listening.
+port_listeners() {
+  local port="$1"
+  [ -z "$port" ] && return 0
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null
+  elif command -v ss >/dev/null 2>&1; then
+    # ss output: 'LISTEN 0 ... users:(("python",pid=12345,fd=4))'
+    # Awk extracts pid= number.
+    ss -tlnp "( sport = :$port )" 2>/dev/null \
+      | awk 'NR>1 { match($0, /pid=[0-9]+/); if (RSTART) print substr($0, RSTART+4, RLENGTH-4) }'
+  elif command -v netstat >/dev/null 2>&1; then
+    # netstat -ano output (Windows + some Linux):
+    #   TCP 0.0.0.0:7547 0.0.0.0:0 LISTENING 12345
+    # Trailing column is PID. Match $port at end of local-address column.
+    netstat -ano 2>/dev/null \
+      | awk -v p=":$port" '$2 ~ p"$" && /LISTEN/ { print $NF }'
+  fi
+}
+
+# Return file size in bytes. Empty / 0 on failure.
+# stat is not POSIX (different flags on BSD vs GNU); chain both with
+# fallback to wc -c which IS POSIX.
+file_size() {
+  local path="$1"
+  [ -f "$path" ] || { echo 0; return 0; }
+  stat -f%z "$path" 2>/dev/null \
+    || stat -c%s "$path" 2>/dev/null \
+    || wc -c < "$path" 2>/dev/null \
+    || echo 0
+}
+
+# Detect platform: emits one of macos, linux, wsl, windows-bash (Git Bash
+# on Windows native), unknown. Most callers don't need this — they
+# should use the proc_/port_/file_ adapters, which handle platform
+# differences internally. detect_platform is for the rare case where
+# a top-level decision genuinely depends on platform (e.g. Tailscale.app
+# launching on macOS).
+detect_platform() {
+  local s; s=$(uname -s 2>/dev/null)
+  case "$s" in
+    Darwin)               echo macos ;;
+    Linux)
+      # Detect WSL via /proc/version content (kernel string contains
+      # 'microsoft' or 'WSL'). Bare Linux otherwise.
+      if grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
+        echo wsl
+      else
+        echo linux
+      fi ;;
+    MINGW*|MSYS*|CYGWIN*) echo windows-bash ;;
+    *)                    echo unknown ;;
+  esac
+}
+
+# ── End platform adapters ───────────────────────────────────────────────
+
 relay_ssh() {
   local ssh_key="$IDENTITY_DIR/ssh_key"
   # ConnectTimeout 10 so unreachable hosts fail fast instead of hanging ~60s
@@ -1562,12 +1706,25 @@ cmd_connect() {
   # converging on the project room) was the more painful failure mode.
   if [ "$use_room" = "1" ] && [ "$room_explicit" = "0" ] \
      && [ "${AIRC_NO_AUTO_ROOM:-0}" != "1" ]; then
-    local _inferred
-    _inferred=$(infer_default_room 2>/dev/null || true)
-    if [ -n "$_inferred" ]; then
-      room_name="${_inferred%|*}"
-      local _source="${_inferred#*|}"
-      echo "  Auto-scoped: #${room_name} (from git ${_source}; override with --room or AIRC_NO_AUTO_ROOM=1)"
+    # Saved room_name (#130): the one piece of cross-restart state worth
+    # trusting. If a prior connect landed us in #foo, the next bare
+    # `airc connect` should target #foo too — not the auto-scope or the
+    # "general" fallback. This replaces the resume code's room-tracking
+    # with a single read of the saved file. Cached host_target is still
+    # NOT trusted (discovery re-derives that from the gist).
+    local _saved_room=""
+    [ -f "$AIRC_WRITE_DIR/room_name" ] && _saved_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
+    if [ -n "$_saved_room" ]; then
+      room_name="$_saved_room"
+      echo "  Resuming saved room: #${room_name} (override with --room or 'airc part' first)"
+    else
+      local _inferred
+      _inferred=$(infer_default_room 2>/dev/null || true)
+      if [ -n "$_inferred" ]; then
+        room_name="${_inferred%|*}"
+        local _source="${_inferred#*|}"
+        echo "  Auto-scoped: #${room_name} (from git ${_source}; override with --room or AIRC_NO_AUTO_ROOM=1)"
+      fi
     fi
   fi
 
@@ -1658,7 +1815,7 @@ cmd_connect() {
       # that would abort this block *before* reaching the rm on line 442 that
       # self-heals the stale pidfile. Result: joiner wedged forever after a
       # parent crash / laptop sleep until someone manually rm'd the pidfile.
-      all_stale="$all_stale $(pgrep -P "$p" 2>/dev/null | tr '\n' ' ' || true)"
+      all_stale="$all_stale $(proc_children "$p" | tr '\n' ' ' || true)"
     done
     # Quiet kill — don't warn unless there was actually a live process.
     if [ -n "$all_stale" ]; then
@@ -1672,271 +1829,30 @@ cmd_connect() {
     rm -f "$stale_pidfile"
   fi
 
-  # Resume case: no join-string arg and we already have state for this scope.
-  # If config records host_target, we were a joiner — just restart the monitor
-  # against the saved host (identity + authorized_keys + peer records persist
-  # on disk, so no fresh handshake needed). Makes `airc connect` after a
-  # Claude Code restart trivially resume the conversation.
-  if [ -z "$target" ] && [ -f "$CONFIG" ]; then
-    local prior_host_target; prior_host_target=$(get_config_val host_target "")
-    if [ -n "$prior_host_target" ]; then
-      # Explicit --room with a different saved room must not silently resume
-      # the saved pairing. Symptom (pre-fix): user runs `airc join --room foo`
-      # after having paired into #bar; resume blindly reconnects to #bar's
-      # host and the --room flag is ignored without a peep. The user has to
-      # `airc teardown --flush` before the explicit flag takes effect, which
-      # is a hidden footgun.
-      #
-      # Fix: when --room is explicit AND a saved room_name file says we were
-      # in a different room, skip resume and fall through to discovery for
-      # the requested room. Identity persists, no flush needed.
-      if [ "$room_explicit" = "1" ]; then
-        local _saved_room_check=""
-        [ -f "$AIRC_WRITE_DIR/room_name" ] && _saved_room_check=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
-        if [ -n "$_saved_room_check" ] && [ "$_saved_room_check" != "$room_name" ]; then
-          echo "  Saved pairing was for #${_saved_room_check}; --room #${room_name} requested → discarding stale pairing."
-          rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_name" "$AIRC_WRITE_DIR/room_gist_id"
-          # Skip the resume block entirely and let discovery run below.
-          prior_host_target=""
-        fi
-      fi
-    fi
-    if [ -n "$prior_host_target" ]; then
-      local prior_name; prior_name=$(get_config_val host_name "$(get_config_val name unknown)")
-      echo "  Resuming as joiner of '$prior_name' ($prior_host_target)..."
-
-      # Tailscale-down pre-flight: when the saved host is a Tailscale
-      # CGNAT address and the local daemon isn't running, the SSH probe
-      # below would block on ConnectTimeout, the monitor retry loop would
-      # keep retrying forever, and every subsequent `airc msg` would queue
-      # with a cryptic "connection timed out." Surface the real cause
-      # with a platform-appropriate start command so the user can fix it
-      # and re-run. No install, no sudo, no prompt — just instruct + exit.
-      if ! advise_tailscale_if_down "$prior_host_target"; then
-        die "Re-run airc join after starting Tailscale."
-      fi
-
-      # Stale-pairing detect (#83): if we resolved into the room via a
-      # gist (joiner-side gist_id was cached at pair time) and that gist
-      # is now gone or replaced, the room dissolved or got rehosted —
-      # the cached host_target is stale even if TCP would still answer.
-      # Catch this BEFORE SSH probe so we self-heal cleanly instead of
-      # silently re-pairing against a dead-but-reachable host or
-      # accidentally landing in a different room.
-      #
-      # Two safety guards (Copilot caught both on PR #92 review):
-      # (a) Confirm gh is healthy first. Auth issues, missing scope,
-      #     rate limits, transient network all return non-zero from
-      #     `gh api gists/<id>` — treating those as "gist deleted"
-      #     would spuriously wipe joiner state on every flaky network
-      #     blip. Only act when we got an authoritative 404.
-      # (b) Capture the preserved name BEFORE deleting CONFIG; otherwise
-      #     get_name reads the now-deleted file and falls back to
-      #     "unknown", changing peer identity on re-exec.
-      local _saved_gist_id=""
-      [ -f "$AIRC_WRITE_DIR/room_gist_id" ] && _saved_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null)
-      local _saved_room_resume=""
-      [ -f "$AIRC_WRITE_DIR/room_name" ] && _saved_room_resume=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
-      if [ -n "$_saved_gist_id" ] && command -v gh >/dev/null 2>&1; then
-        # Two-step gh-health gate. Both required before treating any 404
-        # as authoritative gist-deletion (else a scope-less token's auth
-        # error gets mis-classified):
-        #   (a) gh auth status passes (token is valid)
-        #   (b) gh has gist scope (matching the doctor --connect chain)
-        # Without (b), gist API calls return 401/403/404 depending on
-        # token state — could spuriously trigger teardown.
-        local _gh_healthy=0
-        if gh auth status >/dev/null 2>&1 \
-           && gh auth status 2>&1 | grep -qiE '(scopes|token scopes):.*\bgist\b'; then
-          _gh_healthy=1
-        fi
-        if [ "$_gh_healthy" = "1" ]; then
-          # Capture stderr for 404-vs-other classification. stdout is
-          # redirected to /dev/null so gh's normal output doesn't pollute
-          # our terminal regardless of outcome.
-          #
-          # CRITICAL: pre-declare _gist_probe_rc and use `|| _gist_probe_rc=$?`
-          # so `set -euo pipefail` does NOT abort the script when gh api
-          # returns non-zero. A 404 is the EXPECTED signal that the host
-          # teardown'd and deleted the gist — the whole reason this block
-          # exists. Without the `|| ...` guard, set -e fires on the very
-          # signal we're trying to detect, exiting silently before the
-          # classification logic below can run. Spent a session of "vhsm
-          # tab silently exits 1 on resume after host re-host" on
-          # 2026-04-26 chasing this. (Issue #118.)
-          local _gist_probe_err; _gist_probe_err=$(mktemp -t airc-gist-probe.XXXXXX)
-          local _gist_probe_rc=0
-          gh api "gists/$_saved_gist_id" >/dev/null 2>"$_gist_probe_err" || _gist_probe_rc=$?
-          local _gist_probe_stderr; _gist_probe_stderr=$(cat "$_gist_probe_err" 2>/dev/null)
-          rm -f "$_gist_probe_err"
-          # 404 (gist gone) shows as "Not Found" or "404" in gh's stderr.
-          # Other failures (rate limit "API rate limit", auth "401",
-          # network "could not resolve") are explicitly NOT treated as
-          # gist-deleted.
-          if [ "$_gist_probe_rc" -ne 0 ] && echo "$_gist_probe_stderr" | grep -qiE '404|not found'; then
-            local _preserved_name; _preserved_name=$(get_name 2>/dev/null || echo "")
-            echo ""
-            echo "  ⚠  Saved room gist ($_saved_gist_id) no longer on your gh — room dissolved or rehosted."
-            if [ -n "$_saved_room_resume" ]; then
-              echo "  Re-discovering #${_saved_room_resume} via fresh gist lookup..."
-            else
-              echo "  Re-pairing via fresh discovery..."
-            fi
-            # Wipe stale joiner state. Identity + peer records persist.
-            rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_gist_id"
-            if [ -n "$_saved_room_resume" ]; then
-              exec env ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect --room "$_saved_room_resume"
-            else
-              exec env ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect
-            fi
-          fi
-        fi
-      fi
-
-      # Auth probe BEFORE committing to the monitor loop. Prior behavior
-      # went straight into tail-over-SSH; if auth was broken (stale keys
-      # after reinstall, authorized_keys rotation on host), ssh exited 255
-      # silently, the while loop retried forever, and the user's mesh was
-      # dead without any visible error. This was the "default broken" path:
-      # `airc teardown` + `airc connect` (no args = resume) is what every
-      # user does, and it silently bricked on stale auth.
-      local probe_key="$IDENTITY_DIR/ssh_key"
-      local probe_err; probe_err=$(mktemp -t airc-resume-probe.XXXXXX)
-      local probe_out
-      probe_out=$(ssh -i "$probe_key" -o StrictHostKeyChecking=accept-new \
-                      -o ConnectTimeout=5 -o BatchMode=yes \
-                      "$prior_host_target" "echo __AUTH_OK__" 2>"$probe_err" || true)
-      if ! echo "$probe_out" | grep -q '^__AUTH_OK__$'; then
-        local probe_stderr; probe_stderr=$(cat "$probe_err" 2>/dev/null | tr '\n' ' ' | cut -c1-300)
-        rm -f "$probe_err"
-        # Auth failure → re-pair needed. Network failure → fall through,
-        # monitor's retry loop handles transient outages correctly.
-        if echo "$probe_stderr" | grep -qiE 'permission denied|publickey|host key verification|authentication fail|identification has changed|no supported authentication'; then
-          # Stale auth = saved pairing is dead from our side (host wiped
-          # our key, host machine reinstalled, or host_keys rotated). For
-          # room-mode pairings this is the same end-state as the host
-          # going unreachable: the saved pair is junk. If we have a
-          # saved room_name AND gh is available, fall through to fresh
-          # discovery — the room may have been re-hosted by another
-          # peer, or we'll become the new host. Identity persists, so
-          # re-pair is automatic.
-          #
-          # Without this self-heal the user had to manually run
-          # `airc teardown --flush` and paste an invite — exactly the
-          # toil airc's auto-discovery is supposed to eliminate. Hit
-          # twice in one session on 2026-04-26 (vhsm-2c84 dead host +
-          # regenerated key), which is what motivated this change.
-          local _saved_auth_room=""
-          [ -f "$AIRC_WRITE_DIR/room_name" ] && _saved_auth_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
-          if [ -n "$_saved_auth_room" ] && command -v gh >/dev/null 2>&1; then
-            echo ""
-            echo "  ⚠  SSH auth to host FAILED on resume — saved pairing for #${_saved_auth_room} is stale." >&2
-            echo "     (saved pair: ${prior_name} @ ${prior_host_target} — host rotated keys or reinstalled)" >&2
-            echo "  Self-healing: discarding stale pairing and re-discovering #${_saved_auth_room}..."
-            local _preserved_name_a; _preserved_name_a=$(get_config_val name "")
-            # Wipe joiner state but leave identity (ssh_key) and peer
-            # records intact — they'll be re-validated by the fresh
-            # handshake. room_name is wiped here and re-set after
-            # discovery succeeds, just like the non-auth self-heal does.
-            rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_name" "$AIRC_WRITE_DIR/room_gist_id"
-            echo ""
-            exec env ${_preserved_name_a:+AIRC_NAME="$_preserved_name_a"} "$0" connect --room "$_saved_auth_room"
-          fi
-          # No saved room (legacy 1:1 invite scope) OR no gh: keep the
-          # explicit-die behavior. There's nothing to fall through to —
-          # discovery requires gh, and a 1:1 invite has no room to
-          # rejoin. The user genuinely needs to re-pair via the invite
-          # string.
-          echo "  SSH auth to host FAILED on resume. Saved pairing is stale." >&2
-          echo "  SSH stderr: ${probe_stderr}" >&2
-          echo "  Fix: airc teardown --flush && airc connect <invite-string>" >&2
-          # Reconstruct the invite string from saved config as a convenience.
-          local host_ssh_pub; host_ssh_pub=$(get_config_val host_ssh_pub "")
-          local host_port; host_port=$(get_config_val host_port 7547)
-          if [ -n "$host_ssh_pub" ] && [ -n "$prior_name" ]; then
-            local pub_b64; pub_b64=$(printf '%s\n' "$host_ssh_pub" | base64 | tr -d '\n')
-            local suffix=""; [ "$host_port" != "7547" ] && suffix=":$host_port"
-            echo "  Your saved invite string (for the above command):" >&2
-            echo "    ${prior_name}@${prior_host_target}${suffix}#${pub_b64}" >&2
-          fi
-          die "Resume aborted — re-pair required"
-        else
-          # Non-auth probe failure = TCP unreachable / timeout / network blip.
-          # If we have a saved room_name (i.e. we were in a #general-style
-          # persistent channel), this is likely the prior host going away.
-          # Per Joel's "no claude left behind" rule, take over as new host.
-          # First-agent-back wins; the prior host (if it returns) will
-          # discover OUR fresh gist on next reconnect and join as a peer.
-          local saved_room=""
-          [ -f "$AIRC_WRITE_DIR/room_name" ] && saved_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
-          if [ -n "$saved_room" ] && command -v gh >/dev/null 2>&1; then
-            echo ""
-            echo "  ⚠  Host of #${saved_room} unreachable on resume — self-healing as new host..."
-            echo "     (saved pair: ${prior_name} @ ${prior_host_target} — likely went away)"
-            # Best-effort: delete any stale `airc room: <name>` gists on our
-            # gh account. We don't know the gist id from saved state (the
-            # joiner doesn't track that), so we sweep by description match.
-            # If the gist isn't on our gh (the host was a peer on a different
-            # account), gh-list returns nothing and we silently skip.
-            local stale_ids; stale_ids=$(gh gist list --limit 50 2>/dev/null \
-              | awk -F'\t' -v re="airc room: ${saved_room}\$" '$2 ~ re { print $1 }')
-            if [ -n "$stale_ids" ]; then
-              while IFS= read -r _gid; do
-                [ -z "$_gid" ] && continue
-                gh gist delete "$_gid" --yes 2>/dev/null \
-                  && echo "  ✓ Removed stale gist $_gid" \
-                  || echo "  ⚠  Couldn't delete gist $_gid (already gone? not on this account?)"
-              done <<< "$stale_ids"
-            else
-              echo "  (no #${saved_room} gist on this gh — host was likely cross-account or already cleaned)"
-            fi
-            # Preserve identity name across re-exec — without this the
-            # name re-derives from cwd and can drift if the path resolves
-            # with different case (macOS HFS+/APFS case-insensitive but
-            # case-preserving), causing peers to see us as a "new" peer.
-            local _preserved_name; _preserved_name=$(get_config_val name "")
-            # Wipe joiner state so re-exec falls into host mode cleanly.
-            rm -f "$CONFIG"
-            rm -f "$AIRC_WRITE_DIR/room_name"
-            echo "  Re-execing into host mode for #${saved_room}..."
-            echo ""
-            exec env AIRC_NO_DISCOVERY=1 ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect --room "$saved_room"
-          fi
-          # No saved room (legacy 1:1 invite scope) OR no gh: fall through to
-          # the existing retry-in-monitor behavior. Monitor's retry loop
-          # handles transient outages correctly for the legacy case.
-          echo "  Host probe failed (non-auth). Monitor will retry in background." >&2
-          echo "  SSH stderr: ${probe_stderr:-<none>}" >&2
-        fi
-      else
-        rm -f "$probe_err"
-        # Resume probe succeeded — confirm visibly that we're paired and
-        # entering the monitor loop. Without this the user sees only
-        # "Resuming as joiner of..." and then silence, which (per the
-        # "never swallow errors" rule) has the same evidence-eating
-        # shape as silent failure — they can't tell whether SSH worked
-        # or the script wedged. Fresh-pair prints "Connected to ..."
-        # at line ~2469; resume must too. Caught 2026-04-26 by
-        # vhsm-Claude observing through the substrate.
-        local _resume_room=""
-        [ -f "$AIRC_WRITE_DIR/room_name" ] && _resume_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
-        if [ -n "$_resume_room" ]; then
-          echo "  Resumed as joiner of '$prior_name' in #${_resume_room} (SSH verified)"
-        else
-          echo "  Resumed as joiner of '$prior_name' (SSH verified)"
-        fi
-      fi
-
-      echo $$ > "$AIRC_WRITE_DIR/airc.pid"
-      trap '
-        rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null
-        for p in $(pgrep -P $$ 2>/dev/null); do kill $p 2>/dev/null; done
-      ' EXIT INT TERM
-      spawn_general_sidecar_if_wanted
-      monitor
-      return
-    fi
-  fi
+  # No resume code path. (#130, 2026-04-26.)
+  #
+  # The gist is the source of truth for who's hosting which room and at
+  # what address. Local state we trust across restarts is identity (ssh
+  # key, signing key, name, identity blob) and peer records. We do NOT
+  # trust cached host_target / host_port / host_ssh_pub — those describe
+  # external substrate that can change behind us (host crashed, port
+  # auto-bumped, gist regenerated, ssh key rotated, machine restarted).
+  #
+  # Every `airc connect` runs discovery. Cost: one `gh gist list`
+  # (~200ms). Benefit: every "saved pairing diverged from gist" failure
+  # mode is structurally impossible — there's no saved pairing to
+  # diverge. Discovery + JOIN MODE below already handle stale-heartbeat
+  # takeover, TCP-unreachable self-heal, race-loser detection, multi-
+  # address pick, Tailscale-down advisory, and host_target overwrite on
+  # successful pair. Removing the parallel resume implementation deletes
+  # ~250 lines and an entire bug class:
+  #   - "(SSH verified)" printed against an unreachable cached host
+  #   - silent-success on stale pair after machine restart
+  #   - --room flag silently ignored if it differed from saved pairing
+  #   - 404 self-heal gated on a separate code path with its own bugs
+  # Cached CONFIG fields like host_target are still WRITTEN by JOIN MODE
+  # for monitor() to read at runtime ("am I joiner or host?"), but never
+  # READ at connect-time to skip discovery.
 
   # ── Zero-arg discovery: rooms first, then legacy invites (#38, #39)
   # If we got here with no target AND no saved config, the user just ran
@@ -1953,22 +1869,13 @@ cmd_connect() {
   # AIRC_NO_DISCOVERY=1 (explicit opt-out). With `--no-general` the room
   # path is skipped and we go straight to single-pair invite host mode.
   #
-  # IMPORTANT: discovery used to be gated on `[ ! -f CONFIG ]` to avoid
-  # running on resume. But that broke daemon installs into stale-state
-  # scopes: a CONFIG with identity-only data (no host_target — i.e. a
-  # prior host's leftover) skipped the resume path AND discovery, so the
-  # daemon fell through to host mode and created a DUPLICATE #general
-  # gist alongside the existing one.
-  #
-  # The right gate is "no host_target": if the prior CONFIG was a host
-  # (no host_target), we should still attempt discovery on the next
-  # connect — maybe someone else became the new host since we last ran,
-  # or our prior #general gist is still authoritative and we should join
-  # ourselves into it as a peer (the existing-room flow handles that).
+  # Discovery gate: run only when the user didn't pass an explicit target
+  # and gh is available. We deliberately do NOT short-circuit when CONFIG
+  # has a saved host_target — that's exactly the cached-pairing path the
+  # resume-deletion (#130) is killing. Always discover, always consult
+  # the gist; the gist is the truth.
   local _did_room_discovery=0
-  local _saved_host_target=""
-  [ -f "$CONFIG" ] && _saved_host_target=$(get_config_val host_target "")
-  if [ -z "$target" ] && [ -z "$_saved_host_target" ] && \
+  if [ -z "$target" ] && \
      [ "${AIRC_NO_DISCOVERY:-0}" != "1" ] && \
      command -v gh >/dev/null 2>&1; then
 
@@ -2606,7 +2513,7 @@ json.dump(c, open('$CONFIG', 'w'), indent=2)
     # remote doesn't see an orphaned session and the port doesn't linger.
     trap '
       rm -f "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null
-      for p in $(pgrep -P $$ 2>/dev/null); do kill $p 2>/dev/null; done
+      for p in $(proc_children $$); do kill $p 2>/dev/null; done
     ' EXIT INT TERM
 
     spawn_general_sidecar_if_wanted
@@ -2647,7 +2554,7 @@ json.dump(c, open(os.environ["CONFIG"], "w"), indent=2)
     local host_port="${AIRC_PORT:-7547}"
     local original_port="$host_port"
     local tried=0
-    while lsof -iTCP:"$host_port" -sTCP:LISTEN >/dev/null 2>&1; do
+    while [ -n "$(port_listeners "$host_port")" ]; do
       host_port=$((host_port + 1))
       tried=$((tried + 1))
       if [ "$tried" -ge 20 ]; then
@@ -3103,7 +3010,7 @@ except Exception:
         gh gist delete "$_exit_gist_id" --yes >/dev/null 2>&1
       fi
       rm -f "$AIRC_WRITE_DIR/airc.pid" "$AIRC_WRITE_DIR/heartbeat.pid" "$AIRC_WRITE_DIR/host_gist_id" 2>/dev/null
-      for p in $PAIR_PID $(pgrep -P $PAIR_PID 2>/dev/null) $(pgrep -P $$ 2>/dev/null); do
+      for p in $PAIR_PID $(proc_children $PAIR_PID) $(proc_children $$); do
         kill $p 2>/dev/null
       done
     ' EXIT INT TERM
@@ -4121,7 +4028,7 @@ cmd_send_file() {
     die "Failed to transfer $filename: $scp_out"
   fi
 
-  local filesize; filesize=$(stat -f%z "$filepath" 2>/dev/null || stat -c%s "$filepath" 2>/dev/null || echo "0")
+  local filesize; filesize=$(file_size "$filepath")
   cmd_send "$peer_name" "Sent file: $filename ($filesize bytes)"
   echo "Sent $filename ($filesize bytes)"
 }
@@ -4315,7 +4222,7 @@ cmd_teardown() {
     # Bash airc-connect processes (any path that ends in /airc connect or
     # the /tmp/airc-prefix bootstrap variant the curl|bash installer uses).
     local bash_pids
-    bash_pids=$(pgrep -u "$(id -u)" -f '(airc|airc-prefix)[[:space:]]+connect' 2>/dev/null || true)
+    bash_pids=$(proc_airc_pids_matching '(airc|airc-prefix)[[:space:]]+connect' || true)
     if [ -n "$bash_pids" ]; then
       echo "  --all: killing airc bash processes: $(echo $bash_pids | tr '\n' ' ')"
       kill -9 $bash_pids 2>/dev/null || true
@@ -4326,10 +4233,10 @@ cmd_teardown() {
     local port
     for port in 7547 7548 7549 7550 7551 7552 7553 7554 7555 7556 7557 7558 7559; do
       local lpids
-      lpids=$(lsof -tiTCP:$port -sTCP:LISTEN 2>/dev/null || true)
+      lpids=$(port_listeners "$port" || true)
       for lpid in $lpids; do
         local cmd
-        cmd=$(ps -p "$lpid" -o command= 2>/dev/null || true)
+        cmd=$(proc_cmdline "$lpid" || true)
         if echo "$cmd" | grep -q "socket.SOCK_STREAM\|socket.AF_INET"; then
           echo "  --all: freeing port $port (python pid $lpid)"
           kill -9 "$lpid" 2>/dev/null || true
@@ -4340,7 +4247,7 @@ cmd_teardown() {
     # Stale tail/ssh subprocesses that look like airc message tails
     # (ssh ... tail -F .../.airc/messages.jsonl).
     local tail_pids
-    tail_pids=$(pgrep -u "$(id -u)" -f '\.airc/messages\.jsonl' 2>/dev/null || true)
+    tail_pids=$(proc_airc_pids_matching '\.airc/messages\.jsonl' || true)
     if [ -n "$tail_pids" ]; then
       echo "  --all: killing stale airc message tails: $(echo $tail_pids | tr '\n' ' ')"
       kill -9 $tail_pids 2>/dev/null || true
@@ -4402,7 +4309,7 @@ cmd_teardown() {
       if [ -n "$_sc_pids" ]; then
         local _all_sc="$_sc_pids"
         for _p in $_sc_pids; do
-          local _kids; _kids=$(pgrep -P "$_p" 2>/dev/null | tr '\n' ' ' || true)
+          local _kids; _kids=$(proc_children "$_p" | tr '\n' ' ' || true)
           [ -n "$_kids" ] && _all_sc="$_all_sc $_kids"
         done
         _all_sc=$(echo "$_all_sc" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
@@ -4433,7 +4340,7 @@ cmd_teardown() {
       local all_pids="$main_pids"
       for pid in $main_pids; do
         local kids
-        kids=$(pgrep -P "$pid" 2>/dev/null | tr '\n' ' ' || true)
+        kids=$(proc_children "$pid" | tr '\n' ' ' || true)
         [ -n "$kids" ] && all_pids="$all_pids $kids"
       done
       all_pids=$(echo "$all_pids" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
@@ -4449,7 +4356,7 @@ cmd_teardown() {
           local _sc_pids; _sc_pids=$(cat "$_sc_pidfile" 2>/dev/null | tr '\n' ' ')
           for _scp in $_sc_pids; do
             _exclude_pids="$_exclude_pids $_scp"
-            local _scp_kids; _scp_kids=$(pgrep -P "$_scp" 2>/dev/null | tr '\n' ' ' || true)
+            local _scp_kids; _scp_kids=$(proc_children "$_scp" | tr '\n' ' ' || true)
             [ -n "$_scp_kids" ] && _exclude_pids="$_exclude_pids $_scp_kids"
           done
         fi
@@ -4484,14 +4391,14 @@ cmd_teardown() {
   [ "$ports" != "7547" ] && ports="$ports 7547"
   for port in $ports; do
     local lpids
-    lpids=$(lsof -tiTCP:$port -sTCP:LISTEN 2>/dev/null || true)
+    lpids=$(port_listeners "$port" || true)
     for lpid in $lpids; do
       # `|| true` on both — $lpid came from lsof a moment ago; if the process
       # exited in the interim, `ps -p` returns 1 and pipefail/errexit would
       # abort the port-reap loop mid-scan, leaving later ports unchecked.
       # Empty parent/cmd → the `if` below falls through, which is correct.
-      local parent; parent=$(ps -p "$lpid" -o ppid= 2>/dev/null | tr -d ' ' || true)
-      local cmd; cmd=$(ps -p "$lpid" -o command= 2>/dev/null || true)
+      local parent; parent=$(proc_parent "$lpid" || true)
+      local cmd; cmd=$(proc_cmdline "$lpid" || true)
       # Reap if orphaned AND is a python socket listener.
       if [ "$parent" = "1" ] && echo "$cmd" | grep -q "socket.SOCK_STREAM"; then
         echo "  freeing orphaned port $port (pid $lpid)"
@@ -5338,12 +5245,10 @@ _doctor_connect_preflight() {
 
   # ── Connect-specific: AIRC_PORT free or auto-shift available ──
   local target_port="${AIRC_PORT:-7547}"
-  if command -v lsof >/dev/null 2>&1; then
-    if lsof -iTCP:"$target_port" -sTCP:LISTEN >/dev/null 2>&1; then
-      printf "  [info] port %s busy -- airc will auto-shift to next free port\n" "$target_port"
-    else
-      printf "  [ok] port %s available for hosting\n" "$target_port"
-    fi
+  if [ -n "$(port_listeners "$target_port")" ]; then
+    printf "  [info] port %s busy -- airc will auto-shift to next free port\n" "$target_port"
+  else
+    printf "  [ok] port %s available for hosting\n" "$target_port"
   fi
 
   # ── Connect-specific: cached host_target reachable (resume scenario) ──
