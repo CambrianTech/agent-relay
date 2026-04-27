@@ -14,16 +14,35 @@ set -euo pipefail
 # downstream goes through this wrapper. Hard fail if neither is present
 # (we genuinely need Python — the inline heredocs for monitor formatting
 # and pair handshake are not yet ported to pure shell).
-if ! command -v python3 >/dev/null 2>&1; then
-  if command -v python >/dev/null 2>&1; then
+#
+# DETECTION: invoke `python3 --version` rather than `command -v python3`.
+# Modern Windows ships a Microsoft Store ALIAS at
+# %LOCALAPPDATA%\Microsoft\WindowsApps\python3.exe that satisfies
+# `command -v` (the file exists, is on PATH) but is just a "click here
+# to install Python from the Store" stub. Invoking it exits 49 with a
+# Store-redirect message on stderr and produces no real interpreter.
+# Continuum-b69f caught this on 2026-04-27 — every later `python3 -c "..."`
+# in the script silently failed because the shim never installed; the
+# pair-handshake's captured stderr then got discarded by the generic
+# "Can't reach $host" die() (fix below). Strict --version probe makes
+# the Store stub fail-fast, falling through to `python` (real install)
+# or the install-instructions die.
+if ! python3 --version >/dev/null 2>&1; then
+  if command -v python >/dev/null 2>&1 && python --version >/dev/null 2>&1; then
     # Define a wrapper function that callers see as `python3`.
     python3() { command python "$@"; }
     export -f python3 2>/dev/null || true
   else
-    echo "ERROR: airc requires python3 (or python on Windows/Git Bash)." >&2
+    echo "ERROR: airc requires a working python3 (or python on Windows/Git Bash)." >&2
     echo "  macOS:    brew install python3" >&2
     echo "  Linux:    apt install python3 / dnf install python3" >&2
-    echo "  Windows:  install from python.org or Microsoft Store" >&2
+    echo "  Windows:  install from https://www.python.org/downloads/" >&2
+    echo "" >&2
+    echo "  Note for Windows: a 'python3.exe' Store-installer alias on PATH" >&2
+    echo "  is NOT a real Python — disable it under" >&2
+    echo "  Settings → Apps → Advanced app settings → App execution aliases" >&2
+    echo "  (toggle off python.exe and python3.exe), or PATH-prepend your real" >&2
+    echo "  install (e.g. C:\\Users\\<you>\\AppData\\Local\\Programs\\Python\\Python312\\)." >&2
     exit 1
   fi
 fi
@@ -2568,6 +2587,18 @@ print(data.decode().strip())
         exec env AIRC_NO_DISCOVERY=1 ${_preserved_name:+AIRC_NAME="$_preserved_name"} "$0" connect --room "$resolved_room_name"
       fi
       # Either not a room flow, or no gh, or no resolved_room_name → original die.
+      # Surface the captured pair-handshake stderr (continuum-b69f 2026-04-27:
+      # Windows users got "Can't reach ..." with no clue the real cause was
+      # a Microsoft Store python3.exe stub returning exit 49). Per the
+      # global "never swallow errors" rule — evidence is for the debugger,
+      # not the trash. The handshake captured stderr+stdout via 2>&1 into
+      # $response just above, so we have the real error in hand.
+      if [ -n "${response:-}" ]; then
+        echo "" >&2
+        echo "  Pair handshake output (captured stderr/stdout):" >&2
+        printf '%s\n' "$response" | sed 's/^/    /' >&2
+        echo "" >&2
+      fi
       die "Can't reach $peer_host_only:$peer_port. Is the host running 'airc connect'?"
     fi
 
@@ -5371,13 +5402,34 @@ _doctor_install_cmd_for() {
 
 _doctor_probe() {
   local cmd="$1" mgr="$2" purpose="$3"
-  if command -v "$cmd" >/dev/null 2>&1; then
+  # Strict probe: command must exist on PATH AND respond to --version with
+  # exit 0. The bare `command -v` form is fooled by Windows's Microsoft
+  # Store python3.exe alias (continuum-b69f, 2026-04-27) — the file
+  # exists, satisfies command -v, but exits 49 with a Store-redirect
+  # message on stderr when actually invoked. Same story for Windows
+  # python.exe alias. Strict-probe version catches this fail-fast at
+  # doctor time instead of letting every later python3 -c "..."
+  # call die silently in cmd_connect.
+  if command -v "$cmd" >/dev/null 2>&1 && "$cmd" --version >/dev/null 2>&1; then
     printf "  [ok] %s\n" "$cmd"
     return 0
   fi
-  local fix; fix=$(_doctor_install_cmd_for "$mgr" "$cmd")
-  printf "  [MISSING] %s -- %s\n" "$cmd" "$purpose"
-  printf "         Fix: %s\n" "$fix"
+  # Distinguish "absent" from "stub on PATH" so the fix hint is correct.
+  local fix
+  if command -v "$cmd" >/dev/null 2>&1; then
+    # Present but non-functional — almost certainly a stub.
+    printf "  [BROKEN] %s -- %s\n" "$cmd" "$purpose"
+    printf "         '%s' is on PATH but '%s --version' fails. " "$cmd" "$cmd"
+    printf "Likely a Microsoft Store alias on Windows.\n"
+    printf "         Disable: Settings -> Apps -> Advanced app settings -> App execution aliases\n"
+    printf "         Or PATH-prepend a real install ahead of WindowsApps/.\n"
+    fix=$(_doctor_install_cmd_for "$mgr" "$cmd")
+    printf "         Or install fresh: %s\n" "$fix"
+  else
+    fix=$(_doctor_install_cmd_for "$mgr" "$cmd")
+    printf "  [MISSING] %s -- %s\n" "$cmd" "$purpose"
+    printf "         Fix: %s\n" "$fix"
+  fi
   return 1
 }
 
