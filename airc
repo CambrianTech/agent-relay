@@ -3214,6 +3214,22 @@ json.dump(c, open('$CONFIG', 'w'), indent=2)
 # v1: airc identity show/set/link locally; airc whois on self.
 # v2 (deferred): peer WHOIS over SSH; live continuum/slack import/push.
 
+# IRC /away: short alias for `airc identity set --status ...`. With a
+# message, marks the agent as away. Without args, clears the status
+# (back from away). Adheres to IRC convention; the longer form
+# (airc identity set --status) still works for scripted state changes.
+cmd_away() {
+  ensure_init
+  if [ $# -eq 0 ]; then
+    _identity_set --status "" >/dev/null
+    echo "  back — away cleared."
+  else
+    local msg="$*"
+    _identity_set --status "$msg" >/dev/null
+    echo "  away: $msg"
+  fi
+}
+
 cmd_identity() {
   ensure_init
   local sub="${1:-show}"
@@ -5521,6 +5537,7 @@ case "${1:-help}" in
   ping)      shift; cmd_ping "$@" ;;
   rename|nick) shift; cmd_rename "$@" ;;
   identity|whoami) shift; cmd_identity "$@" ;;
+  away|back) shift; cmd_away "$@" ;;
   whois)     shift; cmd_whois "$@" ;;
   kick)      shift; cmd_kick "$@" ;;
   reminder)  shift; cmd_reminder "$@" ;;
@@ -5562,6 +5579,7 @@ case "${1:-help}" in
     echo "  airc identity import <platform>:<id>     Pull persona FROM platform (continuum)"
     echo "  airc identity push <platform>            Push local fields TO platform (continuum)"
     echo "  airc whois [<peer>]             Show identity of self / host / paired peer / cross-peer-via-host"
+    echo "  airc away [<msg>]               Set/clear away status (IRC /away alias for: identity set --status)"
     echo "  airc kick <peer> [reason]       Host-only: remove a paired peer (drop SSH key + peer file)"
     echo "  airc quit / disconnect          Leave the mesh (keep identity for next time)"
     echo "  airc peers                      List connected peers"
@@ -5584,5 +5602,5 @@ case "${1:-help}" in
     echo "  AIRC_REMINDER env var overrides reminder interval in seconds (default 300)"
     echo "  Join string may include :port after host, e.g. name@user@host:7548#key"
     ;;
-  *) die "Unknown command: $1. Try: relay help" ;;
+  *) die "Unknown command: $1. Try: airc help" ;;
 esac

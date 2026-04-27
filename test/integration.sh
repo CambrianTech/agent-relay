@@ -2530,6 +2530,188 @@ except Exception: print('')
   cleanup_all
 }
 
+# ── Scenario: away (IRC /away alias) ───────────────────────────────────
+# IRC convention: /away <msg> marks user as away with status, /away
+# (no arg) clears it. airc away wraps `airc identity set --status` so
+# every IRC verb in the README table has a direct CLI form.
+scenario_away() {
+  section "away: IRC /away alias for identity set --status"
+  cleanup_all
+
+  local home=/tmp/airc-it-aw/state
+  mkdir -p "$home/identity"
+  ssh-keygen -t ed25519 -f "$home/identity/ssh_key" -N '' -q -C 'aw-test' 2>/dev/null
+  cat > "$home/config.json" <<'JSON'
+{ "name": "alpha", "identity": {} }
+JSON
+
+  # ── Set away with message ──
+  AIRC_HOME="$home" "$AIRC" away "in a meeting til 3pm" >/dev/null 2>&1
+  local status; status=$(python3 -c "
+import json
+print(json.load(open('$home/config.json')).get('identity', {}).get('status', ''))
+" 2>/dev/null)
+  [ "$status" = "in a meeting til 3pm" ] \
+    && pass "away <msg> sets status field" \
+    || fail "away didn't set status (got: '$status')"
+
+  # ── airc whois self should reflect the away status ──
+  local out; out=$(AIRC_HOME="$home" "$AIRC" whois alpha 2>&1)
+  echo "$out" | grep -q "status: *in a meeting til 3pm" \
+    && pass "whois reflects away status" \
+    || fail "whois didn't show away status (got: $out)"
+
+  # ── Multi-word message via positional args ──
+  AIRC_HOME="$home" "$AIRC" away getting coffee >/dev/null 2>&1
+  status=$(python3 -c "
+import json
+print(json.load(open('$home/config.json')).get('identity', {}).get('status', ''))
+" 2>/dev/null)
+  [ "$status" = "getting coffee" ] \
+    && pass "away with multi-word arg joins with spaces" \
+    || fail "multi-word away dropped tokens (got: '$status')"
+
+  # ── airc back (no args) clears status ──
+  AIRC_HOME="$home" "$AIRC" away >/dev/null 2>&1
+  status=$(python3 -c "
+import json
+print(json.load(open('$home/config.json')).get('identity', {}).get('status', '(absent)'))
+" 2>/dev/null)
+  [ "$status" = "(absent)" ] \
+    && pass "away (no arg) clears status field (back)" \
+    || fail "away no-arg didn't clear status (got: '$status')"
+
+  # ── 'back' alias (IRC convention shortcut) ──
+  AIRC_HOME="$home" "$AIRC" away "afk" >/dev/null 2>&1
+  AIRC_HOME="$home" "$AIRC" back >/dev/null 2>&1
+  status=$(python3 -c "
+import json
+print(json.load(open('$home/config.json')).get('identity', {}).get('status', '(absent)'))
+" 2>/dev/null)
+  [ "$status" = "(absent)" ] \
+    && pass "back alias also clears status" \
+    || fail "back alias didn't clear (got: '$status')"
+
+  rm -rf /tmp/airc-it-aw
+  cleanup_all
+}
+
+# ── Scenario: list (rooms registry on gh account) ──────────────────────
+# Verifies airc list / rooms / ls all dispatch to cmd_rooms and the
+# output format meets the IRC /list contract: shows open channels with
+# enough info for any client to /join. Doesn't require a live gh
+# account — the empty-account path is the most reliable to test in CI.
+scenario_list() {
+  section "list: airc list / rooms / ls — IRC /list alias"
+  cleanup_all
+
+  # All three aliases should reach the same code path. Only test that
+  # they don't error and produce SOME output (real listing requires gh
+  # auth which the integration suite doesn't depend on).
+  local home=/tmp/airc-it-ls/state
+  mkdir -p "$home/identity"
+  ssh-keygen -t ed25519 -f "$home/identity/ssh_key" -N '' -q -C 'ls-test' 2>/dev/null
+  cat > "$home/config.json" <<'JSON'
+{ "name": "alpha" }
+JSON
+
+  local rc1 rc2 rc3
+  AIRC_HOME="$home" "$AIRC" list >/dev/null 2>&1; rc1=$?
+  AIRC_HOME="$home" "$AIRC" rooms >/dev/null 2>&1; rc2=$?
+  AIRC_HOME="$home" "$AIRC" ls >/dev/null 2>&1; rc3=$?
+
+  # Exit 0 (empty list / has gists) and exit 1 (no gh) both acceptable
+  # — we just verify dispatch works and the command runs to completion.
+  [ "$rc1" -eq 0 ] || [ "$rc1" -eq 1 ] \
+    && pass "airc list exits cleanly (rc=$rc1)" \
+    || fail "airc list crashed (rc=$rc1)"
+  [ "$rc2" -eq 0 ] || [ "$rc2" -eq 1 ] \
+    && pass "airc rooms exits cleanly (rc=$rc2)" \
+    || fail "airc rooms crashed (rc=$rc2)"
+  [ "$rc3" -eq 0 ] || [ "$rc3" -eq 1 ] \
+    && pass "airc ls exits cleanly (rc=$rc3)" \
+    || fail "airc ls crashed (rc=$rc3)"
+
+  # Output shape: when gh works, we expect either "No open airc rooms"
+  # or "<N> open on your gh account:" lines. Either signals the right
+  # code path was reached.
+  local out; out=$(AIRC_HOME="$home" "$AIRC" list 2>&1)
+  echo "$out" | grep -qE "open airc rooms|open on your gh account|requires the 'gh' CLI" \
+    && pass "list output has the expected shape" \
+    || fail "list output unexpected (got: $out)"
+
+  rm -rf /tmp/airc-it-ls
+  cleanup_all
+}
+
+# ── Scenario: quit (IRC /quit semantics) ──────────────────────────────
+# IRC /quit: leave the mesh, keep your identity. airc quit (alias for
+# disconnect) tears down the running scope's processes and clears
+# host-pairing fields from config — but identity (name, ssh_key,
+# pronouns/role/bio/status) survives so the next `airc connect` can
+# resume the same persona instead of re-bootstrapping.
+scenario_quit() {
+  section "quit: IRC /quit semantics — leave mesh, keep identity"
+  cleanup_all
+
+  local home=/tmp/airc-it-q-quit/state
+  mkdir -p "$home/identity"
+  ssh-keygen -t ed25519 -f "$home/identity/ssh_key" -N '' -q -C 'quit-test' 2>/dev/null
+  # Minimal config simulating a paired joiner: has name + identity AND
+  # host-pairing fields. quit should drop the pairing and keep identity.
+  cat > "$home/config.json" <<'JSON'
+{
+  "name": "alpha",
+  "host_target": "joel@1.2.3.4",
+  "host_name": "ahost",
+  "host_port": 7547,
+  "host_airc_home": "/home/joel/.airc",
+  "host_ssh_pub": "ssh-ed25519 AAAA",
+  "identity": {"pronouns": "they", "role": "agent", "bio": "test bio"}
+}
+JSON
+
+  AIRC_HOME="$home" "$AIRC" quit >/dev/null 2>&1
+  local rc=$?
+  [ "$rc" -eq 0 ] && pass "airc quit returns 0" || fail "airc quit non-zero (rc=$rc)"
+
+  # Identity preserved
+  local name pronouns role bio
+  name=$(python3 -c "import json; print(json.load(open('$home/config.json')).get('name',''))" 2>/dev/null)
+  pronouns=$(python3 -c "import json; print(json.load(open('$home/config.json')).get('identity',{}).get('pronouns',''))" 2>/dev/null)
+  role=$(python3 -c "import json; print(json.load(open('$home/config.json')).get('identity',{}).get('role',''))" 2>/dev/null)
+  bio=$(python3 -c "import json; print(json.load(open('$home/config.json')).get('identity',{}).get('bio',''))" 2>/dev/null)
+  [ "$name" = "alpha" ] && pass "name survives quit" || fail "name lost (got: '$name')"
+  [ "$pronouns" = "they" ] && pass "pronouns survive quit" || fail "pronouns lost (got: '$pronouns')"
+  [ "$role" = "agent" ] && pass "role survives quit" || fail "role lost (got: '$role')"
+  [ "$bio" = "test bio" ] && pass "bio survives quit" || fail "bio lost (got: '$bio')"
+
+  # Host-pairing fields cleared
+  local has_target has_name
+  has_target=$(python3 -c "import json; print('host_target' in json.load(open('$home/config.json')))" 2>/dev/null)
+  has_name=$(python3 -c "import json; print('host_name' in json.load(open('$home/config.json')))" 2>/dev/null)
+  [ "$has_target" = "False" ] && pass "host_target cleared by quit" || fail "host_target still present"
+  [ "$has_name" = "False" ] && pass "host_name cleared by quit" || fail "host_name still present"
+
+  # SSH key file preserved (identity material)
+  [ -f "$home/identity/ssh_key" ] && pass "ssh_key preserved (identity material)" || fail "ssh_key lost"
+
+  # Disconnect alias should be equivalent
+  cat > "$home/config.json" <<'JSON'
+{
+  "name": "alpha",
+  "host_target": "joel@1.2.3.4",
+  "identity": {"pronouns": "they"}
+}
+JSON
+  AIRC_HOME="$home" "$AIRC" disconnect >/dev/null 2>&1
+  has_target=$(python3 -c "import json; print('host_target' in json.load(open('$home/config.json')))" 2>/dev/null)
+  [ "$has_target" = "False" ] && pass "disconnect alias clears pairing too" || fail "disconnect alias didn't clear"
+
+  rm -rf /tmp/airc-it-q-quit
+  cleanup_all
+}
+
 # ── Scenario: platform_adapters (cross-platform helpers contract) ──────
 # proc_children / port_listeners / proc_parent / proc_cmdline /
 # file_size / detect_platform replace inline pgrep/lsof/stat patterns
@@ -2711,9 +2893,12 @@ case "$MODE" in
   whois_cross_scope) scenario_whois_cross_scope ;;
   part_keeps_sidecar) scenario_part_keeps_sidecar ;;
   part_persists) scenario_part_persists ;;
+  away) scenario_away ;;
+  list) scenario_list ;;
+  quit) scenario_quit ;;
   platform_adapters) scenario_platform_adapters ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_send_dead_monitor_dies; scenario_connect_after_kill_recovers; scenario_general_sidecar_default; scenario_send_room_flag; scenario_peers_cross_scope; scenario_whois_cross_scope; scenario_part_keeps_sidecar; scenario_part_persists; scenario_platform_adapters ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|send_room_flag|peers_cross_scope|whois_cross_scope|part_keeps_sidecar|part_persists|platform_adapters|all]"; exit 2 ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_send_dead_monitor_dies; scenario_connect_after_kill_recovers; scenario_general_sidecar_default; scenario_send_room_flag; scenario_peers_cross_scope; scenario_whois_cross_scope; scenario_part_keeps_sidecar; scenario_part_persists; scenario_away; scenario_list; scenario_quit; scenario_platform_adapters ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|send_room_flag|peers_cross_scope|whois_cross_scope|part_keeps_sidecar|part_persists|away|list|quit|platform_adapters|all]"; exit 2 ;;
 esac
 
 echo

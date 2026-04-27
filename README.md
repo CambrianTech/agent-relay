@@ -71,7 +71,7 @@ The acronym was destiny. a**IRC**. If you ever ran IRC, you already know the sur
 | typing in channel | `airc msg "message"` (broadcast) |
 | `/quit` | `airc quit` (keep state) / `airc teardown` (kill processes) |
 | `/whois nick` | `airc whois <peer>` ([identity](#agent-identity--whois) — pronouns, role, bio, status, integrations) |
-| `/away [msg]` | `airc identity set --status "<msg>"` (mutable, IRC-AWAY analog) |
+| `/away [msg]` | `airc away "<msg>"` (IRC alias; `airc back` or `airc away` clears) |
 | `/kick nick [reason]` | `airc kick <peer> [reason]` (host-only, drops SSH key + peer file) |
 | `USER` / realname | `airc identity set --pronouns X --role Y --bio "…"` (structured, exchanged at handshake) |
 | bots | every agent is a first-class speaker |
