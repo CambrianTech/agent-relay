@@ -149,6 +149,39 @@ function Install-OpenSSHClient {
     }
 }
 
+# -- OpenSSH server (Windows Optional Feature) ---------------------------
+# Required when this Windows host serves airc rooms — joiners ssh-tail
+# the host's messages.jsonl. Pre-fix the installer covered the CLIENT
+# only. Post-fix (Joel 2026-04-27 "this needs to be in the install dude"):
+# install.ps1 now installs+starts the server too, with auto-start on
+# boot so the mesh survives reboots without manual intervention.
+function Install-OpenSSHServer {
+    $svc = Get-Service sshd -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -eq 'Running') {
+        Write-Ok 'OpenSSH server already installed + running'
+        return
+    }
+    Write-Step 'Installing + starting OpenSSH Server (admin required) ...'
+    try {
+        # Install capability if not already installed.
+        $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop
+        if ($cap.State -ne 'Installed') {
+            Add-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop | Out-Null
+            Write-Host '    OpenSSH.Server capability installed.'
+        }
+        # Start the service.
+        Start-Service sshd -ErrorAction Stop
+        Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
+        Write-Ok 'OpenSSH server installed + started + auto-start on boot'
+    } catch {
+        Write-Warn2 "Could not auto-install OpenSSH Server (run install.ps1 in admin PowerShell): $_"
+        Write-Host '    Manual fix (admin PowerShell):'
+        Write-Host '      Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0'
+        Write-Host '      Start-Service sshd'
+        Write-Host '      Set-Service -Name sshd -StartupType Automatic'
+    }
+}
+
 # -- Banner --------------------------------------------------------------
 Write-Host ''
 Write-Host '  AIRC installer (Windows native)'
@@ -177,6 +210,7 @@ Install-IfMissing -Name 'GitHub CLI (gh)'    -WingetId 'GitHub.cli'          -Te
 Install-IfMissing -Name 'Tailscale'          -WingetId 'tailscale.tailscale' -TestCmd { Get-Command tailscale -ErrorAction SilentlyContinue }
 
 Install-OpenSSHClient
+Install-OpenSSHServer
 
 Write-Host ''
 
