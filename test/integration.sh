@@ -2427,7 +2427,14 @@ scenario_part_persists() {
   section "part_persists: /part is sticky across sessions (issue #136)"
   cleanup_all
 
-  local home1=/tmp/airc-it-pp/state
+  # NOTE: fixture path basename starts with "." so _primary_scope_for sees
+  # a leading-dot scope (the real-world layout is $repo/.airc, not 'state').
+  # vhsm-d1f4 caught a regression in PR #144 e2e where _primary_scope_for's
+  # regex over-stripped '.airc' to '' and silently routed _clear_parted_room
+  # to a bogus path. Earlier fixture used 'state'/'state.general' which
+  # never exercised the leading-dot code path. Switching to '.airc' /
+  # '.airc.general' so the test matches production layout.
+  local home1=/tmp/airc-it-pp/.airc
   mkdir -p "$home1"
 
   # ── Phase 1: primary + sidecar both up ─────────────────────────────
