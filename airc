@@ -2364,6 +2364,29 @@ cmd_connect() {
         # Legacy raw-string format OR jq missing — take the first
         # non-empty line that looks like an invite.
         resolved=$(printf '%s' "$raw_content" | grep -E '@.*@' | head -1 | tr -d '\r\n ')
+        # If the matched line is from a JSON envelope (e.g.
+        # `"invite": "name@user@host:port#..."`), the grep grabs the
+        # whole quoted line including the JSON-key prefix. Strip
+        # leading non-name characters: anything before the first letter
+        # is JSON syntax (quotes, colons, whitespace). Found by
+        # continuum-b69f Win→Mac e2e 2026-04-27 — bash on Git Bash
+        # ships without jq, falls through to this path, captured
+        # `"invite":"authenticator-fd63@...` as the invite, then the
+        # downstream @-split made the displayed peer name include
+        # the JSON-key fragment AND prevented resolved_room_name from
+        # ever being set (no JSON parse, no .name extraction). Strip
+        # everything up to the first letter or hyphen, then re-validate.
+        resolved=$(printf '%s' "$resolved" | sed -E 's/^[^a-zA-Z]+//')
+        # Fallback room-name extraction when jq is missing: grep the
+        # raw_content for `"name": "..."` and capture the value. Same
+        # JSON envelope shape as the jq path; sed-only so it works on
+        # bare-bones environments. Empty if not present (legacy gist).
+        if [ -z "$resolved_room_name" ]; then
+          resolved_room_name=$(printf '%s' "$raw_content" \
+            | grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+"' \
+            | head -1 \
+            | sed -E 's/^"name"[[:space:]]*:[[:space:]]*"([^"]+)"$/\1/')
+        fi
       fi
       if [ -z "$resolved" ] || ! echo "$resolved" | grep -q '@'; then
         die "Failed to resolve gist '$gist_id' to a valid invite (got: $(printf '%s' "$raw_content" | head -c 80)...)"
@@ -5379,6 +5402,7 @@ cmd_doctor() {
   _doctor_probe "ssh"          "$mgr" "OpenSSH client for the wire"     || issues=$((issues+1))
   _doctor_probe "ssh-keygen"   "$mgr" "Identity keypair generation"     || issues=$((issues+1))
   _doctor_probe "python3"      "$mgr" "Monitor formatter + heredocs"    || issues=$((issues+1))
+  _doctor_probe "jq"           "$mgr" "Gist envelope parser (rooms, addresses)" || issues=$((issues+1))
   _doctor_probe_sshd                                                    || issues=$((issues+1))
   _doctor_probe_tailscale "$mgr"  # optional, never increments issues
 
@@ -5669,6 +5693,7 @@ _doctor_connect_preflight() {
   _doctor_probe "ssh"          "$mgr" "OpenSSH client for the wire"    || issues=$((issues+1))
   _doctor_probe "ssh-keygen"   "$mgr" "Identity keypair generation"    || issues=$((issues+1))
   _doctor_probe "python3"      "$mgr" "Monitor formatter + heredocs"   || issues=$((issues+1))
+  _doctor_probe "jq"           "$mgr" "Gist envelope parser (rooms, addresses)" || issues=$((issues+1))
   _doctor_probe_sshd                                                   || issues=$((issues+1))
 
   # ── gh chain: installed → authed → gist scope → gists API reachable.
