@@ -127,6 +127,101 @@ install_with_pkgmgr() {
   esac
 }
 
+# Ensure sshd is installed AND running. Per-platform with one sudo / UAC
+# prompt at most. Idempotent — if already running, no-op.
+_ensure_sshd_running() {
+  case "$(uname -s 2>/dev/null)" in
+    Darwin)
+      # macOS: sshd is launchd-managed; "Remote Login" toggle drives it.
+      if launchctl list 2>/dev/null | grep -q "com\.openssh\.sshd" \
+         || systemsetup -getremotelogin 2>/dev/null | grep -qi "Remote Login: On"; then
+        ok "sshd running (Remote Login enabled)"
+        return 0
+      fi
+      info "Enabling Remote Login (sshd) — sudo prompt incoming."
+      info "  airc joiners need this to ssh-tail your messages.jsonl when you host."
+      if sudo systemsetup -setremotelogin on 2>&1; then
+        ok "Remote Login enabled."
+      else
+        warn "systemsetup failed. Manual fallback: System Settings -> General -> Sharing -> Remote Login (toggle on)."
+      fi
+      ;;
+    Linux)
+      # Already running?
+      if systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; then
+        ok "sshd running"
+        return 0
+      fi
+      # Install (if missing) + enable. Try Debian/Ubuntu unit name first
+      # (ssh) then RHEL/Fedora (sshd). Guarded by detect_pkgmgr — if the
+      # package is missing we use install_with_pkgmgr which already
+      # handles sudo + the per-distro install command.
+      info "Installing + enabling sshd — needed for hosting airc rooms."
+      local _pkgmgr; _pkgmgr=$(detect_pkgmgr)
+      case "$_pkgmgr" in
+        apt|dnf|pacman|apk)
+          install_with_pkgmgr "$_pkgmgr" "openssh-server" 2>&1 || \
+            warn "openssh-server install failed (already present? Try: airc doctor)."
+          # After install, enable + start the right unit.
+          if systemctl list-unit-files 2>/dev/null | grep -q "^ssh\.service"; then
+            sudo systemctl enable --now ssh 2>&1 \
+              && ok "ssh.service enabled + running" \
+              || warn "Failed to start ssh.service. Manual: sudo systemctl enable --now ssh"
+          elif systemctl list-unit-files 2>/dev/null | grep -q "^sshd\.service"; then
+            sudo systemctl enable --now sshd 2>&1 \
+              && ok "sshd.service enabled + running" \
+              || warn "Failed to start sshd.service. Manual: sudo systemctl enable --now sshd"
+          else
+            warn "Neither ssh.service nor sshd.service found. Check distro docs."
+          fi
+          ;;
+        *)
+          warn "Linux without recognized package manager — install + enable sshd manually."
+          ;;
+      esac
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      # Windows Git Bash: probe via powershell.exe; install via UAC-elevated
+      # PowerShell (Start-Process -Verb RunAs).
+      if ! command -v powershell.exe >/dev/null 2>&1; then
+        warn "powershell.exe not on PATH; can't auto-configure sshd."
+        return 0
+      fi
+      local _state
+      _state=$(powershell.exe -NoProfile -Command "(Get-Service sshd -ErrorAction SilentlyContinue).Status" 2>/dev/null | tr -d '\r\n ')
+      case "$_state" in
+        Running)
+          ok "sshd running (Windows OpenSSH.Server)"
+          return 0
+          ;;
+        Stopped|StopPending|StartPending|Paused)
+          info "sshd installed but not running — starting it (UAC prompt incoming)."
+          powershell.exe -NoProfile -Command "Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -Command Start-Service sshd; Set-Service sshd -StartupType Automatic'" 2>&1 \
+            && ok "sshd started + auto-start configured." \
+            || warn "Self-elevation failed. Run in admin PowerShell: Start-Service sshd; Set-Service sshd -StartupType Automatic"
+          ;;
+        "")
+          info "Installing OpenSSH.Server (UAC prompt incoming) — needed for hosting airc rooms."
+          # Self-elevate, install capability, start service, set automatic.
+          # All in one elevated process so the user clicks UAC once.
+          powershell.exe -NoProfile -Command "Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -Command Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0; Start-Service sshd; Set-Service -Name sshd -StartupType Automatic'" 2>&1 \
+            && ok "OpenSSH.Server installed + started + auto-start configured." \
+            || warn "Self-elevation failed. Run in admin PowerShell:
+    Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+    Start-Service sshd
+    Set-Service -Name sshd -StartupType Automatic"
+          ;;
+        *)
+          warn "sshd state unknown (Get-Service returned: '$_state'). Run airc doctor to diagnose."
+          ;;
+      esac
+      ;;
+    *)
+      info "sshd auto-config skipped (unsupported platform: $(uname -s))"
+      ;;
+  esac
+}
+
 tailscale_present() {
   # macOS GUI install puts Tailscale.app at /Applications without putting
   # `tailscale` on PATH — `command -v tailscale` then lies about a missing
@@ -224,52 +319,19 @@ ensure_prereqs() {
 
   # sshd: airc joiners ssh into the host's airc_home to tail messages.
   # Every airc user who'll host a room (which is most users — first to
-  # discover becomes the host) needs sshd RUNNING on their box. Pre-fix
-  # 2026-04-27: install printed "All required prereqs present" against
-  # systems with no sshd, then airc connect's first cross-machine pair
-  # silently failed at the ssh-tail step. Now we detect + provide the
-  # platform-specific fix.
-  case "$(uname -s 2>/dev/null)" in
-    Darwin)
-      # macOS: sshd is launchd-managed via Remote Login.
-      if ! launchctl list 2>/dev/null | grep -q "com\.openssh\.sshd" \
-         && ! systemsetup -getremotelogin 2>/dev/null | grep -qi "Remote Login: On"; then
-        warn "sshd not running (Remote Login OFF) — needed when you HOST a room."
-        warn "  Enable: System Settings -> General -> Sharing -> Remote Login"
-        warn "  Or:     sudo systemsetup -setremotelogin on"
-      fi
-      ;;
-    Linux)
-      if ! systemctl is-active --quiet ssh 2>/dev/null && ! systemctl is-active --quiet sshd 2>/dev/null; then
-        warn "sshd not running — needed when you HOST a room."
-        warn "  Debian/Ubuntu: sudo apt-get install openssh-server && sudo systemctl enable --now ssh"
-        warn "  RHEL/Fedora:   sudo dnf install openssh-server && sudo systemctl enable --now sshd"
-      fi
-      ;;
-    MINGW*|MSYS*|CYGWIN*)
-      # Windows Git Bash: probe via powershell.exe.
-      if command -v powershell.exe >/dev/null 2>&1; then
-        _SSHD_STATE=$(powershell.exe -NoProfile -Command "(Get-Service sshd -ErrorAction SilentlyContinue).Status" 2>/dev/null | tr -d '\r\n ')
-        case "$_SSHD_STATE" in
-          Running) ok "sshd running (OpenSSH.Server service)" ;;
-          Stopped|StopPending|StartPending|Paused)
-            warn "sshd installed but not running (state: $_SSHD_STATE) — needed when you HOST."
-            warn "  Run in admin PowerShell:"
-            warn "    Start-Service sshd"
-            warn "    Set-Service sshd -StartupType Automatic"
-            ;;
-          "")
-            warn "sshd NOT installed — needed when you HOST a room."
-            warn "  Run in admin PowerShell (one-time):"
-            warn "    Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0"
-            warn "    Start-Service sshd"
-            warn "    Set-Service -Name sshd -StartupType Automatic"
-            warn "  Then re-run install.sh."
-            ;;
-        esac
-      fi
-      ;;
-  esac
+  # discover becomes the host) needs sshd RUNNING. install.sh actually
+  # turns it on instead of just warning, since "warn + leave it to the
+  # user" was Joel's "this needs to be in the install dude" pushback
+  # 2026-04-27. ONE sudo / UAC prompt during install (same shape as
+  # install_with_pkgmgr already uses for apt/dnf/etc); after that
+  # airc just works for hosting.
+  #
+  # AIRC_SKIP_SSHD=1 short-circuits the whole block — for headless CI
+  # boxes that genuinely don't host, or environments that manage sshd
+  # via their own config-management (Ansible, Chef).
+  if [ "${AIRC_SKIP_SSHD:-0}" != "1" ]; then
+    _ensure_sshd_running
+  fi
 
   # Tailscale is optional -- only needed for cross-LAN mesh. LAN-only
   # works fine without it, so we attempt install but don't fail loud.
