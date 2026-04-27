@@ -948,8 +948,17 @@ _primary_scope_for() {
   parent=$(dirname "$scope")
   self_base=$(basename "$scope")
   prefix=$(printf '%s' "$self_base" | sed -E 's/\.[a-z0-9-]+$//')
-  if [ "$prefix" = "$self_base" ]; then
-    # Already primary — no trailing .<word> suffix to strip.
+  # Sidecar only if the regex stripped a real suffix AND left a non-empty
+  # prefix. Empty prefix means the entire basename was a leading-dot-name
+  # like '.airc' (canonical primary scope name in real deployments) — the
+  # regex eats the whole thing. Without the empty-prefix guard, '.airc'
+  # gets treated as a sidecar of '' under '<parent>/' which then can't
+  # find config.json and silently no-ops. Bug surfaced by vhsm-d1f4 in
+  # PR #144 e2e (2026-04-27): airc join --general silently failed because
+  # _clear_parted_room got the wrong path. Test scenario_part_persists
+  # passed because its fixture path is 'state'/'state.general' (no
+  # leading dot), masking the prefix='' code path entirely.
+  if [ -z "$prefix" ] || [ "$prefix" = "$self_base" ]; then
     printf '%s' "$scope"
   else
     printf '%s' "$parent/$prefix"
