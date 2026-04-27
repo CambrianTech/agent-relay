@@ -178,7 +178,14 @@ ensure_prereqs() {
 
   local missing=() pkgs=() unmappable=()
   for cmd in git gh openssl ssh-keygen python3; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
+    # Strict probe: presence on PATH AND a successful --version invocation.
+    # The bare `command -v` form is fooled by Windows's Microsoft Store
+    # python3.exe alias (continuum-b69f, 2026-04-27) — the file exists,
+    # satisfies command -v, but exits 49 with a Store-redirect message
+    # when actually run. Pre-fix: install printed "All required prereqs
+    # present" and airc later silent-fail-cascaded at every python3 -c
+    # invocation. Strict probe catches this at install time.
+    if ! command -v "$cmd" >/dev/null 2>&1 || ! "$cmd" --version >/dev/null 2>&1; then
       missing+=("$cmd")
       local pkg; pkg=$(pkgname_for "$mgr" "$cmd")
       if [ -z "$pkg" ]; then
