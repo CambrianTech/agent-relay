@@ -2414,6 +2414,122 @@ scenario_part_keeps_sidecar() {
   cleanup_all
 }
 
+# ── Scenario: part_persists (issue #136) ───────────────────────────────
+# Pre-fix: /part #general left the lobby for the session, but the next
+# `airc join` auto-respawned the sidecar — your /part was useless.
+# Persistence converts /part from session-action to durable preference.
+#
+# Post-fix: cmd_part records the parted room in primary scope's
+# parted_rooms array. spawn_general_sidecar_if_wanted reads that list
+# on bootstrap and skips spawn for any room in it. `airc join --general`
+# clears "general" from parted_rooms (explicit re-opt-in).
+scenario_part_persists() {
+  section "part_persists: /part is sticky across sessions (issue #136)"
+  cleanup_all
+
+  local home1=/tmp/airc-it-pp/state
+  mkdir -p "$home1"
+
+  # ── Phase 1: primary + sidecar both up ─────────────────────────────
+  ( cd /tmp/airc-it-pp && unset AIRC_NO_GENERAL && \
+      AIRC_HOME="$home1" AIRC_NAME=alpha AIRC_PORT=7585 \
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --no-gist --room pp-room-$$ > "$home1/out.log" 2>&1 & )
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    sleep 1
+    [ -f "${home1}.general/airc.pid" ] && [ -f "$home1/airc.pid" ] && break
+  done
+  [ -f "$home1/airc.pid" ] && [ -f "${home1}.general/airc.pid" ] \
+    && pass "phase 1: primary + sidecar both running" \
+    || { fail "phase 1: setup failed"; cleanup_all; rm -rf /tmp/airc-it-pp; return; }
+
+  # parted_rooms should be absent or empty in primary config now.
+  local before; before=$(python3 -c "
+import json
+try: print(' '.join(json.load(open('$home1/config.json')).get('parted_rooms', []) or []))
+except Exception: print('')
+" 2>/dev/null)
+  [ -z "$before" ] \
+    && pass "phase 1: primary config has empty parted_rooms initially" \
+    || fail "phase 1: parted_rooms unexpectedly populated (got: $before)"
+
+  # ── Phase 2: /part the sidecar — should write parted_rooms ─────────
+  AIRC_HOME="${home1}.general" "$AIRC" part >/dev/null 2>&1
+  sleep 1
+
+  local after; after=$(python3 -c "
+import json
+try: print(' '.join(json.load(open('$home1/config.json')).get('parted_rooms', []) or []))
+except Exception: print('')
+" 2>/dev/null)
+  [ "$after" = "general" ] \
+    && pass "phase 2: /part wrote 'general' to primary parted_rooms" \
+    || fail "phase 2: parted_rooms missing 'general' (got: '$after')"
+
+  # Full teardown to reset between phases (sidecar already gone from /part).
+  AIRC_HOME="$home1" "$AIRC" teardown >/dev/null 2>&1
+  sleep 1
+
+  # ── Phase 3: bootstrap again — sidecar must NOT spawn ──────────────
+  ( cd /tmp/airc-it-pp && unset AIRC_NO_GENERAL && \
+      AIRC_HOME="$home1" AIRC_NAME=alpha AIRC_PORT=7586 \
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --no-gist --room pp-room-$$ > "$home1/out2.log" 2>&1 & )
+  for i in 1 2 3 4 5 6 7 8; do
+    sleep 1
+    [ -f "$home1/airc.pid" ] && break
+  done
+
+  [ -f "$home1/airc.pid" ] \
+    && pass "phase 3: primary respawned" \
+    || { fail "phase 3: primary failed to come up"; cleanup_all; rm -rf /tmp/airc-it-pp; return; }
+
+  # The sidecar pidfile should NOT exist (was parted, persisted).
+  # Wait a couple seconds for any stray sidecar spawn before asserting.
+  sleep 2
+  [ ! -f "${home1}.general/airc.pid" ] \
+    && pass "phase 3: sidecar does NOT auto-respawn (parted_rooms honored)" \
+    || fail "phase 3: sidecar respawned despite /part persistence"
+
+  # The "previously parted" notice should be in the output.
+  grep -q "previously parted" "$home1/out2.log" 2>/dev/null \
+    && pass "phase 3: 'previously parted' notice surfaced to user" \
+    || fail "phase 3: silent skip — notice missing from output (would surprise users)"
+
+  # Tear down primary before phase 4.
+  AIRC_HOME="$home1" "$AIRC" teardown >/dev/null 2>&1
+  sleep 1
+
+  # ── Phase 4: --general flag clears parted state and respawns sidecar
+  ( cd /tmp/airc-it-pp && unset AIRC_NO_GENERAL && \
+      AIRC_HOME="$home1" AIRC_NAME=alpha AIRC_PORT=7587 \
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --no-gist --room pp-room-$$ --general > "$home1/out3.log" 2>&1 & )
+  for i in 1 2 3 4 5 6 7 8; do
+    sleep 1
+    [ -f "${home1}.general/airc.pid" ] && [ -f "$home1/airc.pid" ] && break
+  done
+
+  [ -f "${home1}.general/airc.pid" ] \
+    && pass "phase 4: --general flag restored sidecar" \
+    || fail "phase 4: --general didn't respawn sidecar"
+
+  local cleared; cleared=$(python3 -c "
+import json
+try: print(' '.join(json.load(open('$home1/config.json')).get('parted_rooms', []) or []))
+except Exception: print('')
+" 2>/dev/null)
+  [ -z "$cleared" ] \
+    && pass "phase 4: --general cleared parted_rooms (round-trip works)" \
+    || fail "phase 4: parted_rooms still has stale entries (got: '$cleared')"
+
+  AIRC_HOME="$home1" "$AIRC" teardown >/dev/null 2>&1
+  sleep 1
+  rm -rf /tmp/airc-it-pp
+  cleanup_all
+}
+
 # ── Scenario: platform_adapters (cross-platform helpers contract) ──────
 # proc_children / port_listeners / proc_parent / proc_cmdline /
 # file_size / detect_platform replace inline pgrep/lsof/stat patterns
@@ -2594,9 +2710,10 @@ case "$MODE" in
   peers_cross_scope) scenario_peers_cross_scope ;;
   whois_cross_scope) scenario_whois_cross_scope ;;
   part_keeps_sidecar) scenario_part_keeps_sidecar ;;
+  part_persists) scenario_part_persists ;;
   platform_adapters) scenario_platform_adapters ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_send_dead_monitor_dies; scenario_connect_after_kill_recovers; scenario_general_sidecar_default; scenario_send_room_flag; scenario_peers_cross_scope; scenario_whois_cross_scope; scenario_part_keeps_sidecar; scenario_platform_adapters ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|send_room_flag|peers_cross_scope|whois_cross_scope|part_keeps_sidecar|platform_adapters|all]"; exit 2 ;;
+  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_send_dead_monitor_dies; scenario_connect_after_kill_recovers; scenario_general_sidecar_default; scenario_send_room_flag; scenario_peers_cross_scope; scenario_whois_cross_scope; scenario_part_keeps_sidecar; scenario_part_persists; scenario_platform_adapters ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|send_room_flag|peers_cross_scope|whois_cross_scope|part_keeps_sidecar|part_persists|platform_adapters|all]"; exit 2 ;;
 esac
 
 echo

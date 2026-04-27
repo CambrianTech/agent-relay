@@ -937,6 +937,90 @@ remote_home() {
   echo "$h"
 }
 
+# Resolve the PRIMARY scope dir for any given scope (issue #136).
+# Sidecar scopes are named `<primary>.<room>` (e.g. .airc.general). The
+# primary itself returns its own path. Used by cmd_part to write the
+# parted_rooms list into primary config (single source of truth) even
+# when /part was invoked from a sidecar scope.
+_primary_scope_for() {
+  local scope="$1"
+  local parent self_base prefix
+  parent=$(dirname "$scope")
+  self_base=$(basename "$scope")
+  prefix=$(printf '%s' "$self_base" | sed -E 's/\.[a-z0-9-]+$//')
+  if [ "$prefix" = "$self_base" ]; then
+    # Already primary — no trailing .<word> suffix to strip.
+    printf '%s' "$scope"
+  else
+    printf '%s' "$parent/$prefix"
+  fi
+}
+
+# Read the parted_rooms list (issue #136) from a primary scope's
+# config.json. Echoes one room per line (empty if unset). Caller can
+# pipe to grep -Fxq "<room>" to test membership without subshell.
+_read_parted_rooms() {
+  local primary="$1"
+  local cfg="$primary/config.json"
+  [ -f "$cfg" ] || return 0
+  CONFIG="$cfg" python3 -c '
+import json, os
+try:
+    c = json.load(open(os.environ["CONFIG"]))
+    for r in c.get("parted_rooms", []) or []:
+        print(r)
+except Exception:
+    pass
+' 2>/dev/null
+}
+
+# Mark a room as parted in the primary scope's config (issue #136).
+# Idempotent — re-parting the same room does not create duplicates.
+# Persists across teardown/reboot so /part is sticky, not session-only.
+_record_parted_room() {
+  local primary="$1" room="$2"
+  local cfg="$primary/config.json"
+  [ -f "$cfg" ] || return 0
+  CONFIG="$cfg" ROOM="$room" python3 -c '
+import json, os, sys
+cfg = os.environ["CONFIG"]
+room = os.environ["ROOM"]
+try:
+    c = json.load(open(cfg))
+except Exception:
+    # Better to no-op than corrupt config; the missing persist surfaces
+    # as auto-resubscribe on next bootstrap, not silent state corruption.
+    sys.exit(0)
+parted = list(c.get("parted_rooms", []) or [])
+if room not in parted:
+    parted.append(room)
+    c["parted_rooms"] = parted
+    json.dump(c, open(cfg, "w"), indent=2)
+' 2>/dev/null || true
+}
+
+# Remove a room from the primary scope's parted_rooms (issue #136).
+# Used by `airc join --general` (and similar explicit re-opt-in flows)
+# to undo a prior /part.
+_clear_parted_room() {
+  local primary="$1" room="$2"
+  local cfg="$primary/config.json"
+  [ -f "$cfg" ] || return 0
+  CONFIG="$cfg" ROOM="$room" python3 -c '
+import json, os, sys
+cfg = os.environ["CONFIG"]
+room = os.environ["ROOM"]
+try:
+    c = json.load(open(cfg))
+except Exception:
+    sys.exit(0)
+parted = [r for r in (c.get("parted_rooms", []) or []) if r != room]
+if parted != (c.get("parted_rooms", []) or []):
+    c["parted_rooms"] = parted
+    json.dump(c, open(cfg, "w"), indent=2)
+' 2>/dev/null || true
+}
+
 # Spawn the #general sidecar (issue #121) — a parallel `airc connect`
 # in a sibling scope (.general suffix) so the primary tab is in BOTH
 # its project room AND the lobby. Identity NICK is shared via AIRC_NAME;
@@ -962,6 +1046,17 @@ spawn_general_sidecar_if_wanted() {
   local _primary_scope="$AIRC_WRITE_DIR"
   local _primary_name; _primary_name=$(get_name 2>/dev/null || echo "")
   local _sidecar_scope="${_primary_scope}.general"
+
+  # Issue #136: honor a prior /part. If "general" is in the primary
+  # scope's parted_rooms list, the user explicitly left the lobby —
+  # don't auto-resubscribe on bootstrap. Override with `airc join
+  # --general` (cmd_connect calls _clear_parted_room) or by editing
+  # config.json. Env/flag opt-outs are session-only and do NOT touch
+  # parted_rooms; only an explicit /part persists.
+  if _read_parted_rooms "$_primary_scope" | grep -Fxq "general"; then
+    echo "  Sidecar #general skipped — previously parted (airc join --general to rejoin)."
+    return 0
+  fi
 
   echo "  Sidecar: also subscribing to #general (--no-general to opt out)"
 
@@ -1613,6 +1708,7 @@ cmd_connect() {
   local room_explicit=0  # set to 1 when user passes --room explicitly
   local use_room=1   # default ON — auto-#general substrate
   local general_sidecar=1   # default ON (issue #121) — also subscribe to #general
+  local _force_general_sidecar=0   # set by --general flag (issue #136 re-opt-in)
   # Recursion guard: when WE are the sidecar (spawned by another airc
   # connect), don't spawn our own sidecar. Otherwise: turtles all the way.
   [ "${AIRC_GENERAL_SIDECAR:-0}" = "1" ] && general_sidecar=0
@@ -1659,6 +1755,14 @@ cmd_connect() {
         # default and users need a way to opt out of just the lobby
         # part without dropping back to legacy 1:1 invites.
         general_sidecar=0; shift ;;
+      --general|-general)
+        # Issue #136: explicit re-opt-in to #general after a prior
+        # /part. Clears the room from primary scope's parted_rooms so
+        # the sidecar resubscribes. Force general_sidecar=1 too in case
+        # AIRC_GENERAL_SIDECAR=1 was set (recursion guard) — the user
+        # is explicitly asking for the sidecar, override session env.
+        # Symmetric inverse of --no-general.
+        _force_general_sidecar=1; shift ;;
       --room-only|-room-only)
         # Combo: explicit project room + skip general sidecar. For
         # focused work where lobby noise would distract.
@@ -1676,6 +1780,22 @@ cmd_connect() {
     esac
   done
   set -- "${positional[@]+"${positional[@]}"}"
+
+  # Issue #136: --general re-opt-in. Clear parted state on primary
+  # scope and force the sidecar back on. Done after arg parsing so we
+  # know AIRC_WRITE_DIR (set by ensure_init below) is meaningful — but
+  # we have to wait for ensure_init to run, since --general can be
+  # called before any prior init. The cleanup happens via a deferred
+  # check in spawn_general_sidecar_if_wanted: since _clear_parted_room
+  # is idempotent, we can call it eagerly here when config exists, and
+  # also force general_sidecar=1 to override any session env opt-out.
+  if [ "$_force_general_sidecar" = "1" ]; then
+    general_sidecar=1
+    if [ -f "$AIRC_WRITE_DIR/config.json" ]; then
+      local _primary_now; _primary_now=$(_primary_scope_for "$AIRC_WRITE_DIR")
+      _clear_parted_room "$_primary_now" "general"
+    fi
+  fi
 
   # Tailscale-installed-but-logged-out nudge. Runs AFTER flag parsing
   # so --no-tailscale takes effect. Default behavior: if Tailscale is
@@ -4053,6 +4173,17 @@ cmd_part() {
     # incorrectly trigger the stale-pairing-detect path on the next
     # resume even though they parted intentionally.
     rm -f "$room_name_file" "$gist_id_file"
+  fi
+
+  # Issue #136: persist the /part. Record the room into the PRIMARY
+  # scope's parted_rooms list so a later `airc join` won't auto-
+  # resubscribe. Only meaningful for sidecar rooms (general, future
+  # opt-in #repo etc.) — parting your project's primary scope means
+  # the whole scope is gone, so persistence there is moot.
+  local _primary_scope; _primary_scope=$(_primary_scope_for "$AIRC_WRITE_DIR")
+  if [ "$_primary_scope" != "$AIRC_WRITE_DIR" ] && [ "$room_name" != "(unnamed)" ]; then
+    _record_parted_room "$_primary_scope" "$room_name"
+    echo "  /part persisted — #${room_name} won't auto-resubscribe. Rejoin with: airc join --${room_name}"
   fi
 
   # IRC `/part` semantics — leave THIS room only; the #general sidecar
