@@ -54,6 +54,19 @@ else
 fi
 export AIRC_PYTHON
 
+# MSYS Git Bash on Windows translates argv VALUES that look like
+# Unix-rooted paths when bash invokes a Windows-native binary. So
+# `--host-airc-home /Users/joelteply/.airc` arrives at python.exe as
+# `--host-airc-home C:/Program Files/Git/Users/joelteply/.airc` —
+# silently corrupting paths that the joiner later sends back over SSH
+# to a real Unix host. continuum-b69f traced + fixed this 2026-04-27;
+# the targeted exclude covers macOS / Linux / root home prefixes
+# without breaking `/tmp/` or `/c/` paths (which DO need translation
+# for `--config "$CONFIG"` where $CONFIG is on the local Windows
+# filesystem). Set once at airc startup, exported, every airc_core
+# invocation inherits the same translation policy.
+export MSYS2_ARG_CONV_EXCL="${MSYS2_ARG_CONV_EXCL:-/Users/;/home/;/root/}"
+
 # Resolve the airc install dir's lib/ path and prepend to PYTHONPATH so
 # Python heredocs + module invocations can import airc_core (the
 # Python truth-layer #152). Three resolution paths, first hit wins:
