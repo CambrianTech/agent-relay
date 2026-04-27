@@ -97,6 +97,11 @@ pkgname_for() {
         winget) echo "GitHub.cli" ;;
         *)      echo "gh" ;;
       esac ;;
+    jq)
+      case "$mgr" in
+        winget) echo "jqlang.jq" ;;
+        *)      echo "jq" ;;
+      esac ;;
     *) echo "$prereq" ;;
   esac
 }
@@ -321,7 +326,12 @@ ensure_prereqs() {
   fi
 
   local missing=() pkgs=() unmappable=()
-  for cmd in git gh openssl ssh-keygen python3; do
+  # jq added 2026-04-27: airc's gist envelope parser uses jq for the
+  # canonical path; bash bare-grep fallback handles JSON-key-prefix
+  # leak now (PR fix), but jq is the right tool — without it the
+  # fallback can't extract host.addresses[] for multi-address pick.
+  # On Git Bash, jq is winget-installable as 'jqlang.jq'.
+  for cmd in git gh jq openssl ssh-keygen python3; do
     # Strict probe: presence on PATH AND a successful --version invocation.
     # The bare `command -v` form is fooled by Windows's Microsoft Store
     # python3.exe alias (continuum-b69f, 2026-04-27) — the file exists,
