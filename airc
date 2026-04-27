@@ -54,6 +54,42 @@ else
 fi
 export AIRC_PYTHON
 
+# Resolve the airc install dir's lib/ path and prepend to PYTHONPATH so
+# Python heredocs + module invocations can import airc_core (the
+# Python truth-layer #152). Three resolution paths, first hit wins:
+#   1. $AIRC_DIR (explicit override / install.sh's working dir)
+#   2. dirname of this script (dev checkout — running from repo)
+#   3. $HOME/.airc-src (install.sh default)
+# When the lib/ dir doesn't exist (e.g. older install before this PR
+# landed), PYTHONPATH stays unmodified — heredocs still work.
+_airc_resolve_lib_dir() {
+  local _candidate _abs
+  for _candidate in \
+      "${AIRC_DIR:-}/lib" \
+      "$(dirname "$(readlink "$0" 2>/dev/null || echo "$0")")/lib" \
+      "$(dirname "$0")/lib" \
+      "$HOME/.airc-src/lib"; do
+    if [ -d "$_candidate/airc_core" ]; then
+      # Canonicalize to absolute path so PYTHONPATH stays valid even
+      # if cwd changes mid-script (heredocs that cd elsewhere). cd +
+      # pwd is the portable canonicalize idiom — `realpath` and
+      # `readlink -f` are not available everywhere (BSD readlink
+      # lacks -f, busybox lacks realpath).
+      _abs=$(cd "$_candidate" 2>/dev/null && pwd) || _abs="$_candidate"
+      printf '%s' "$_abs"
+      return 0
+    fi
+  done
+}
+_airc_lib_dir=$(_airc_resolve_lib_dir)
+if [ -n "${_airc_lib_dir:-}" ]; then
+  if [ -n "${PYTHONPATH:-}" ]; then
+    export PYTHONPATH="$_airc_lib_dir:$PYTHONPATH"
+  else
+    export PYTHONPATH="$_airc_lib_dir"
+  fi
+fi
+
 # One-time migration from pre-rename ~/.agent-relay → ~/.airc. Fires when user
 # is on vanilla defaults, the old dir exists as a real dir (not a symlink we
 # already left), and ~/.airc doesn't. Leaves a symlink ~/.agent-relay → ~/.airc
@@ -939,44 +975,20 @@ detect_platform() {
   esac
 }
 
-# Convert an ISO 8601 UTC timestamp (e.g. "2026-04-27T03:25:54Z") to a
-# Unix epoch (seconds since 1970). Echoes the epoch on success, empty
-# on failure. Tries in order:
-#   - BSD/macOS:    date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s
-#   - GNU/Linux:    date -u -d "$ts" +%s     (also works in Git Bash on
-#                                             Windows via MSYS coreutils)
-#   - python3:      datetime.strptime fallback for any environment where
-#                   neither `date` flavor parses (rare but real on some
-#                   minimal Cygwin/MSYS installs without coreutils).
+# Convert an ISO 8601 UTC timestamp to a Unix epoch (seconds since 1970).
+# Echoes the epoch on success, empty on failure.
 #
-# Why an adapter: the BSD-vs-GNU date split was inlined at 3 callsites
-# pre-canary. Each had its own `date -j -u -f ... || date -u -d ...`
-# fallback chain — so when WSL's date semantics drifted (it's GNU but
-# old enough to reject some flag combos) the fix had to land at every
-# site. Single adapter = single fix. Mac integration tests still cover
-# both branches because Mac's `date -j` succeeds first; the python
-# fallback is only reachable on hosts where both `date` flavors fail.
+# Migrated to airc_core.datetime as Phase 0a of the Python truth-layer
+# (#152 architecture). Pre-migration this was a 3-fallback adapter
+# chain inline in bash (BSD date / GNU date / python3 heredoc).
+# Post-migration the bash function is a one-line call into the
+# Python module — same contract, same stdout shape, but the logic
+# lives in a testable Python file with no bash → python heredoc
+# substitution risk. First migration; pattern for the rest.
 iso_to_epoch() {
   local ts="${1:-}"
   [ -z "$ts" ] && return 0
-  local epoch=""
-  if epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null); then
-    echo "$epoch"; return 0
-  fi
-  if epoch=$(date -u -d "$ts" +%s 2>/dev/null); then
-    echo "$epoch"; return 0
-  fi
-  if [ -n "${AIRC_PYTHON:-}" ]; then
-    "$AIRC_PYTHON" -c "
-import datetime, sys
-try:
-    dt = datetime.datetime.strptime('$ts', '%Y-%m-%dT%H:%M:%SZ')
-    dt = dt.replace(tzinfo=datetime.timezone.utc)
-    print(int(dt.timestamp()))
-except Exception:
-    sys.exit(1)
-" 2>/dev/null
-  fi
+  "$AIRC_PYTHON" -m airc_core.datetime iso_to_epoch "$ts" 2>/dev/null
 }
 
 # ── End platform adapters ───────────────────────────────────────────────
@@ -5880,6 +5892,11 @@ case "${1:-help}" in
   debug-scope) echo "$AIRC_WRITE_DIR" ;;
   debug-name)  resolve_name ;;
   debug-host)  get_host ;;
+  debug-pythonpath)
+    echo "AIRC_PYTHON=$AIRC_PYTHON"
+    echo "lib_dir=${_airc_lib_dir:-<not-resolved>}"
+    echo "PYTHONPATH=${PYTHONPATH:-<unset>}"
+    "$AIRC_PYTHON" -c "import airc_core; print(f'airc_core import ok: v{airc_core.__version__}')" 2>&1 ;;
   help|--help|-h)
     echo "AIRC — Agentic Internet Relay Chat for AI peers"
     echo "(IRC verbs work as primary; airc-classic names also accepted)"

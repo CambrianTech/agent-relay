@@ -2762,8 +2762,15 @@ scenario_platform_adapters() {
   # safely source.
   local _adapters_extract; _adapters_extract=$(mktemp -t airc-it-pa.XXXXXX)
   awk '/^# ── Platform adapters/,/^# ── End platform adapters/' "$AIRC" > "$_adapters_extract"
+  # iso_to_epoch (post-PR #152 Phase 0a) calls into airc_core.datetime
+  # via "$AIRC_PYTHON" -m. The extracted-adapter test bash needs both
+  # vars set + lib/ on PYTHONPATH so the module resolves. Pre-Phase-0a
+  # this wasn't required (the bash adapter had inline date fallbacks).
+  local _airc_lib_dir; _airc_lib_dir=$(cd "$(dirname "$AIRC")/lib" 2>/dev/null && pwd)
   _adapter_call() {
-    bash -c "source '$_adapters_extract'; $*"
+    AIRC_PYTHON="${AIRC_PYTHON:-python3}" \
+    PYTHONPATH="${_airc_lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
+    bash -c "source '$_adapters_extract'; export AIRC_PYTHON='${AIRC_PYTHON:-python3}'; $*"
   }
 
   # ── proc_children ──
