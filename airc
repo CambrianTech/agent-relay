@@ -2910,133 +2910,15 @@ JSON
     echo "  Waiting for peers on port $host_port..."
     # Background: accept peer registrations via TCP (public keys only)
     while true; do
-      "$AIRC_PYTHON" -c "
-import socket, json, sys, os
-
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-sock.bind(('0.0.0.0', $host_port))
-sock.listen(1)
-# Short accept timeout + parent-death check means if the outer bash dies
-# between pairings, this python exits cleanly on the next timeout instead
-# of orphaning and holding the port forever.
-sock.settimeout(10)
-while True:
-    try:
-        conn, addr = sock.accept()
-        break
-    except socket.timeout:
-        if os.getppid() == 1:
-            sock.close()
-            sys.exit(0)
-data = b''
-while True:
-    chunk = conn.recv(4096)
-    if not chunk: break
-    data += chunk
-    if b'\n' in data: break
-
-joiner = json.loads(data.decode().strip())
-
-# Authorize joiner's SSH key
-ssh_dir = os.path.expanduser('~/.ssh')
-os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
-ak = os.path.join(ssh_dir, 'authorized_keys')
-ssh_key = joiner.get('ssh_pub', '')
-if ssh_key:
-    existing = open(ak).read() if os.path.exists(ak) else ''
-    if ssh_key not in existing:
-        with open(ak, 'a') as f:
-            f.write(ssh_key.strip() + '\n')
-        os.chmod(ak, 0o600)
-
-# Save joiner as peer — but first drop any existing records that share
-# this joiner's host (stable identity across renames). Otherwise a
-# rename chain leaves stale '<old-name>.json' alongside the new one.
-peers_dir = os.path.expanduser('$PEERS_DIR')
-os.makedirs(peers_dir, exist_ok=True)
-jname = joiner['name']
-jhost = joiner.get('host','')
-if jhost and os.path.isdir(peers_dir):
-    for entry in os.listdir(peers_dir):
-        if not entry.endswith('.json'): continue
-        if entry == jname + '.json': continue
-        try:
-            d = json.load(open(os.path.join(peers_dir, entry)))
-        except Exception:
-            continue
-        if d.get('host') == jhost:
-            # Same machine+user pairing under a different name — stale.
-            for ext in ('.json', '.pub'):
-                p = os.path.join(peers_dir, entry[:-5] + ext)
-                if os.path.isfile(p):
-                    try: os.remove(p)
-                    except Exception: pass
-with open(os.path.join(peers_dir, jname + '.json'), 'w') as f:
-    json.dump({
-        'name': jname,
-        'host': joiner.get('host',''),
-        'airc_home': joiner.get('airc_home', ''),
-        'paired': '$(timestamp)',
-        # Cache joiner's SSH pubkey so airc kick can remove it from
-        # authorized_keys later. Without this, kick has no way to find
-        # the right line in authorized_keys and the kicked peer keeps
-        # SSH access — Copilot caught this on PR #73 review.
-        'ssh_pub': joiner.get('ssh_pub', ''),
-        # Cache joiner's identity blob (issue #34 v2). Empty on legacy
-        # peers that don't send the field — airc whois prints the
-        # 'not exchanged yet' fallback gracefully.
-        'identity': joiner.get('identity', {})
-    }, f, indent=2)
-if joiner.get('sign_pub'):
-    with open(os.path.join(peers_dir, jname + '.pub'), 'w') as f:
-        f.write(joiner['sign_pub'])
-
-# Send back host's SSH pubkey + airc_home + own identity blob (issue #34
-# v2). Joiner caches under host_identity so 'airc whois <host-name>'
-# works locally without a round-trip.
-host_pub = open(os.path.expanduser('$IDENTITY_DIR/ssh_key.pub')).read().strip()
-host_identity = {}
-try:
-    host_config = json.load(open('$CONFIG'))
-    host_identity = host_config.get('identity', {}) or {}
-except Exception:
-    pass
-response = json.dumps({
-    'ssh_pub': host_pub,
-    'name': '$name',
-    'reminder': $reminder_interval,
-    'airc_home': '$AIRC_WRITE_DIR',
-    'identity': host_identity
-})
-conn.sendall((response + '\n').encode())
-conn.close()
-sock.close()
-print(f'  Peer joined: {jname}')
-# Surface the join as a system event in messages.jsonl so the monitor
-# formatter (and downstream Monitor task summaries on every paired peer)
-# render a one-liner like '[#general] airc: <peer> joined' instead of
-# silence. Without this, peer-joined is invisible to anyone reading
-# notifications — they only learn about the new peer when chat traffic
-# starts flowing. Joel 2026-04-24: 'preview of the message or the
-# connection or whatever happened, Anvil joined instead of generic'.
-import datetime
-try:
-    room_name_path = '$AIRC_WRITE_DIR/room_name'
-    room_name = open(room_name_path).read().strip() if os.path.isfile(room_name_path) else 'general'
-    event = {
-        'ts': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
-        'from': 'airc',
-        'to': 'all',
-        'msg': f'{jname} joined #{room_name}',
-    }
-    with open('$MESSAGES', 'a') as f:
-        f.write(json.dumps(event) + '\n')
-except Exception:
-    # Don't fail the pair on event-emit error — pairing already
-    # succeeded by this point; the missing event line is cosmetic.
-    pass
-" 2>/dev/null || true
+      HOST_PORT="$host_port" \
+      PEERS_DIR="$PEERS_DIR" \
+      IDENTITY_DIR="$IDENTITY_DIR" \
+      CONFIG="$CONFIG" \
+      HOST_NAME="$name" \
+      REMINDER_INTERVAL="$reminder_interval" \
+      AIRC_WRITE_DIR="$AIRC_WRITE_DIR" \
+      MESSAGES="$MESSAGES" \
+      "$AIRC_PYTHON" -m airc_core.handshake accept_one 2>/dev/null || true
     done &
     PAIR_PID=$!
 
