@@ -127,7 +127,16 @@ cmd_send() {
   if [ -n "$_peer_csv" ]; then
     peer_name="$_peer_csv"
     msg="$*"
-    [ -z "$msg" ] && die "Usage: airc send @peer [@peer2 ...] <message>"
+    if [ -z "$msg" ]; then
+      # #147: empty body after leading @-tokens. Common cause is a user
+      # wanting an in-channel @-mention rather than a DM (#141). Two
+      # explicit recovery paths instead of just the bare usage line.
+      echo "Usage:" >&2
+      echo "  airc msg @peer <message>           DM that peer" >&2
+      echo "  airc msg @peer1 @peer2 <message>   DM multiple peers" >&2
+      echo "  airc msg \"hi @peer, fyi\"           in-channel @-mention (quote so @ stays in body)" >&2
+      die "got @-targets but no message body. If you wanted an @-mention in the channel, quote the whole message."
+    fi
   else
     peer_name="all"
     msg="$*"
