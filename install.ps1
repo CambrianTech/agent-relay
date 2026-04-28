@@ -448,3 +448,14 @@ Write-Host '    4. Join the mesh:           airc join'
 Write-Host ''
 Write-Host '  Diagnose anytime:    airc doctor'
 Write-Host ''
+
+# Explicit successful exit. Earlier external probes (winget, tailscale
+# status, etc.) leak their $LASTEXITCODE through to the script's
+# natural-end exit — most notably `tailscale status` returns non-zero
+# when the user hasn't logged in yet (a perfectly normal post-install
+# state we already report via Write-Warn2 above). Without this, every
+# fresh install on a runner / VM with not-yet-signed-in tailscale exits
+# 1 from install.ps1 even though the install fully succeeded. CI sees
+# the install as failed, despite the binary being correctly placed.
+$global:LASTEXITCODE = 0
+exit 0
