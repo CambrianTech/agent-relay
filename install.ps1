@@ -67,18 +67,47 @@ function Update-SessionPath {
 # stripped App Installer, we can't auto-install -- flag it loud with the
 # exact Microsoft Store / GitHub Releases URL to recover.
 function Test-WingetAvailable {
-    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-        Write-Fail 'winget not found. winget is the Windows package manager that ships with App Installer (Microsoft Store).'
+    if (Get-Command winget -ErrorAction SilentlyContinue) { return }
+
+    # Issue #95: detect Windows Server — Microsoft Store path is a
+    # dead-end there (no Store, no App Installer). Surface chocolatey
+    # / scoop fallbacks instead.
+    $isServer = $false
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+        # ProductType: 1=Workstation, 2=Domain Controller, 3=Server
+        if ($os -and ($os.ProductType -eq 2 -or $os.ProductType -eq 3)) {
+            $isServer = $true
+        }
+    } catch { }
+
+    Write-Fail 'winget not found.'
+    Write-Host ''
+    if ($isServer) {
+        Write-Host '  This is Windows Server. The Microsoft Store path does not apply here.'
+        Write-Host '  Use chocolatey OR scoop, then re-run this installer:'
         Write-Host ''
-        Write-Host '  Install it manually then re-run this script:'
+        Write-Host '    # chocolatey (recommended for Server):'
+        Write-Host '    Set-ExecutionPolicy Bypass -Scope Process -Force'
+        Write-Host "    iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))"
+        Write-Host '    choco install -y python git gh openssh'
+        Write-Host ''
+        Write-Host '    # OR scoop (user-scope, no admin needed):'
+        Write-Host "    iwr -useb https://get.scoop.sh | iex"
+        Write-Host '    scoop install python git gh openssh'
+        Write-Host ''
+        Write-Host '  After installing python, git, gh, openssh manually, re-run this script;'
+        Write-Host '  it will detect them and skip winget.'
+    } else {
+        Write-Host '  winget ships with App Installer (Microsoft Store). Install or update it:'
         Write-Host '    1. Open the Microsoft Store, search "App Installer", click Install/Update'
         Write-Host '       (or: https://www.microsoft.com/store/productId/9NBLGGH4NNS1)'
         Write-Host '    2. Reopen PowerShell and run this installer again.'
         Write-Host ''
-        Write-Host '  If you cannot use the Microsoft Store, install manually from'
+        Write-Host '  If the Store is unavailable, install manually from'
         Write-Host '  https://github.com/microsoft/winget-cli/releases (latest .msixbundle).'
-        exit 1
     }
+    exit 1
 }
 
 # -- Install one winget package, idempotent ------------------------------
@@ -149,6 +178,154 @@ function Install-OpenSSHClient {
     }
 }
 
+# -- OpenSSH server (Windows Optional Feature) ---------------------------
+# Required when this Windows host serves airc rooms -- joiners ssh-tail
+# the host's messages.jsonl. Pre-fix the installer covered the CLIENT
+# only. Post-fix (Joel 2026-04-27 "this needs to be in the install dude"):
+# install.ps1 now installs+starts the server too, with auto-start on
+# boot so the mesh survives reboots without manual intervention.
+# Workaround for Windows HNS (Host Network Service) randomly reserving
+# port 22 at boot. HNS dynamically reserves port ranges to support
+# Hyper-V / WSL2 / Docker Desktop networking; the reservations rotate
+# per-boot and are NOT visible in `netsh int ipv4 show excludedportrange`
+# (that command shows static admin reservations only). When port 22
+# happens to fall inside a dynamic HNS range, sshd bind() returns EPERM
+# even with admin. Diagnosis credit: continuum-b69f via cross-Mac/Windows
+# coord gist 2026-04-27. Two-step persistent fix:
+#
+#   1. Disable HNS auto-exclusion via registry -- survives reboots.
+#   2. Explicitly reserve port 22 in the static excluded-port-range so
+#      HNS can't grab it on subsequent boots.
+#
+# References:
+#   keasigmadelta.com/blog/how-to-solve-cannot-bind-to-port-due-to-permission-denied-on-windows
+#   github.com/docker/for-win/issues/3171
+function Set-HnsPortFreedomFor22 {
+    # Idempotent -- both checks before writing so re-runs of install
+    # don't double-write or noisy on a healthy system.
+    $regPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\hns\State'
+    $regName = 'EnableExcludedPortRange'
+    $needRegWrite = $true
+    try {
+        $cur = (Get-ItemProperty -Path $regPath -Name $regName -ErrorAction SilentlyContinue).$regName
+        if ($cur -eq 0) { $needRegWrite = $false }
+    } catch { }
+    if ($needRegWrite) {
+        Write-Host '    Disabling HNS auto-exclusion (HKLM\...\hns\State EnableExcludedPortRange = 0) ...'
+        & reg add 'HKLM\SYSTEM\CurrentControlSet\Services\hns\State' /v 'EnableExcludedPortRange' /d 0 /f 2>$null | Out-Null
+    }
+
+    # Check if port 22 is already in the static excluded-port-range.
+    $existing = & netsh int ipv4 show excludedportrange protocol=tcp 2>$null | Out-String
+    if ($existing -match '(?m)^\s*22\s+22\b') {
+        # Already reserved.
+        return
+    }
+    Write-Host '    Reserving port 22 in static excluded-port-range (netsh) ...'
+    & netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1 2>$null | Out-Null
+}
+
+# -- DefaultShell -- bash, not cmd.exe (#98) ----------------------------
+# Windows OpenSSH defaults DefaultShell to cmd.exe, which lacks `cat`,
+# heredoc redirection, the rest of the POSIX shell vocabulary that airc
+# remote commands rely on (`cat >> $rhome/messages.jsonl`, etc.). Result
+# without this fix: every Windows airc HOST fails the moment a peer
+# tries to send a message -- the remote `cat` command is "not recognized
+# as an internal or external command", airc records [QUEUED] forever,
+# and the user sees no errors locally.
+#
+# Set DefaultShell to Git for Windows bash. Bash is what airc.ps1's
+# remote commands assume (POSIX paths, redirects). Git for Windows is
+# already a hard prereq for Windows users (we install it above), so
+# its bash.exe is a stable target.
+function Set-OpenSSHDefaultShellBash {
+    $regPath = 'HKLM:\SOFTWARE\OpenSSH'
+    # Locate Git for Windows bash.exe. Standard install paths first,
+    # fall through to PATH lookup. Without bash.exe we can't set it,
+    # so warn loudly -- every airc host on this machine will break
+    # silently otherwise.
+    $bashCandidates = @(
+        'C:\Program Files\Git\bin\bash.exe',
+        'C:\Program Files (x86)\Git\bin\bash.exe',
+        "$env:USERPROFILE\AppData\Local\Programs\Git\bin\bash.exe"
+    )
+    $bashPath = $null
+    foreach ($c in $bashCandidates) {
+        if (Test-Path $c) { $bashPath = $c; break }
+    }
+    if (-not $bashPath) {
+        $cmd = Get-Command bash.exe -ErrorAction SilentlyContinue
+        if ($cmd) { $bashPath = $cmd.Source }
+    }
+    if (-not $bashPath) {
+        Write-Warn2 "Could not locate Git for Windows bash.exe -- leaving OpenSSH DefaultShell at OS default (cmd.exe)."
+        Write-Host '    Without bash, this Windows machine cannot HOST an airc room -- joiners will see [QUEUED] forever.'
+        Write-Host '    Fix: install Git for Windows, then re-run install.ps1.'
+        return
+    }
+    # Idempotent -- read current, only write if different.
+    try {
+        $cur = (Get-ItemProperty -Path $regPath -Name DefaultShell -ErrorAction SilentlyContinue).DefaultShell
+    } catch { $cur = $null }
+    if ($cur -eq $bashPath) {
+        Write-Ok "OpenSSH DefaultShell already set to $bashPath"
+        return
+    }
+    try {
+        if (-not (Test-Path $regPath)) {
+            New-Item -Path $regPath -Force | Out-Null
+        }
+        New-ItemProperty -Path $regPath -Name DefaultShell -Value $bashPath -PropertyType String -Force | Out-Null
+        Write-Ok "OpenSSH DefaultShell set to $bashPath (was: $cur)"
+    } catch {
+        Write-Warn2 "Could not set DefaultShell registry value (admin required): $_"
+        Write-Host '    Manual fix (admin PowerShell):'
+        Write-Host "      New-ItemProperty -Path '$regPath' -Name DefaultShell -Value '$bashPath' -PropertyType String -Force"
+    }
+}
+
+function Install-OpenSSHServer {
+    $svc = Get-Service sshd -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -eq 'Running') {
+        Write-Ok 'OpenSSH server already installed + running'
+        return
+    }
+    Write-Step 'Installing + starting OpenSSH Server (admin required) ...'
+    try {
+        # 1. Capability install (if not already).
+        $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop
+        if ($cap.State -ne 'Installed') {
+            Add-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop | Out-Null
+            Write-Host '    OpenSSH.Server capability installed.'
+        }
+        # 2. HNS port-22 reservation (Hyper-V quirk -- see Set-HnsPortFreedomFor22).
+        Set-HnsPortFreedomFor22
+        # 3. Firewall rule for inbound TCP/22. The capability install
+        # usually creates 'OpenSSH-Server-In-TCP' but it may be disabled
+        # or missing on some systems. Idempotent.
+        if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
+            Write-Host '    Creating firewall rule for inbound SSH (TCP/22) ...'
+            New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' `
+                                -DisplayName 'OpenSSH Server (sshd)' `
+                                -Enabled True -Direction Inbound -Protocol TCP `
+                                -Action Allow -LocalPort 22 -ErrorAction SilentlyContinue | Out-Null
+        }
+        # 4. Start + persist.
+        Start-Service sshd -ErrorAction Stop
+        Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
+        Write-Ok 'OpenSSH server installed + started + auto-start on boot'
+    } catch {
+        Write-Warn2 "Could not auto-install OpenSSH Server (run install.ps1 in admin PowerShell): $_"
+        Write-Host '    Manual fix (admin PowerShell):'
+        Write-Host '      Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0'
+        Write-Host '      reg add HKLM\SYSTEM\CurrentControlSet\Services\hns\State /v EnableExcludedPortRange /d 0 /f'
+        Write-Host '      netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1'
+        Write-Host '      Start-Service sshd'
+        Write-Host '      Set-Service -Name sshd -StartupType Automatic'
+        Write-Host '    (The reg+netsh lines work around Windows HNS holding port 22 randomly per boot.)'
+    }
+}
+
 # -- Banner --------------------------------------------------------------
 Write-Host ''
 Write-Host '  AIRC installer (Windows native)'
@@ -174,9 +351,12 @@ Install-IfMissing -Name 'Python 3'           -WingetId 'Python.Python.3.12'  -Te
     return [bool](Get-Command py -ErrorAction SilentlyContinue)
 }
 Install-IfMissing -Name 'GitHub CLI (gh)'    -WingetId 'GitHub.cli'          -TestCmd { Get-Command gh -ErrorAction SilentlyContinue }
-Install-IfMissing -Name 'Tailscale'          -WingetId 'tailscale.tailscale' -TestCmd { Get-Command tailscale -ErrorAction SilentlyContinue }
+Install-IfMissing -Name 'jq'                 -WingetId 'jqlang.jq'           -TestCmd { Get-Command jq -ErrorAction SilentlyContinue }
+Install-IfMissing -Name 'Tailscale'          -WingetId 'Tailscale.Tailscale' -TestCmd { Get-Command tailscale -ErrorAction SilentlyContinue }
 
 Install-OpenSSHClient
+Install-OpenSSHServer
+Set-OpenSSHDefaultShellBash
 
 Write-Host ''
 
@@ -357,3 +537,14 @@ Write-Host '    4. Join the mesh:           airc join'
 Write-Host ''
 Write-Host '  Diagnose anytime:    airc doctor'
 Write-Host ''
+
+# Explicit successful exit. Earlier external probes (winget, tailscale
+# status, etc.) leak their $LASTEXITCODE through to the script's
+# natural-end exit -- most notably `tailscale status` returns non-zero
+# when the user hasn't logged in yet (a perfectly normal post-install
+# state we already report via Write-Warn2 above). Without this, every
+# fresh install on a runner / VM with not-yet-signed-in tailscale exits
+# 1 from install.ps1 even though the install fully succeeded. CI sees
+# the install as failed, despite the binary being correctly placed.
+$global:LASTEXITCODE = 0
+exit 0

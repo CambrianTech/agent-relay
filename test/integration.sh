@@ -250,12 +250,12 @@ scenario_tabs() {
   python3 -c "
 import json
 c = json.load(open('$fake_home/state/config.json'))
-c['host_target'] = 'nobody@127.0.0.99'
+c['host_target'] = 'nobody@198.51.100.99'
 c['host_airc_home'] = '/tmp/nowhere'
 json.dump(c, open('$fake_home/state/config.json', 'w'))
 "
   # Write a fake peer so resolution doesn't fail
-  echo '{"name":"ghost","host":"nobody@127.0.0.99","airc_home":"/tmp/nowhere"}' > "$fake_home/state/peers/ghost.json"
+  echo '{"name":"ghost","host":"nobody@198.51.100.99","airc_home":"/tmp/nowhere"}' > "$fake_home/state/peers/ghost.json"
   AIRC_HOME=$fake_home/state "$AIRC" send @ghost "this-should-fail-but-still-mirror" >/dev/null 2>&1
   # Exit should be non-zero (we die()), but local must have both the attempt AND the failure marker
   grep -q '"this-should-fail-but-still-mirror"' "$fake_home/state/messages.jsonl" 2>/dev/null && \
@@ -619,11 +619,11 @@ scenario_queue() {
 import json
 p = '/tmp/airc-it-q-j/state/config.json'
 c = json.load(open(p))
-c['host_target'] = 'nobody@127.0.0.99'
+c['host_target'] = 'nobody@198.51.100.99'
 json.dump(c, open(p, 'w'))
 "
   # Also fake the peer record so resolution doesn't fail on @qhost
-  echo '{"name":"qhost","host":"nobody@127.0.0.99","airc_home":"/tmp/nowhere"}' \
+  echo '{"name":"qhost","host":"nobody@198.51.100.99","airc_home":"/tmp/nowhere"}' \
     > /tmp/airc-it-q-j/state/peers/qhost.json
   pass "joiner: host_target flipped to unreachable (outage simulation)"
 
@@ -714,10 +714,10 @@ import json
 p = '/tmp/airc-it-s-j/state/config.json'
 c = json.load(open(p))
 c['_real_host_target'] = c['host_target']
-c['host_target'] = 'nobody@127.0.0.99'
+c['host_target'] = 'nobody@198.51.100.99'
 json.dump(c, open(p, 'w'))
 "
-  echo '{"name":"shost","host":"nobody@127.0.0.99","airc_home":"/tmp/nowhere"}' > /tmp/airc-it-s-j/state/peers/shost.json
+  echo '{"name":"shost","host":"nobody@198.51.100.99","airc_home":"/tmp/nowhere"}' > /tmp/airc-it-s-j/state/peers/shost.json
   AIRC_HOME=/tmp/airc-it-s-j/state "$AIRC" send @shost "status-queue-probe" >/dev/null 2>&1 || true
   local j_out3; j_out3=$(AIRC_HOME=/tmp/airc-it-s-j/state "$AIRC" status 2>&1)
   echo "$j_out3" | grep -Eq 'queue:\s+[1-9][0-9]* pending' \
@@ -1958,26 +1958,22 @@ scenario_connect_after_kill_recovers() {
   cleanup_all
 }
 
-# ── Scenario: general_sidecar_default (issue #121) ─────────────────────
-# Default-on multi-room presence: bare `airc join` from a project repo
-# should subscribe the tab to BOTH the auto-scoped project room AND
-# #general. The sidecar runs in a sibling .general scope; its bash PID
-# is appended to the primary's airc.pid so cmd_teardown reaps both.
+# ── Scenario: general_sidecar_default (Phase 2B.3 — sidecar deletion) ──
+# Phase 2B.3 collapses the multi-scope sidecar into a single scope with
+# subscribed_channels=["<project-room>", "general"]. Default-on multi-
+# room presence is preserved, but as ONE process subscribing to both
+# channels — not a separate `.general` sidecar process.
 #
 # Tests:
-#   1. Default behavior: primary spawns a #general sidecar.
-#   2. --no-general flag: project-only, no sidecar.
-#   3. cmd_teardown cleans BOTH primary scope + sidecar scope (.general).
-#
-# Test bypasses gh by using AIRC_NO_DISCOVERY=1 + --no-gist on both
-# primary and (transitively) sidecar — both fall into host mode in
-# their respective rooms with no gist publish. The point isn't wire
-# behavior; it's process spawn + scope creation + teardown reaping.
+#   1. Default behavior: bare `airc join` adds "general" to
+#      subscribed_channels (no separate scope/process).
+#   2. --no-general flag: project-only, no general subscription.
+#   3. --room-only is equivalent to --room + --no-general.
 scenario_general_sidecar_default() {
-  section "general_sidecar_default: bare join spawns #general sidecar (issue #121)"
+  section "general_sidecar_default: subscribed_channels (Phase 2B.3)"
   cleanup_all
 
-  # ── Test 1: default-on sidecar ────────────────────────────────────────
+  # ── Test 1: default-on subscription, no separate process ─────────────
   # The harness exports AIRC_NO_GENERAL=1 globally to suppress sidecar
   # in other tests; here we explicitly unset it for the scope of this
   # scenario.
@@ -1990,57 +1986,46 @@ scenario_general_sidecar_default() {
   local i
   for i in 1 2 3 4 5 6 7 8; do
     sleep 1
-    grep -qE 'Sidecar:.*also subscribing' "$home1/out.log" 2>/dev/null && break
+    grep -qE 'Also subscribing to #general' "$home1/out.log" 2>/dev/null && break
   done
 
-  grep -qE 'Sidecar:.*also subscribing to #general' "$home1/out.log" \
-    && pass "primary printed sidecar-spawn banner" \
-    || fail "no sidecar-spawn banner (got: $(head -10 "$home1/out.log" | tr '\n' '|'))"
+  grep -qE 'Also subscribing to #general' "$home1/out.log" \
+    && pass "primary printed subscribe-to-general banner" \
+    || fail "no subscribe banner (got: $(head -15 "$home1/out.log" | tr '\n' '|'))"
 
-  # Wait for sidecar scope to exist + be populated
+  # NEW: subscribed_channels in primary's config.json should include "general"
+  # (and the project room). No separate .general scope dir.
   for i in 1 2 3 4 5 6 7 8; do
     sleep 1
-    [ -f "${home1}.general/airc.pid" ] && [ -f "${home1}.general/room_name" ] && break
+    [ -f "$home1/config.json" ] && grep -q 'subscribed_channels' "$home1/config.json" && break
   done
 
-  [ -d "${home1}.general" ] \
-    && pass "sidecar scope dir created at \${home}.general" \
-    || fail "sidecar scope dir absent"
+  if [ -f "$home1/config.json" ] && python3 -c "
+import json,sys
+c=json.load(open('$home1/config.json'))
+chans=c.get('subscribed_channels',[])
+sys.exit(0 if 'general' in chans else 1)
+" 2>/dev/null; then
+    pass "subscribed_channels includes 'general'"
+  else
+    fail "subscribed_channels missing 'general' (config: $(cat "$home1/config.json" 2>/dev/null))"
+  fi
 
-  [ -f "${home1}.general/room_name" ] && [ "$(cat "${home1}.general/room_name")" = "general" ] \
-    && pass "sidecar scope has room_name=general" \
-    || fail "sidecar scope room_name wrong (got: $(cat "${home1}.general/room_name" 2>/dev/null))"
+  [ ! -d "${home1}.general" ] \
+    && pass "no .general sidecar scope created (Phase 2B.3)" \
+    || fail ".general sidecar scope STILL created — sidecar deletion not effective"
 
-  # Primary's airc.pid contains primary's host-mode PIDs ($$ PAIR_PID
-  # hb_pid on one line). The sidecar's PID lives in its OWN scope's
-  # airc.pid — separate file, separate ownership. (PR #122 originally
-  # appended sidecar PID to primary's airc.pid, but PR #125 reverted
-  # that to make `airc part` work cleanly without nuking the sidecar.)
   [ -s "$home1/airc.pid" ] \
     && pass "primary airc.pid is non-empty (host PIDs recorded)" \
     || fail "primary airc.pid empty or missing"
 
-  # Sidecar bash should be alive — read sidecar's OWN pidfile.
-  # awk '{print $1; exit}' grabs just the first PID since host-mode
-  # airc.pid has multiple space-separated PIDs on one line.
-  local _sc_pid; _sc_pid=$(awk '{print $1; exit}' "${home1}.general/airc.pid" 2>/dev/null)
-  if [ -n "$_sc_pid" ] && kill -0 "$_sc_pid" 2>/dev/null; then
-    pass "sidecar bash PID ${_sc_pid} (from sidecar scope's own airc.pid) is alive"
-  else
-    fail "sidecar PID not alive (pid=${_sc_pid:-<empty>})"
-  fi
-
-  # ── Test 2: cmd_teardown reaps both ──────────────────────────────────
+  # ── Test 2: cmd_teardown reaps the single scope ──────────────────────
   AIRC_HOME="$home1" "$AIRC" teardown >/dev/null 2>&1
   sleep 1
 
-  ! kill -0 "$_sc_pid" 2>/dev/null \
-    && pass "teardown killed sidecar bash (PID ${_sc_pid})" \
-    || fail "sidecar still alive after teardown"
-
-  [ ! -f "${home1}.general/airc.pid" ] \
-    && pass "teardown cleared sidecar pidfile" \
-    || fail "sidecar pidfile still present after teardown"
+  [ ! -f "$home1/airc.pid" ] \
+    && pass "teardown cleared primary pidfile" \
+    || fail "primary pidfile still present after teardown"
 
   cleanup_all
   rm -rf /tmp/airc-it-sc1
@@ -2106,441 +2091,6 @@ scenario_general_sidecar_default() {
 # Post-fix: --room <name> consumes both args, looks up the sibling scope
 # via the .airc.<name> convention, and either re-execs with the right
 # AIRC_HOME or errors loudly listing rooms the tab IS in.
-scenario_send_room_flag() {
-  section "send_room_flag: airc send --room <name> routes to sibling scope or errors"
-  cleanup_all
-
-  # Synthesize a primary scope (#myproject) and a sibling sidecar
-  # scope (#general) so the cross-room reroute can find a target.
-  local primary=/tmp/airc-it-srf/state
-  local sidecar=/tmp/airc-it-srf/state.general
-  mkdir -p "$primary/identity" "$primary/peers" "$sidecar/identity" "$sidecar/peers"
-  ssh-keygen -t ed25519 -f "$primary/identity/ssh_key" -N '' -q -C 'srf-primary' 2>/dev/null
-  ssh-keygen -t ed25519 -f "$sidecar/identity/ssh_key" -N '' -q -C 'srf-sidecar' 2>/dev/null
-  cat > "$primary/config.json" <<'JSON'
-{ "name": "alpha" }
-JSON
-  cat > "$sidecar/config.json" <<'JSON'
-{ "name": "alpha" }
-JSON
-  echo "myproject" > "$primary/room_name"
-  echo "general" > "$sidecar/room_name"
-  echo $$ > "$primary/airc.pid"
-  echo $$ > "$sidecar/airc.pid"
-
-  # ── Test 1: --room <current room> is a no-op route ────────────────────
-  AIRC_HOME="$primary" "$AIRC" send --room myproject "in-room test" >/dev/null 2>&1
-  grep -q 'in-room test' "$primary/messages.jsonl" \
-    && pass "--room <current>: lands in current scope's log (no-op route)" \
-    || fail "--room <current>: didn't land where expected"
-
-  # ── Test 2: --room general re-routes to sibling .general scope ────────
-  AIRC_HOME="$primary" "$AIRC" send --room general "lobby ping from alpha" >/dev/null 2>&1
-  grep -q 'lobby ping from alpha' "$sidecar/messages.jsonl" \
-    && pass "--room general: re-routed append to sibling .general scope" \
-    || fail "--room general: NOT in sidecar log (got primary=$(grep 'lobby ping' "$primary/messages.jsonl" | wc -l) sidecar=$(grep 'lobby ping' "$sidecar/messages.jsonl" 2>/dev/null | wc -l))"
-
-  # The lobby ping should NOT have leaked into the primary scope.
-  ! grep -q 'lobby ping from alpha' "$primary/messages.jsonl" \
-    && pass "--room general: did NOT also land in primary (no double-write)" \
-    || fail "--room general: leaked into primary scope (silent dual-write bug)"
-
-  # ── Test 3: --room <unsubscribed> fails loudly with diagnostic ────────
-  local err
-  err=$(mktemp -t airc-srf-err.XXXXXX)
-  AIRC_HOME="$primary" "$AIRC" send --room unsubscribed "should fail" >/dev/null 2>"$err"
-  local rc=$?
-
-  [ "$rc" -ne 0 ] \
-    && pass "--room <unsubscribed>: exits non-zero (no silent fallthrough)" \
-    || fail "--room <unsubscribed>: exited 0 despite no such room"
-
-  grep -q 'not subscribed in this scope' "$err" \
-    && pass "stderr says 'not subscribed in this scope'" \
-    || fail "stderr missing the structured 'not subscribed' line"
-
-  grep -qE 'rooms you ARE in:' "$err" \
-    && pass "stderr lists the rooms the tab IS in (helps user fix)" \
-    || fail "stderr doesn't list available rooms"
-
-  grep -qE '#myproject|#general' "$err" \
-    && pass "stderr names at least one subscribed room by name" \
-    || fail "stderr empty of room names"
-
-  # ── Test 4: --room with @peer DM also re-routes ──────────────────────
-  AIRC_HOME="$primary" "$AIRC" send --room general @somepeer "private to lobby peer" >/dev/null 2>&1
-  grep -q 'private to lobby peer' "$sidecar/messages.jsonl" \
-    && pass "--room general @peer DM: re-routed to sibling scope" \
-    || fail "--room <r> @peer DM: didn't re-route"
-
-  rm -f "$err"
-  cleanup_all
-  rm -rf /tmp/airc-it-srf
-}
-
-# ── Scenario: peers_cross_scope (sidecar peers visible from primary) ────
-# Pre-fix: `airc peers` walked only the current scope's peers/ dir, so a
-# tab in primary scope (e.g. #useideem) couldn't see who else was in the
-# #general lobby without `cd`'ing into the .general sidecar. Multi-room
-# presence is meaningless if the operator can't see who's in each room.
-#
-# Post-fix: cmd_peers walks the project scope AND every sibling .airc.<room>
-# scope, merging peer records by (name, host) and tagging each peer with
-# the rooms they're in. Same peer in both rooms shows as one line with
-# [#room1, #room2].
-scenario_peers_cross_scope() {
-  section "peers_cross_scope: airc peers aggregates across primary + sidecar scopes"
-  cleanup_all
-
-  local primary=/tmp/airc-it-pcs/state
-  local sidecar=/tmp/airc-it-pcs/state.general
-  mkdir -p "$primary/identity" "$primary/peers" "$sidecar/identity" "$sidecar/peers"
-  ssh-keygen -t ed25519 -f "$primary/identity/ssh_key" -N '' -q -C 'pcs-primary' 2>/dev/null
-  ssh-keygen -t ed25519 -f "$sidecar/identity/ssh_key" -N '' -q -C 'pcs-sidecar' 2>/dev/null
-  cat > "$primary/config.json" <<'JSON'
-{ "name": "alpha" }
-JSON
-  cat > "$sidecar/config.json" <<'JSON'
-{ "name": "alpha" }
-JSON
-  echo "myproject" > "$primary/room_name"
-  echo "general" > "$sidecar/room_name"
-
-  # Peer records: 'shared' is in both scopes; 'projonly' only in primary;
-  # 'lobbyonly' only in sidecar. Verifies merge + per-scope tagging.
-  cat > "$primary/peers/shared.json" <<'JSON'
-{"name":"shared","host":"joel@10.0.0.1","ssh_pub":"ssh-ed25519 AAAA"}
-JSON
-  cat > "$primary/peers/projonly.json" <<'JSON'
-{"name":"projonly","host":"joel@10.0.0.2","ssh_pub":"ssh-ed25519 BBBB"}
-JSON
-  cat > "$sidecar/peers/shared.json" <<'JSON'
-{"name":"shared","host":"joel@10.0.0.1","ssh_pub":"ssh-ed25519 AAAA"}
-JSON
-  cat > "$sidecar/peers/lobbyonly.json" <<'JSON'
-{"name":"lobbyonly","host":"joel@10.0.0.3","ssh_pub":"ssh-ed25519 CCCC"}
-JSON
-
-  local out
-  out=$(AIRC_HOME="$primary" "$AIRC" peers 2>&1)
-
-  echo "$out" | grep -qE 'shared.*joel@10.0.0.1.*\[#myproject.*#general\]|shared.*joel@10.0.0.1.*\[#general.*#myproject\]' \
-    && pass "shared peer shows tagged with BOTH rooms" \
-    || fail "shared peer missing dual-room tag (got: $(echo "$out" | grep shared))"
-
-  echo "$out" | grep -qE 'projonly.*joel@10.0.0.2.*\[#myproject\]' \
-    && pass "primary-only peer tagged with #myproject" \
-    || fail "projonly peer missing primary tag (got: $(echo "$out" | grep projonly))"
-
-  echo "$out" | grep -qE 'lobbyonly.*joel@10.0.0.3.*\[#general\]' \
-    && pass "sidecar-only peer visible from primary scope, tagged with #general" \
-    || fail "lobbyonly peer NOT visible from primary scope (got: $(echo "$out" | grep lobbyonly))"
-
-  # Same query from the sidecar scope should return the same merged set
-  # (operator perspective shouldn't change based on which scope they
-  # happen to invoke from).
-  local out2
-  out2=$(AIRC_HOME="$sidecar" "$AIRC" peers 2>&1)
-  echo "$out2" | grep -qE 'projonly' \
-    && pass "from sidecar scope: still sees primary-only peer" \
-    || fail "from sidecar scope: lost primary-only peer (got: $(echo "$out2" | head -3))"
-
-  rm -rf /tmp/airc-it-pcs
-  cleanup_all
-}
-
-# ── Scenario: whois_cross_scope (issue #134) ───────────────────────────
-# Pre-fix: cmd_whois only consulted the primary scope. A peer who
-# was paired in the #general sidecar but not in the primary project
-# room returned "no record" — even though airc peers (post-#124)
-# already showed them. JOIN events in the sidecar emitted names
-# whois couldn't resolve.
-#
-# Post-fix: cmd_whois walks sibling scopes (.airc + .airc.<room>)
-# and tries each scope's host / local-peer / cross-peer-via-host
-# lookups. First hit wins; "no record" only after exhausting all.
-#
-# Test exercises the local-peer path in sibling scope (the SSH-based
-# cross-peer path is symmetric in code and covered by scenario_whois
-# at the primary scope). Also verifies sibling-scope HOST lookup
-# works — whois on the sidecar's host name should pull host_identity
-# out of the sidecar's config.json rather than 404.
-scenario_whois_cross_scope() {
-  section "whois_cross_scope: airc whois walks sibling scopes (issue #134)"
-  cleanup_all
-
-  local primary=/tmp/airc-it-wcs/state
-  local sidecar=/tmp/airc-it-wcs/state.general
-  mkdir -p "$primary/identity" "$primary/peers" "$sidecar/identity" "$sidecar/peers"
-  ssh-keygen -t ed25519 -f "$primary/identity/ssh_key" -N '' -q -C 'wcs-primary' 2>/dev/null
-  ssh-keygen -t ed25519 -f "$sidecar/identity/ssh_key" -N '' -q -C 'wcs-sidecar' 2>/dev/null
-  # Primary scope: paired with phost in #myproject. No fellow joiners.
-  cat > "$primary/config.json" <<'JSON'
-{
-  "name": "alpha",
-  "host_name": "phost",
-  "host_target": "joel@10.0.0.1",
-  "host_identity": {"pronouns":"they","role":"primary-host","bio":"primary host bio"}
-}
-JSON
-  echo "myproject" > "$primary/room_name"
-  # Sidecar scope: paired with shost in #general. Fellow joiner 'lobbymate'.
-  cat > "$sidecar/config.json" <<'JSON'
-{
-  "name": "alpha",
-  "host_name": "shost",
-  "host_target": "joel@10.0.0.2",
-  "host_identity": {"pronouns":"she","role":"general-host","bio":"general host bio"}
-}
-JSON
-  echo "general" > "$sidecar/room_name"
-  cat > "$sidecar/peers/lobbymate.json" <<'JSON'
-{"name":"lobbymate","host":"joel@10.0.0.99","ssh_pub":"ssh-ed25519 AAAA",
- "identity":{"pronouns":"they","role":"fellow-joiner","bio":"in general only"}}
-JSON
-
-  local out
-  # ── from primary scope: sidecar peer should resolve ────────────────
-  out=$(AIRC_HOME="$primary" "$AIRC" whois lobbymate 2>&1)
-  echo "$out" | grep -q "role: *fellow-joiner" \
-    && pass "primary scope finds sidecar-only peer (role)" \
-    || fail "primary scope didn't find sidecar peer (got: $out)"
-  echo "$out" | grep -q "bio: *in general only" \
-    && pass "primary scope finds sidecar-only peer (bio)" \
-    || fail "primary scope sidecar peer missing bio (got: $out)"
-
-  # ── from primary scope: sidecar HOST should resolve ────────────────
-  # shost is the host of the sidecar's #general — primary scope's
-  # host_name is phost, so the lookup must walk into sidecar's config
-  # and read host_identity from there.
-  out=$(AIRC_HOME="$primary" "$AIRC" whois shost 2>&1)
-  echo "$out" | grep -q "role: *general-host" \
-    && pass "primary scope finds sidecar host via cross-scope walk" \
-    || fail "primary scope didn't resolve sidecar host (got: $out)"
-
-  # ── from primary scope: primary host still resolves (no regression)
-  out=$(AIRC_HOME="$primary" "$AIRC" whois phost 2>&1)
-  echo "$out" | grep -q "role: *primary-host" \
-    && pass "primary scope still resolves primary host (no regression)" \
-    || fail "primary host lookup regressed (got: $out)"
-
-  # ── from primary scope: unknown peer still graceful ────────────────
-  out=$(AIRC_HOME="$primary" "$AIRC" whois ghost-zzz 2>&1 || true)
-  echo "$out" | grep -q "no record for 'ghost-zzz'" \
-    && pass "unknown peer still 404s after walking all scopes" \
-    || fail "unknown peer error message regressed (got: $out)"
-
-  # ── from sidecar scope: same merged view (operator perspective) ────
-  out=$(AIRC_HOME="$sidecar" "$AIRC" whois phost 2>&1)
-  echo "$out" | grep -q "role: *primary-host" \
-    && pass "sidecar scope finds primary host (symmetric walk)" \
-    || fail "sidecar scope didn't resolve primary host (got: $out)"
-
-  rm -rf /tmp/airc-it-wcs
-  cleanup_all
-}
-
-# ── Scenario: part_keeps_sidecar (IRC /part semantics) ──────────────────
-# Pre-fix: `airc part` from the primary scope called cmd_teardown which
-# (post-#122) cleaned both primary AND sidecar scopes — so leaving
-# #useideem also dropped #general unintentionally. IRC convention is
-# /part leaves ONE channel; the lobby should persist.
-#
-# Post-fix: cmd_part sets AIRC_TEARDOWN_PART_ONLY=1 before calling
-# cmd_teardown, which makes cmd_teardown skip the sidecar cleanup
-# block. Sidecar process + gist + scope dir survive.
-scenario_part_keeps_sidecar() {
-  section "part_keeps_sidecar: airc part leaves project room only, #general sidecar lives"
-  cleanup_all
-
-  local home1=/tmp/airc-it-pks/state
-  mkdir -p "$home1"
-
-  # Spawn primary with sidecar enabled (unset the global suppression).
-  ( cd /tmp/airc-it-pks && unset AIRC_NO_GENERAL && \
-      AIRC_HOME="$home1" AIRC_NAME=alpha AIRC_PORT=7575 \
-      AIRC_NO_DISCOVERY=1 \
-      "$AIRC" connect --no-gist --room pks-test-$$ > "$home1/out.log" 2>&1 & )
-  local i
-  for i in 1 2 3 4 5 6 7 8; do
-    sleep 1
-    [ -f "${home1}.general/airc.pid" ] && [ -f "$home1/airc.pid" ] && break
-  done
-
-  [ -f "$home1/airc.pid" ] && [ -f "${home1}.general/airc.pid" ] \
-    && pass "primary + sidecar both running pre-part" \
-    || { fail "setup failed (primary or sidecar didn't start)"; cleanup_all; return; }
-
-  # Capture sidecar's bash PID so we can verify it survives the part.
-  # airc.pid in host mode contains multiple space-separated PIDs on
-  # one line ($$ $PAIR_PID $_hb_pid_persisted); we want just the
-  # main bash PID for the kill -0 check.
-  local _sc_pid; _sc_pid=$(awk '{print $1; exit}' "${home1}.general/airc.pid" 2>/dev/null)
-
-  # Run airc part on primary scope.
-  AIRC_HOME="$home1" "$AIRC" part >/dev/null 2>&1
-  sleep 1
-
-  # Primary's pidfile should be gone (parted).
-  [ ! -f "$home1/airc.pid" ] \
-    && pass "primary scope airc.pid removed by part" \
-    || fail "primary airc.pid still present after part"
-
-  # CRITICAL: sidecar should still be running.
-  if [ -n "$_sc_pid" ] && kill -0 "$_sc_pid" 2>/dev/null; then
-    pass "sidecar PID $_sc_pid still alive after primary's part"
-  else
-    fail "sidecar killed by primary's part (pre-fix bug regressed)"
-  fi
-
-  [ -d "${home1}.general" ] && [ -f "${home1}.general/airc.pid" ] \
-    && pass "sidecar scope dir + pidfile still present after part" \
-    || fail "sidecar scope wiped by part"
-
-  # Sidecar's room_name should still say 'general'.
-  [ -f "${home1}.general/room_name" ] && [ "$(cat "${home1}.general/room_name" 2>/dev/null)" = "general" ] \
-    && pass "sidecar room_name preserved" \
-    || fail "sidecar room_name lost"
-
-  # Now full teardown should reap the sidecar.
-  AIRC_HOME="$home1" "$AIRC" teardown >/dev/null 2>&1
-  sleep 1
-
-  ! kill -0 "$_sc_pid" 2>/dev/null \
-    && pass "subsequent airc teardown DOES reap the sidecar (full kill semantic preserved)" \
-    || fail "sidecar survived even airc teardown — over-skip bug"
-
-  rm -rf /tmp/airc-it-pks
-  cleanup_all
-}
-
-# ── Scenario: part_persists (issue #136) ───────────────────────────────
-# Pre-fix: /part #general left the lobby for the session, but the next
-# `airc join` auto-respawned the sidecar — your /part was useless.
-# Persistence converts /part from session-action to durable preference.
-#
-# Post-fix: cmd_part records the parted room in primary scope's
-# parted_rooms array. spawn_general_sidecar_if_wanted reads that list
-# on bootstrap and skips spawn for any room in it. `airc join --general`
-# clears "general" from parted_rooms (explicit re-opt-in).
-scenario_part_persists() {
-  section "part_persists: /part is sticky across sessions (issue #136)"
-  cleanup_all
-
-  # NOTE: fixture path basename starts with "." so _primary_scope_for sees
-  # a leading-dot scope (the real-world layout is $repo/.airc, not 'state').
-  # vhsm-d1f4 caught a regression in PR #144 e2e where _primary_scope_for's
-  # regex over-stripped '.airc' to '' and silently routed _clear_parted_room
-  # to a bogus path. Earlier fixture used 'state'/'state.general' which
-  # never exercised the leading-dot code path. Switching to '.airc' /
-  # '.airc.general' so the test matches production layout.
-  local home1=/tmp/airc-it-pp/.airc
-  mkdir -p "$home1"
-
-  # ── Phase 1: primary + sidecar both up ─────────────────────────────
-  ( cd /tmp/airc-it-pp && unset AIRC_NO_GENERAL && \
-      AIRC_HOME="$home1" AIRC_NAME=alpha AIRC_PORT=7585 \
-      AIRC_NO_DISCOVERY=1 \
-      "$AIRC" connect --no-gist --room pp-room-$$ > "$home1/out.log" 2>&1 & )
-  local i
-  for i in 1 2 3 4 5 6 7 8; do
-    sleep 1
-    [ -f "${home1}.general/airc.pid" ] && [ -f "$home1/airc.pid" ] && break
-  done
-  [ -f "$home1/airc.pid" ] && [ -f "${home1}.general/airc.pid" ] \
-    && pass "phase 1: primary + sidecar both running" \
-    || { fail "phase 1: setup failed"; cleanup_all; rm -rf /tmp/airc-it-pp; return; }
-
-  # parted_rooms should be absent or empty in primary config now.
-  local before; before=$(python3 -c "
-import json
-try: print(' '.join(json.load(open('$home1/config.json')).get('parted_rooms', []) or []))
-except Exception: print('')
-" 2>/dev/null)
-  [ -z "$before" ] \
-    && pass "phase 1: primary config has empty parted_rooms initially" \
-    || fail "phase 1: parted_rooms unexpectedly populated (got: $before)"
-
-  # ── Phase 2: /part the sidecar — should write parted_rooms ─────────
-  AIRC_HOME="${home1}.general" "$AIRC" part >/dev/null 2>&1
-  sleep 1
-
-  local after; after=$(python3 -c "
-import json
-try: print(' '.join(json.load(open('$home1/config.json')).get('parted_rooms', []) or []))
-except Exception: print('')
-" 2>/dev/null)
-  [ "$after" = "general" ] \
-    && pass "phase 2: /part wrote 'general' to primary parted_rooms" \
-    || fail "phase 2: parted_rooms missing 'general' (got: '$after')"
-
-  # Full teardown to reset between phases (sidecar already gone from /part).
-  AIRC_HOME="$home1" "$AIRC" teardown >/dev/null 2>&1
-  sleep 1
-
-  # ── Phase 3: bootstrap again — sidecar must NOT spawn ──────────────
-  ( cd /tmp/airc-it-pp && unset AIRC_NO_GENERAL && \
-      AIRC_HOME="$home1" AIRC_NAME=alpha AIRC_PORT=7586 \
-      AIRC_NO_DISCOVERY=1 \
-      "$AIRC" connect --no-gist --room pp-room-$$ > "$home1/out2.log" 2>&1 & )
-  for i in 1 2 3 4 5 6 7 8; do
-    sleep 1
-    [ -f "$home1/airc.pid" ] && break
-  done
-
-  [ -f "$home1/airc.pid" ] \
-    && pass "phase 3: primary respawned" \
-    || { fail "phase 3: primary failed to come up"; cleanup_all; rm -rf /tmp/airc-it-pp; return; }
-
-  # The sidecar pidfile should NOT exist (was parted, persisted).
-  # Wait a couple seconds for any stray sidecar spawn before asserting.
-  sleep 2
-  [ ! -f "${home1}.general/airc.pid" ] \
-    && pass "phase 3: sidecar does NOT auto-respawn (parted_rooms honored)" \
-    || fail "phase 3: sidecar respawned despite /part persistence"
-
-  # The "previously parted" notice should be in the output.
-  grep -q "previously parted" "$home1/out2.log" 2>/dev/null \
-    && pass "phase 3: 'previously parted' notice surfaced to user" \
-    || fail "phase 3: silent skip — notice missing from output (would surprise users)"
-
-  # Tear down primary before phase 4.
-  AIRC_HOME="$home1" "$AIRC" teardown >/dev/null 2>&1
-  sleep 1
-
-  # ── Phase 4: --general flag clears parted state and respawns sidecar
-  ( cd /tmp/airc-it-pp && unset AIRC_NO_GENERAL && \
-      AIRC_HOME="$home1" AIRC_NAME=alpha AIRC_PORT=7587 \
-      AIRC_NO_DISCOVERY=1 \
-      "$AIRC" connect --no-gist --room pp-room-$$ --general > "$home1/out3.log" 2>&1 & )
-  for i in 1 2 3 4 5 6 7 8; do
-    sleep 1
-    [ -f "${home1}.general/airc.pid" ] && [ -f "$home1/airc.pid" ] && break
-  done
-
-  [ -f "${home1}.general/airc.pid" ] \
-    && pass "phase 4: --general flag restored sidecar" \
-    || fail "phase 4: --general didn't respawn sidecar"
-
-  local cleared; cleared=$(python3 -c "
-import json
-try: print(' '.join(json.load(open('$home1/config.json')).get('parted_rooms', []) or []))
-except Exception: print('')
-" 2>/dev/null)
-  [ -z "$cleared" ] \
-    && pass "phase 4: --general cleared parted_rooms (round-trip works)" \
-    || fail "phase 4: parted_rooms still has stale entries (got: '$cleared')"
-
-  AIRC_HOME="$home1" "$AIRC" teardown >/dev/null 2>&1
-  sleep 1
-  rm -rf /tmp/airc-it-pp
-  cleanup_all
-}
-
-# ── Scenario: away (IRC /away alias) ───────────────────────────────────
-# IRC convention: /away <msg> marks user as away with status, /away
-# (no arg) clears it. airc away wraps `airc identity set --status` so
-# every IRC verb in the README table has a direct CLI form.
 scenario_away() {
   section "away: IRC /away alias for identity set --status"
   cleanup_all
@@ -2760,10 +2310,19 @@ scenario_platform_adapters() {
   # statement and either die ("Unknown command") or print cmd_help.
   # Extract just the marked adapter section into a temp file we can
   # safely source.
-  local _adapters_extract; _adapters_extract=$(mktemp -t airc-it-pa.XXXXXX)
-  awk '/^# ── Platform adapters/,/^# ── End platform adapters/' "$AIRC" > "$_adapters_extract"
+  # Phase 3 (#152): adapters live in lib/airc_bash/platform_adapters.sh,
+  # sourced by airc at startup. The test bash directly sources that file
+  # — no awk extraction needed any more.
+  local _airc_lib_dir; _airc_lib_dir=$(cd "$(dirname "$AIRC")/lib" 2>/dev/null && pwd)
+  local _adapters_file="$_airc_lib_dir/airc_bash/platform_adapters.sh"
+  if [ ! -f "$_adapters_file" ]; then
+    fail "platform_adapters.sh not found at $_adapters_file"
+    return
+  fi
   _adapter_call() {
-    bash -c "source '$_adapters_extract'; $*"
+    AIRC_PYTHON="${AIRC_PYTHON:-python3}" \
+    PYTHONPATH="${_airc_lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
+    bash -c "source '$_adapters_file'; export AIRC_PYTHON='${AIRC_PYTHON:-python3}'; $*"
   }
 
   # ── proc_children ──
@@ -2868,7 +2427,36 @@ time.sleep(30)
   # automatically (no special simulation needed).
   echo "  (proc_children fallback exercised for real on platforms without pgrep — see Windows runs)"
 
-  rm -f "$_adapters_extract"
+  # ── iso_to_epoch ──
+  # Single adapter replacing the BSD/GNU date split that used to live at
+  # 3 callsites (heartbeat parse, _format_relative_time, _is_stale).
+  # Same fixed timestamp + arithmetic check on the result keeps the
+  # assertion deterministic regardless of which date flavor wins.
+  # 2026-01-15T12:34:56Z = 1768480496 (UTC epoch seconds; computed via
+  # python3 -c "import datetime; print(int(datetime.datetime(2026,1,15,12,34,56,tzinfo=datetime.timezone.utc).timestamp()))").
+  local _epoch_known
+  _epoch_known=$(_adapter_call "iso_to_epoch '2026-01-15T12:34:56Z'" 2>/dev/null)
+  [ "$_epoch_known" = "1768480496" ] \
+    && pass "iso_to_epoch: known timestamp parses to expected epoch" \
+    || fail "iso_to_epoch: parse mismatch (expected 1768480496, got '$_epoch_known')"
+
+  # Empty input → empty output (callers test for empty to skip stale check)
+  local _epoch_empty
+  _epoch_empty=$(_adapter_call "iso_to_epoch ''" 2>/dev/null)
+  [ -z "$_epoch_empty" ] \
+    && pass "iso_to_epoch: empty input → empty output (graceful)" \
+    || fail "iso_to_epoch: empty input returned '$_epoch_empty' (should be empty)"
+
+  # Garbage input → empty output (no crash, no false epoch)
+  local _epoch_bad
+  _epoch_bad=$(_adapter_call "iso_to_epoch 'not-a-timestamp'" 2>/dev/null)
+  [ -z "$_epoch_bad" ] \
+    && pass "iso_to_epoch: garbage input → empty (no false-positive epoch)" \
+    || fail "iso_to_epoch: garbage parsed to '$_epoch_bad' (should be empty)"
+
+  # _adapters_extract no longer used post-Phase-3 (the file is sourced
+  # from its real location in lib/airc_bash/); nothing to clean up.
+  :
   cleanup_all
 }
 
@@ -2895,17 +2483,26 @@ case "$MODE" in
   send_dead_monitor_dies) scenario_send_dead_monitor_dies ;;
   connect_after_kill_recovers) scenario_connect_after_kill_recovers ;;
   general_sidecar_default) scenario_general_sidecar_default ;;
-  send_room_flag) scenario_send_room_flag ;;
-  peers_cross_scope) scenario_peers_cross_scope ;;
-  whois_cross_scope) scenario_whois_cross_scope ;;
-  part_keeps_sidecar) scenario_part_keeps_sidecar ;;
-  part_persists) scenario_part_persists ;;
   away) scenario_away ;;
   list) scenario_list ;;
   quit) scenario_quit ;;
   platform_adapters) scenario_platform_adapters ;;
-  all)          scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown; scenario_resilience; scenario_reconnect; scenario_queue; scenario_status; scenario_auth_failure; scenario_room; scenario_events; scenario_get_host; scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat; scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope; scenario_send_dead_monitor_dies; scenario_connect_after_kill_recovers; scenario_general_sidecar_default; scenario_send_room_flag; scenario_peers_cross_scope; scenario_whois_cross_scope; scenario_part_keeps_sidecar; scenario_part_persists; scenario_away; scenario_list; scenario_quit; scenario_platform_adapters ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|send_room_flag|peers_cross_scope|whois_cross_scope|part_keeps_sidecar|part_persists|away|list|quit|platform_adapters|all]"; exit 2 ;;
+  ""|all)
+    # Default = run everything. The peers_cross_scope + whois_cross_scope
+    # scenarios were removed in PR #239 (sidecar walk semantics deleted
+    # in Phase 2B.3); their lines in this all-list and case-dispatch
+    # got swept along, which left this whole \`all)\` branch missing —
+    # CI no-arg invocation hit *) and exit 2.
+    scenario_tabs; scenario_scope; scenario_reminder; scenario_teardown
+    scenario_resilience; scenario_reconnect; scenario_queue; scenario_status
+    scenario_auth_failure; scenario_room; scenario_events; scenario_get_host
+    scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat
+    scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope
+    scenario_send_dead_monitor_dies; scenario_connect_after_kill_recovers
+    scenario_general_sidecar_default; scenario_away
+    scenario_list; scenario_quit; scenario_platform_adapters
+    ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|all]"; exit 2 ;;
 esac
 
 echo
