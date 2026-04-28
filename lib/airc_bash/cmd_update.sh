@@ -103,9 +103,11 @@ cmd_update() {
   # connect that's been running since BEFORE this update is still
   # executing the old version. We can't auto-restart safely (would
   # interrupt active SSH sessions), so we print a loud, action-shaped
-  # warning ONLY when a monitor is actually running in the current
-  # scope. Silent when nothing is running.
-  if [ -f "$AIRC_WRITE_DIR/airc.pid" ]; then
+  # warning ONLY when (a) a monitor is actually running AND (b) the
+  # SHA actually advanced. Skipping (b) was a false-positive bug in
+  # the original #235 — running `airc update` when nothing changed
+  # told the user to bounce for nothing. Self-caught 2026-04-28.
+  if [ "$before" != "$after" ] && [ -f "$AIRC_WRITE_DIR/airc.pid" ]; then
     local _pid; _pid=$(awk '{print $1; exit}' "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null)
     if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
       echo ""
