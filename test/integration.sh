@@ -2760,10 +2760,19 @@ scenario_platform_adapters() {
   # statement and either die ("Unknown command") or print cmd_help.
   # Extract just the marked adapter section into a temp file we can
   # safely source.
-  local _adapters_extract; _adapters_extract=$(mktemp -t airc-it-pa.XXXXXX)
-  awk '/^# ── Platform adapters/,/^# ── End platform adapters/' "$AIRC" > "$_adapters_extract"
+  # Phase 3 (#152): adapters live in lib/airc_bash/platform_adapters.sh,
+  # sourced by airc at startup. The test bash directly sources that file
+  # — no awk extraction needed any more.
+  local _airc_lib_dir; _airc_lib_dir=$(cd "$(dirname "$AIRC")/lib" 2>/dev/null && pwd)
+  local _adapters_file="$_airc_lib_dir/airc_bash/platform_adapters.sh"
+  if [ ! -f "$_adapters_file" ]; then
+    fail "platform_adapters.sh not found at $_adapters_file"
+    return
+  fi
   _adapter_call() {
-    bash -c "source '$_adapters_extract'; $*"
+    AIRC_PYTHON="${AIRC_PYTHON:-python3}" \
+    PYTHONPATH="${_airc_lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
+    bash -c "source '$_adapters_file'; export AIRC_PYTHON='${AIRC_PYTHON:-python3}'; $*"
   }
 
   # ── proc_children ──
@@ -2868,7 +2877,36 @@ time.sleep(30)
   # automatically (no special simulation needed).
   echo "  (proc_children fallback exercised for real on platforms without pgrep — see Windows runs)"
 
-  rm -f "$_adapters_extract"
+  # ── iso_to_epoch ──
+  # Single adapter replacing the BSD/GNU date split that used to live at
+  # 3 callsites (heartbeat parse, _format_relative_time, _is_stale).
+  # Same fixed timestamp + arithmetic check on the result keeps the
+  # assertion deterministic regardless of which date flavor wins.
+  # 2026-01-15T12:34:56Z = 1768480496 (UTC epoch seconds; computed via
+  # python3 -c "import datetime; print(int(datetime.datetime(2026,1,15,12,34,56,tzinfo=datetime.timezone.utc).timestamp()))").
+  local _epoch_known
+  _epoch_known=$(_adapter_call "iso_to_epoch '2026-01-15T12:34:56Z'" 2>/dev/null)
+  [ "$_epoch_known" = "1768480496" ] \
+    && pass "iso_to_epoch: known timestamp parses to expected epoch" \
+    || fail "iso_to_epoch: parse mismatch (expected 1768480496, got '$_epoch_known')"
+
+  # Empty input → empty output (callers test for empty to skip stale check)
+  local _epoch_empty
+  _epoch_empty=$(_adapter_call "iso_to_epoch ''" 2>/dev/null)
+  [ -z "$_epoch_empty" ] \
+    && pass "iso_to_epoch: empty input → empty output (graceful)" \
+    || fail "iso_to_epoch: empty input returned '$_epoch_empty' (should be empty)"
+
+  # Garbage input → empty output (no crash, no false epoch)
+  local _epoch_bad
+  _epoch_bad=$(_adapter_call "iso_to_epoch 'not-a-timestamp'" 2>/dev/null)
+  [ -z "$_epoch_bad" ] \
+    && pass "iso_to_epoch: garbage input → empty (no false-positive epoch)" \
+    || fail "iso_to_epoch: garbage parsed to '$_epoch_bad' (should be empty)"
+
+  # _adapters_extract no longer used post-Phase-3 (the file is sourced
+  # from its real location in lib/airc_bash/); nothing to clean up.
+  :
   cleanup_all
 }
 
