@@ -2829,18 +2829,27 @@ JSON
 }
 
 cmd_rename() {
-  local new_name="${1:-}"
-  # Intercept help flags BEFORE sanitization — otherwise `--help` looks like a
-  # valid name (all chars are in [a-z0-9-]) and gets written into config.json.
-  case "$new_name" in
-    ""|-h|--help)
-      echo "Usage: airc rename <new-name>"
-      echo "  Renames this identity and broadcasts [rename] to paired peers."
-      [ -z "$new_name" ] && exit 1 || exit 0
-      ;;
-  esac
-  # Reject leading dash so no flag-shaped string can ever become an identity.
-  case "$new_name" in -*) die "Name must not start with '-' (got '$new_name')" ;; esac
+  # Parse flags. --no-propagate is the recursion guard for sibling-scope
+  # propagation (#179): when cmd_rename recurses into `airc rename` for
+  # each sibling scope, it passes --no-propagate so the sub-call does
+  # its own scope's work without re-recursing into us.
+  local no_propagate=0
+  local new_name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-propagate) no_propagate=1; shift ;;
+      -h|--help|"")
+        echo "Usage: airc rename <new-name>"
+        echo "  Renames this identity and broadcasts [rename] to paired peers."
+        echo "  --no-propagate    skip sibling-scope propagation (internal — used during recursion)"
+        [ -z "${1:-}" ] && exit 1 || exit 0 ;;
+      -*) die "Unknown flag: $1 (try: airc rename --help)" ;;
+      *)
+        [ -n "$new_name" ] && die "rename takes one name (got '$new_name' and '$1')"
+        new_name="$1"; shift ;;
+    esac
+  done
+  [ -z "$new_name" ] && { echo "Usage: airc rename <new-name>"; exit 1; }
   # Sanitize: lowercase, replace non-[a-z0-9-] with '-', collapse runs of
   # dashes, strip leading/trailing dashes, then cap. The post-sanitization
   # leading-dash strip matters because input like `.foo` becomes `-foo`
@@ -2863,20 +2872,62 @@ cmd_rename() {
     return
   fi
 
-  "$AIRC_PYTHON" -c "
-import json
-c = json.load(open('$CONFIG'))
-c['name'] = '$new_name'
-json.dump(c, open('$CONFIG', 'w'), indent=2)
-"
+  # Phase 1: write the new name into THIS scope's config (the truth-
+  # layer effect for this scope). Goes through airc_core.config rather
+  # than an inline-python heredoc — the heredoc was quoting-fragile
+  # (would have broken on a name containing a single quote — currently
+  # safe because the sanitizer keeps names in [a-z0-9-], but a sharp
+  # edge in code that's about to recurse).
+  "$AIRC_PYTHON" -m airc_core.config set_name --config "$CONFIG" --name "$new_name"
   echo "  Renamed: $old_name → $new_name"
 
-  # Broadcast the rename. Include a stable `host` field so receivers can
-  # find THIS peer's record even if their name-keyed lookup would miss
-  # (e.g. a prior rename marker got dropped; their peer file for us
-  # still sits under an older name). host is immutable per machine+user.
+  # Phase 2: propagate the config write to sibling scopes BEFORE
+  # broadcasting (#179 — vhsm-d1f4 + ideem-local-4bef caught 2026-04-28
+  # that nick rename only updated the current scope's config, leaving
+  # any sidecar to broadcast under the OLD name).
+  #
+  # Order matters: configs first, broadcast last. cmd_send calls die()
+  # if the scope's monitor is down, and die() is `exit 1` (kills the
+  # whole shell, ignoring our `|| true`). Doing configs first means a
+  # broadcast failure after this point cannot prevent propagation.
+  #
+  # --no-propagate prevents the sub-call from recursing back into us.
+  # Each sibling scope writes its own config AND broadcasts in its own
+  # room's host_target.
+  if [ "$no_propagate" != "1" ]; then
+    local _primary _parent _primary_base _sibling
+    _primary=$(_primary_scope_for "$AIRC_WRITE_DIR")
+    _parent=$(dirname "$_primary")
+    _primary_base=$(basename "$_primary")
+    # Glob all sibling sidecars (named <primary>.<room>) — does NOT
+    # match the primary itself (which has no trailing `.<room>`).
+    for _sibling in "$_parent/$_primary_base".*; do
+      [ -d "$_sibling" ] || continue
+      [ -f "$_sibling/config.json" ] || continue
+      [ "$_sibling" = "$AIRC_WRITE_DIR" ] && continue
+      AIRC_HOME="$_sibling" "$0" rename --no-propagate "$new_name" \
+        || echo "  warn: rename propagation to $_sibling failed (exit $?)" >&2
+    done
+    # If WE are a sidecar (current scope != primary), also rename the
+    # primary scope.
+    if [ "$AIRC_WRITE_DIR" != "$_primary" ] && [ -f "$_primary/config.json" ]; then
+      AIRC_HOME="$_primary" "$0" rename --no-propagate "$new_name" \
+        || echo "  warn: rename propagation to primary $_primary failed (exit $?)" >&2
+    fi
+  fi
+
+  # Phase 3: best-effort broadcast in this scope. Include a stable
+  # `host` field so receivers can find THIS peer's record even if their
+  # name-keyed lookup would miss (a prior rename marker got dropped;
+  # their peer file for us still sits under an older name). host is
+  # immutable per machine+user.
+  #
+  # --internal tells cmd_send to append-and-return rather than die()
+  # when this scope's monitor is down. [rename] is informational;
+  # receivers heal via monitor_formatter's host-fallback on next
+  # traffic regardless of whether they saw this specific event.
   local my_host; my_host="$(whoami)@$(get_host)"
-  cmd_send "[rename] old=$old_name new=$new_name host=$my_host" >/dev/null 2>&1 || true
+  cmd_send --internal "[rename] old=$old_name new=$new_name host=$my_host" >/dev/null || true
 }
 
 # ── Identity (issue #34) ────────────────────────────────────────────────
@@ -3377,6 +3428,14 @@ cmd_send() {
   # loudly when the requested room isn't in the user's subscription set
   # — never silently broadcasts to the wrong place.
   local target_room=""
+  # --internal: best-effort send for internal informational broadcasts
+  # ([rename], etc.) where the monitor-down guard is the wrong UX. Append
+  # to the local log + return 0 even when the monitor isn't running.
+  # Receivers heal via monitor_formatter's host-fallback / next-traffic
+  # passes, so missing one event in a quiet scope isn't a correctness
+  # issue. Exposed as a flag (not an env var) so call sites are
+  # grep-able and the pattern matches the rest of the airc CLI surface.
+  local internal=0
   local positional=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -3384,6 +3443,9 @@ cmd_send() {
         target_room="${2:-}"
         [ -z "$target_room" ] && die "Usage: airc send --room <name> <message>"
         shift 2 ;;
+      --internal)
+        internal=1
+        shift ;;
       *) positional+=("$1"); shift ;;
     esac
   done
@@ -3588,6 +3650,22 @@ cmd_send() {
       fi
     fi
     if [ "$_monitor_alive" = "0" ]; then
+      # --internal callers (informational broadcasts: [rename], etc.):
+      # append to the local log silently and return 0. The monitor-down
+      # die is appropriate UX for explicit `airc send` — it surfaces
+      # "you're broadcasting to nobody" loudly so the user doesn't wait
+      # for a reply that can't arrive. For [rename] the broadcast is
+      # informational; receivers heal via monitor_formatter's host-
+      # fallback on next traffic, so noisily failing the rename in any
+      # scope whose monitor isn't running today (a perfectly normal
+      # multi-scope state) would give the rename feature a worse UX
+      # than no-propagation had.
+      if [ "$internal" = "1" ]; then
+        echo "$full_msg" >> "$MESSAGES"
+        date +%s > "$AIRC_WRITE_DIR/last_sent" 2>/dev/null
+        rm -f "$AIRC_WRITE_DIR/reminded" 2>/dev/null
+        return 0
+      fi
       echo "  Send NOT delivered — this scope's monitor isn't running." >&2
       echo "    scope:    $AIRC_WRITE_DIR" >&2
       echo "    identity: $my_name (host)" >&2

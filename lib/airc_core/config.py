@@ -44,6 +44,32 @@ def cmd_get_name(args) -> int:
     return 0
 
 
+def cmd_set_name(args) -> int:
+    """Atomically write the identity name into config.json.
+
+    Replaces the inline-Python heredoc that lived in cmd_rename. With
+    multi-scope rename propagation (#179), cmd_rename writes the name
+    into the primary scope AND every sidecar scope's config; doing it
+    via a single CLI call per scope keeps the write quoting-safe (the
+    heredoc inlined `$new_name` into a python string literal which
+    would have broken on names containing single quotes — fortunately
+    the rename sanitizer only allows [a-z0-9-] today, but the heredoc
+    pattern was a sharp edge).
+    """
+    try:
+        c = json.load(open(args.config))
+    except (OSError, ValueError) as e:
+        print(f"airc-config-set-error: cannot read {args.config}: {e}", file=sys.stderr)
+        return 1
+    c["name"] = args.name
+    try:
+        json.dump(c, open(args.config, "w"), indent=2)
+        return 0
+    except OSError as e:
+        print(f"airc-config-set-error: cannot write {args.config}: {e}", file=sys.stderr)
+        return 1
+
+
 def cmd_set_host_block(args) -> int:
     """Atomically write the post-handshake host_* fields into config.
 
@@ -92,6 +118,11 @@ def _build_parser() -> argparse.ArgumentParser:
     n = sub.add_parser("get_name")
     n.add_argument("--config", required=True)
     n.set_defaults(func=cmd_get_name)
+
+    sn = sub.add_parser("set_name")
+    sn.add_argument("--config", required=True)
+    sn.add_argument("--name", required=True)
+    sn.set_defaults(func=cmd_set_name)
 
     s = sub.add_parser("set_host_block")
     s.add_argument("--config", required=True)
