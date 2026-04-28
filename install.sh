@@ -297,9 +297,13 @@ tailscale_present() {
   # `tailscale` on PATH — `command -v tailscale` then lies about a missing
   # install and we'd brew-cask over the user's working Tailscale (sudo
   # prompt + kernel extension churn). Check the GUI bundle path too.
+  # Windows Git Bash: winget installs to Program Files; PATH may not
+  # include it in the current shell yet. Same trap.
   command -v tailscale >/dev/null 2>&1 && return 0
   [ -d /Applications/Tailscale.app ] && return 0
   [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ] && return 0
+  [ -x "/c/Program Files/Tailscale/tailscale.exe" ] && return 0
+  [ -x "/c/Program Files (x86)/Tailscale/tailscale.exe" ] && return 0
   return 1
 }
 
@@ -604,6 +608,13 @@ ts_post_check() {
     ts_bin="tailscale"
   elif [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then
     ts_bin="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+  elif [ -x "/c/Program Files/Tailscale/tailscale.exe" ]; then
+    # Windows Git Bash: winget installs Tailscale to Program Files;
+    # PATH may not yet include it in the current shell. Mirror
+    # airc.ps1's resolve_tailscale_bin candidates.
+    ts_bin="/c/Program Files/Tailscale/tailscale.exe"
+  elif [ -x "/c/Program Files (x86)/Tailscale/tailscale.exe" ]; then
+    ts_bin="/c/Program Files (x86)/Tailscale/tailscale.exe"
   fi
   [ -z "$ts_bin" ] && return 0   # not installed, nothing to nag about
 
@@ -621,9 +632,15 @@ ts_post_check() {
           else
             info "Sign in:  tailscale up"
           fi ;;
+        MINGW*|MSYS*|CYGWIN*)
+          info "Click the Tailscale tray icon to sign in, or run:  tailscale up"
+          info "Do this BEFORE 'airc join', or cross-machine joins will hang." ;;
         *)
           info "Sign in:  tailscale up   (follow the printed URL)" ;;
       esac
+      ;;
+    *)
+      # Logged in / running normally — silent (good UX, nothing to nag).
       ;;
   esac
 }
@@ -635,10 +652,20 @@ ts_post_check
 echo ""
 ok "Installed."
 echo ""
-echo "  Cross-LAN mesh? Tailscale is optional but recommended:"
-echo "    https://tailscale.com    (then: tailscale up)"
-echo "  Same-LAN mesh works without it; gist orchestration handles either."
-echo ""
+# Tailscale post-install message — be honest about installed state. The
+# pre-fix text always read "Tailscale is optional but recommended:
+# https://tailscale.com" even when winget had just installed it 30s ago,
+# which (per Joel 2026-04-28) reads as a fail. ts_post_check above
+# already nudges sign-in if installed-but-logged-out, so here we only
+# print the "go install it" line when tailscale really isn't present.
+if tailscale_present; then
+  :  # ts_post_check handled the messaging if relevant
+else
+  echo "  Cross-LAN mesh? Tailscale is optional (not installed):"
+  echo "    https://tailscale.com    (then: tailscale up)"
+  echo "  Same-LAN mesh works without it; gist orchestration handles either."
+  echo ""
+fi
 echo "  Next:"
 echo "    1. gh auth login -s gist          # one-time, browser flow"
 echo "    2. airc join                      # auto-#general (joins existing or hosts)"
