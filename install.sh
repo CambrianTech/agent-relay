@@ -758,6 +758,21 @@ ensure_prereqs() {
     if ! gh auth status >/dev/null 2>&1; then
       warn "gh CLI is not authenticated. Run once before 'airc join':"
       warn "    gh auth login -s gist"
+    else
+      # Wire gh's token into git's credential helper. Without this,
+      # every git-over-HTTPS op (gist fetch/push -- airc's substrate
+      # hot path) prompts the user for a password, repeatedly. gh ships
+      # with `gh auth git-credential` for exactly this purpose; the
+      # `gh auth setup-git` one-liner registers it in ~/.gitconfig.
+      # Idempotent (no-op if already configured), safe to always run.
+      # Joel hit this on 2026-04-28 — Windows install where gh was
+      # auth'd-in-keyring but git itself didn't know. Resulted in a
+      # GUI password popup every airc operation that touched a gist.
+      if ! git config --global --get-all credential.https://github.com.helper 2>/dev/null | grep -q 'gh auth git-credential'; then
+        if gh auth setup-git 2>/dev/null; then
+          info "  gh token wired into git credential helper (no more password popups for gist ops)"
+        fi
+      fi
     fi
   fi
 }
