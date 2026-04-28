@@ -233,19 +233,29 @@ _ensure_sshd_running() {
       # doesn't re-prompt or duplicate state.
       # DefaultShell = Git for Windows bash (#98). Without this, every
       # Windows airc HOST silently fails inbound `airc msg` from peers
-      # because the OpenSSH default shell is cmd.exe, which lacks `cat`,
-      # `>>`, and the rest of the POSIX vocabulary airc remote commands
-      # rely on. Locate bash.exe; idempotent registry write.
-      # Payload wraps work in Start-Transcript so we ALWAYS get a log
-       # file we can show the user — the elevated window auto-closes when
-       # the script ends and any red errors flash too fast to read (Joel
-       # 2026-04-28: "your powershell crashes. It has red all over but
-       # blinks for a half second so i have no idea"). Log lives at
-       # $env:TEMP\airc-install-elevated.log; bash side surfaces it
-       # below regardless of success/failure.
-      local _elevated_payload='
+      # because the OpenSSH default shell is cmd.exe.
+      #
+      # Why we write to a .ps1 file (Joel 2026-04-28): the payload was
+      # previously inlined as `... -ArgumentList '-NoProfile -Command
+      # "$_elevated_payload"'`, but the payload itself contains many
+      # double-quotes (PowerShell strings) and backslashes (registry
+      # paths), and those got mangled across four layers of quoting:
+      # bash double-quoted → powershell.exe outer -Command → Start-
+      # Process ArgumentList single-quoted → inner -Command double-
+      # quoted. Result: payload never parsed, elevated window opened
+      # with red errors, transcript never written, user saw nothing.
+      # Stage payload as a .ps1 file in $CLONE_DIR (which is guaranteed
+      # writable + is the canonical airc dir) and invoke via
+      # Start-Process -File. Zero-quoting passing.
+      local _elevated_ps1="$CLONE_DIR/install-elevated.ps1"
+      mkdir -p "$CLONE_DIR"
+      cat > "$_elevated_ps1" <<'PSPAYLOAD'
 $ErrorActionPreference = "Stop";
-$logPath = Join-Path $env:TEMP "airc-install-elevated.log";
+# Use [System.IO.Path]::GetTempPath() not $env:TEMP — when this script
+# is called via `powershell.exe -File` from a Git Bash invocation, env
+# inheritance is normal and TEMP resolves to Windows user temp; but
+# being explicit is safer and avoids surprises if env is filtered.
+$logPath = Join-Path ([System.IO.Path]::GetTempPath()) "airc-install-elevated.log";
 Start-Transcript -Path $logPath -Force | Out-Null;
 try {
   Write-Host "==> OpenSSH.Server capability";
@@ -291,7 +301,17 @@ try {
   Stop-Transcript | Out-Null;
 }
 exit $global:LASTEXITCODE;
-'
+PSPAYLOAD
+
+      # Translate the .ps1 path to Windows form for Start-Process -File.
+      local _elevated_ps1_win
+      if command -v cygpath >/dev/null 2>&1; then
+        _elevated_ps1_win=$(cygpath -w "$_elevated_ps1" 2>/dev/null)
+      else
+        # Fallback: /c/Users/foo/.airc-src/install-elevated.ps1 → C:\Users\foo\.airc-src\install-elevated.ps1
+        _elevated_ps1_win=$(printf '%s' "$_elevated_ps1" | sed 's|^/\([a-z]\)/|\U\1:\\\\|; s|/|\\\\|g')
+      fi
+
       case "$_state" in
         Running)
           ok "sshd running (Windows OpenSSH.Server)"
@@ -309,12 +329,12 @@ exit $global:LASTEXITCODE;
           else
             _ps_log_bash=$(printf '%s' "$_ps_log_win" | sed 's|\\|/|g; s|^\([A-Za-z]\):|/\L\1|')
           fi
-          info "  elevated log: $_ps_log_win  (also at $_ps_log_bash from Git Bash)"
-          # Run the elevated payload. Start-Process exits 0 if it could
-          # launch the elevated process; the payload's own exit code is
-          # what we care about (it explicitly `exit $LASTEXITCODE`s based
-          # on try/catch).
-          powershell.exe -NoProfile -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile -Command \"$_elevated_payload\"'" 2>&1 \
+          info "  elevated payload: $_elevated_ps1_win"
+          info "  elevated log:     $_ps_log_win  (also at $_ps_log_bash from Git Bash)"
+          # Run the elevated payload via -File (no quoting hell). Start-
+          # Process -Wait propagates the elevated process's exit code.
+          # The payload itself `exit $LASTEXITCODE`s based on try/catch.
+          powershell.exe -NoProfile -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','$_elevated_ps1_win')" 2>&1 \
             || _elev_rc=$?
           # Always dump the transcript — success or failure, the user
           # sees what happened. If transcript file is missing, the
