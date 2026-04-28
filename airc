@@ -4876,10 +4876,19 @@ _daemon_airc_path() {
   fi
 }
 
-# The scope the daemon will run under. If AIRC_HOME is set at install time,
-# that's recorded in the unit/plist so future starts use the same scope.
+# The scope the daemon will run under. Mirrors detect_scope() (line 135)
+# so `airc daemon install` from a project dir captures THAT dir's
+# .airc as the daemon's scope -- otherwise the daemon spawns a monitor
+# pointed at $HOME/.airc (empty / wrong room) while the user's actual
+# join state lives at $cwd/.airc. Joel 2026-04-28: "lol obv if it
+# worked you would have a monitor and be online. FAIL" -- caught the
+# scope mismatch on continuum-b69f's box.
 _daemon_scope() {
-  echo "${AIRC_HOME:-$HOME/.airc}"
+  if [ -n "${AIRC_HOME:-}" ]; then
+    echo "$AIRC_HOME"
+  else
+    echo "$(pwd -P)/.airc"
+  fi
 }
 
 # Returns 0 if the autostart daemon (launchd / systemd unit) is installed
