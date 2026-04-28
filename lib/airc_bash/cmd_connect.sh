@@ -1207,10 +1207,15 @@ JSON
             local _hb_room="$room_name"
             local _hb_created="$_now"
             local _hb_machine_id="$_machine_id"
+            local _hb_messages="$MESSAGES"
+            local _hb_stderr="$AIRC_WRITE_DIR/heartbeat.stderr"
+            local _hb_state_dir="$AIRC_WRITE_DIR"
             (
               # Detach from job control so a parent SIGINT kills the
               # whole tree but normal exit lets us race the trap to
               # delete the gist first.
+              local _consec_fail=0
+              local _max_consec_fail="${AIRC_HB_MAX_FAIL:-3}"
               while sleep "$_heartbeat_sec"; do
                 # Parent died (PID gone) → exit. This is the kill -9
                 # / OOM / sleep recovery path.
@@ -1247,7 +1252,33 @@ JSON
 )
                 local _hb_tmp; _hb_tmp=$(mktemp -t airc-hb.XXXXXX)
                 printf '%s\n' "$_hb_payload" > "$_hb_tmp"
-                gh gist edit "$_gist_id" "$_hb_tmp" >/dev/null 2>&1 || true
+                # Capture stderr to a state file (per never-swallow-errors
+                # rule). Track consecutive failures: after N in a row,
+                # detect active-host-evicted (#224) and self-heal — kill
+                # the parent so the daemon (or user) respawns into a
+                # fresh discovery + rejoin path.
+                if gh gist edit "$_gist_id" "$_hb_tmp" >/dev/null 2>"$_hb_stderr"; then
+                  _consec_fail=0
+                else
+                  _consec_fail=$((_consec_fail + 1))
+                  if [ "$_consec_fail" -ge "$_max_consec_fail" ]; then
+                    local _stderr_tail; _stderr_tail=$(tail -1 "$_hb_stderr" 2>/dev/null | tr -d '\n' | tr '"' "'")
+                    local _evict_marker; _evict_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[HOST EVICTED] heartbeat to gist %s failed %d consecutive times — self-healing. last stderr: %s"}' \
+                      "$_hb_now" "$_hb_room" "$_gist_id" "$_consec_fail" "${_stderr_tail:-<empty>}")
+                    echo "$_evict_marker" >> "$_hb_messages" 2>/dev/null || true
+                    # Drop the stale local-state files so the parent's
+                    # next discovery re-elects via _mesh_find.
+                    rm -f "$_hb_state_dir/host_gist_id" "$_hb_state_dir/room_gist_id" 2>/dev/null
+                    # SIGTERM the parent — its EXIT trap will reap
+                    # children + clean up. With daemon installed,
+                    # launchd/systemd respawns; without daemon, the
+                    # parent's reconnect loop catches the EXIT and the
+                    # user gets a clean "host evicted" log line in
+                    # messages.jsonl.
+                    kill -TERM "$_hb_parent_pid" 2>/dev/null
+                    exit 0
+                  fi
+                fi
                 rm -f "$_hb_tmp"
               done
             ) &
