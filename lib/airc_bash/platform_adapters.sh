@@ -128,18 +128,10 @@ file_size() {
 # a top-level decision genuinely depends on platform (e.g. Tailscale.app
 # launching on macOS).
 detect_platform() {
-  local s; s=$(uname -s 2>/dev/null)
-  case "$s" in
-    Darwin)               echo macos ;;
-    Linux)
-      # Detect WSL via /proc/version content (kernel string contains
-      # 'microsoft' or 'WSL'). Bare Linux otherwise.
-      if grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
-        echo wsl
-      else
-        echo linux
-      fi ;;
-    MINGW*|MSYS*|CYGWIN*) echo windows-bash ;;
+  case "$(uname -s 2>/dev/null)" in
+    Darwin)               echo darwin ;;
+    Linux)                grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null && echo wsl || echo linux ;;
+    MINGW*|MSYS*|CYGWIN*) echo windows ;;
     *)                    echo unknown ;;
   esac
 }

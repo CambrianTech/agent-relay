@@ -199,7 +199,7 @@ _doctor_probe_gh_auth() {
 _doctor_probe_sshd() {
   local plat; plat=$(detect_platform)
   case "$plat" in
-    macos)
+    darwin)
       # macOS Remote Login = launchd-managed sshd. Detect WITHOUT sudo:
       #   - `launchctl list` (user scope) does NOT show system services
       #     like com.openssh.sshd, so the user-scope probe always misses.
@@ -232,7 +232,7 @@ _doctor_probe_sshd() {
       printf "         Fix (RHEL/Fedora):    sudo dnf install openssh-server && sudo systemctl enable --now sshd\n"
       return 1
       ;;
-    windows-bash)
+    windows)
       # powershell.exe is the canonical PS launcher in Git Bash. Some
       # boxes also ship pwsh.exe (PS Core); prefer powershell.exe for
       # broadest reach since OpenSSH service control works in both.

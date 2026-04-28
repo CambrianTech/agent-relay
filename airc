@@ -4747,24 +4747,6 @@ cmd_daemon() {
   esac
 }
 
-# Detect the OS: darwin / linux / wsl / unknown.
-_daemon_os() {
-  case "$(uname -s)" in
-    Darwin) echo "darwin" ;;
-    Linux)
-      # WSL2 detection — systemd may or may not be enabled; we still treat
-      # it as linux (user must have [boot] systemd=true in wsl.conf).
-      if grep -qi 'microsoft\|wsl' /proc/version 2>/dev/null; then
-        echo "wsl"
-      else
-        echo "linux"
-      fi
-      ;;
-    MINGW*|MSYS*|CYGWIN*) echo "windows" ;;
-    *) echo "unknown" ;;
-  esac
-}
-
 # Resolve the absolute path to airc binary that should run under the daemon.
 # install.sh symlinks $HOME/.local/bin/airc → $AIRC_DIR/airc; we want the
 # real path so a future `airc update` (which mutates $AIRC_DIR/airc in
@@ -4801,7 +4783,7 @@ _daemon_scope() {
 # (daemon present) or just kill the relay silently (no daemon — they
 # need to `airc join` again).
 _daemon_installed() {
-  local os; os=$(_daemon_os)
+  local os; os=$(detect_platform)
   case "$os" in
     darwin)
       [ -f "$HOME/Library/LaunchAgents/com.cambriantech.airc.plist" ] && return 0 ;;
@@ -4814,7 +4796,7 @@ _daemon_installed() {
 }
 
 cmd_daemon_install() {
-  local os; os=$(_daemon_os)
+  local os; os=$(detect_platform)
   local airc_bin; airc_bin=$(_daemon_airc_path)
   local scope; scope=$(_daemon_scope)
   mkdir -p "$scope"
@@ -5038,7 +5020,7 @@ UNIT
 }
 
 cmd_daemon_uninstall() {
-  local os; os=$(_daemon_os)
+  local os; os=$(detect_platform)
   case "$os" in
     darwin)
       local plist_path="$HOME/Library/LaunchAgents/com.cambriantech.airc.plist"
@@ -5083,7 +5065,7 @@ cmd_daemon_uninstall() {
 }
 
 cmd_daemon_status() {
-  local os; os=$(_daemon_os)
+  local os; os=$(detect_platform)
   case "$os" in
     darwin)
       local plist_path="$HOME/Library/LaunchAgents/com.cambriantech.airc.plist"
