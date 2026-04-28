@@ -1244,16 +1244,42 @@ monitor() {
         local saved_room=""
         [ -f "$AIRC_WRITE_DIR/room_name" ] && saved_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
         if [ -n "$saved_room" ]; then
+          # Surface to STDOUT (not stderr-only) so Monitor-style consumers
+          # that watch stdout (Claude Code Monitor tool, simple `airc join
+          # | tee log`, integration tests) actually see WHY the mesh just
+          # went dark. The pre-fix behavior printed to stderr only and
+          # consumers got a silent disconnect — Joel's #184 (high severity,
+          # violates CLAUDE.md "never swallow errors").
+          #
+          # Daemon-aware: detect whether `airc daemon install` has been
+          # run on this OS; if yes, the exit-99 will trigger self-heal
+          # via launchd/systemd. If NOT, exit 99 is just death — tell
+          # the user explicitly so they can `airc join` again or install
+          # the daemon for auto-recovery.
+          local _daemon_present=0
+          if _daemon_installed >/dev/null 2>&1; then
+            _daemon_present=1
+          fi
           echo ""
-          echo "  ⚠  Host of #${saved_room} dead for $consecutive_timeouts consecutive cycles" >&2
-          echo "  ⚠  Exiting airc connect — daemon restart will trigger self-heal" >&2
-          echo "  ⚠  (per the no-claude-left-behind protocol — first agent back becomes new host)" >&2
+          if [ "$_daemon_present" = "1" ]; then
+            echo "airc: mesh disconnected — host of #${saved_room} dead $consecutive_timeouts cycles; daemon restart will self-heal"
+            echo "  ⚠  Host of #${saved_room} dead for $consecutive_timeouts consecutive cycles" >&2
+            echo "  ⚠  Exiting airc connect — daemon restart will trigger self-heal" >&2
+            echo "  ⚠  (per the no-claude-left-behind protocol — first agent back becomes new host)" >&2
+          else
+            echo "airc: mesh disconnected — host of #${saved_room} dead $consecutive_timeouts cycles; NO DAEMON installed, restart with: airc join"
+            echo "airc:   (for auto-recovery on disconnect: airc daemon install)"
+            echo "  ⚠  Host of #${saved_room} dead for $consecutive_timeouts consecutive cycles" >&2
+            echo "  ⚠  Exiting airc connect — NO DAEMON installed; rerun 'airc join' to reconnect" >&2
+            echo "  ⚠  Install daemon for auto-recovery: airc daemon install" >&2
+          fi
           # Specific exit code so postmortems can tell why we left. launchd /
           # systemd Restart=always treat any non-zero exit as restart-worthy.
           exit 99
         else
           # Legacy 1:1 invite scope. Don't auto-promote, but warn the user
           # so they can manually re-pair if the host is genuinely gone.
+          echo "airc: $consecutive_timeouts consecutive watchdog timeouts on legacy invite scope — host may be down"
           echo "  ⚠  $consecutive_timeouts consecutive watchdog timeouts on legacy invite scope — host may be down" >&2
           consecutive_timeouts=0   # reset to avoid spamming
         fi
@@ -1266,6 +1292,18 @@ monitor() {
       tail_pos="-n +$(($(cat "$offset_file" 2>/dev/null || echo 0) + 1))"
       sleep 1
     done
+    # `while true` should be unreachable here — the body has no break /
+    # exit / return, the pipeline is `|| true`-guarded, and there's no
+    # signal trap in this scope that returns from the loop. Yet Joel
+    # observed the host monitor silently disappearing on canary dee3b6c
+    # (#184 part 2). If we ever fall through, leave a loud diagnostic
+    # on both stdout (Monitor-visible) and stderr (log-visible) so the
+    # next person debugging has something to grep — silent exit was
+    # the original sin per CLAUDE.md "never swallow errors".
+    echo "airc: host monitor loop exited unexpectedly — restart with: airc join"
+    echo "  ⚠  host monitor while-true loop fell through; this should be impossible." >&2
+    echo "  ⚠  If you see this, capture the airc connect stdout/stderr + report on #184." >&2
+    exit 99
   fi
 }
 
@@ -4733,6 +4771,22 @@ _daemon_airc_path() {
 # that's recorded in the unit/plist so future starts use the same scope.
 _daemon_scope() {
   echo "${AIRC_HOME:-$HOME/.airc}"
+}
+
+# Returns 0 if the autostart daemon (launchd / systemd unit) is installed
+# on this OS, 1 otherwise. Used by the monitor escalation banner (#184)
+# to tell the user whether the upcoming exit-99 will trigger self-heal
+# (daemon present) or just kill the relay silently (no daemon — they
+# need to `airc join` again).
+_daemon_installed() {
+  local os; os=$(_daemon_os)
+  case "$os" in
+    darwin)
+      [ -f "$HOME/Library/LaunchAgents/com.cambriantech.airc.plist" ] && return 0 ;;
+    linux|wsl)
+      [ -f "$HOME/.config/systemd/user/airc.service" ] && return 0 ;;
+  esac
+  return 1
 }
 
 cmd_daemon_install() {
