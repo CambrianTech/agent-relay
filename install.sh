@@ -236,20 +236,36 @@ _ensure_sshd_running() {
       # because the OpenSSH default shell is cmd.exe, which lacks `cat`,
       # `>>`, and the rest of the POSIX vocabulary airc remote commands
       # rely on. Locate bash.exe; idempotent registry write.
+      # Payload wraps work in Start-Transcript so we ALWAYS get a log
+       # file we can show the user — the elevated window auto-closes when
+       # the script ends and any red errors flash too fast to read (Joel
+       # 2026-04-28: "your powershell crashes. It has red all over but
+       # blinks for a half second so i have no idea"). Log lives at
+       # $env:TEMP\airc-install-elevated.log; bash side surfaces it
+       # below regardless of success/failure.
       local _elevated_payload='
 $ErrorActionPreference = "Stop";
+$logPath = Join-Path $env:TEMP "airc-install-elevated.log";
+Start-Transcript -Path $logPath -Force | Out-Null;
 try {
+  Write-Host "==> OpenSSH.Server capability";
   $cap = Get-WindowsCapability -Online -Name "OpenSSH.Server*";
-  if ($cap.State -ne "Installed") { Add-WindowsCapability -Online -Name $cap.Name | Out-Null }
+  if ($cap.State -ne "Installed") { Add-WindowsCapability -Online -Name $cap.Name | Out-Null; Write-Host "  installed: $($cap.Name)" } else { Write-Host "  already installed" }
+  Write-Host "==> HNS port-22 reservation";
   $reg = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\hns\State" -Name "EnableExcludedPortRange" -ErrorAction SilentlyContinue).EnableExcludedPortRange;
-  if ($reg -ne 0) { reg add "HKLM\SYSTEM\CurrentControlSet\Services\hns\State" /v "EnableExcludedPortRange" /d 0 /f | Out-Null }
+  if ($reg -ne 0) { reg add "HKLM\SYSTEM\CurrentControlSet\Services\hns\State" /v "EnableExcludedPortRange" /d 0 /f | Out-Null; Write-Host "  HNS auto-exclusion disabled" } else { Write-Host "  HNS auto-exclusion already off" }
   $excl = netsh int ipv4 show excludedportrange protocol=tcp | Out-String;
-  if ($excl -notmatch "(?m)^\s*22\s+22\b") { netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1 | Out-Null }
+  if ($excl -notmatch "(?m)^\s*22\s+22\b") { netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1 | Out-Null; Write-Host "  port 22 reserved in static excluded-port-range" } else { Write-Host "  port 22 already reserved" }
+  Write-Host "==> Firewall rule";
   if (-not (Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -DisplayName "OpenSSH Server (sshd)" -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
-  }
+    New-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -DisplayName "OpenSSH Server (sshd)" -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null;
+    Write-Host "  inbound TCP/22 rule created"
+  } else { Write-Host "  inbound TCP/22 rule already exists" }
+  Write-Host "==> sshd service";
   Start-Service sshd;
   Set-Service -Name sshd -StartupType Automatic;
+  Write-Host "  started + auto-start on boot";
+  Write-Host "==> DefaultShell registry";
   $bashCandidates = @("C:\Program Files\Git\bin\bash.exe", "C:\Program Files (x86)\Git\bin\bash.exe", "$env:USERPROFILE\AppData\Local\Programs\Git\bin\bash.exe");
   $bashPath = $null;
   foreach ($c in $bashCandidates) { if (Test-Path $c) { $bashPath = $c; break } }
@@ -258,11 +274,23 @@ try {
     $cur = (Get-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -ErrorAction SilentlyContinue).DefaultShell;
     if ($cur -ne $bashPath) {
       if (-not (Test-Path "HKLM:\SOFTWARE\OpenSSH")) { New-Item -Path "HKLM:\SOFTWARE\OpenSSH" -Force | Out-Null }
-      New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -Value $bashPath -PropertyType String -Force | Out-Null
-    }
-  }
+      New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -Value $bashPath -PropertyType String -Force | Out-Null;
+      Write-Host "  DefaultShell -> $bashPath"
+    } else { Write-Host "  DefaultShell already $bashPath" }
+  } else { Write-Host "  WARN: bash.exe not found; DefaultShell left at OS default (cmd.exe). Install Git for Windows + re-run." }
+  Write-Host "";
   Write-Host "airc: sshd ready (capability + HNS + firewall + service auto-start + DefaultShell=bash)";
-} catch { Write-Host "airc-elevated-error: $_" }
+  $global:LASTEXITCODE = 0;
+} catch {
+  Write-Host "";
+  Write-Host "airc-elevated-error: $_";
+  Write-Host "Stack trace:";
+  Write-Host $_.ScriptStackTrace;
+  $global:LASTEXITCODE = 1;
+} finally {
+  Stop-Transcript | Out-Null;
+}
+exit $global:LASTEXITCODE;
 '
       case "$_state" in
         Running)
@@ -272,14 +300,54 @@ try {
         Stopped|StopPending|StartPending|Paused|"")
           info "Configuring OpenSSH.Server + HNS port-22 reservation (UAC prompt incoming)."
           info "  airc joiners need this to ssh-tail your messages.jsonl when you host."
+          # Log path lives at %TEMP%\airc-install-elevated.log on Windows.
+          # Compute its bash-form so we can dump it below.
+          local _ps_log_win _ps_log_bash _elev_rc=0
+          _ps_log_win=$(powershell.exe -NoProfile -Command "Join-Path \$env:TEMP 'airc-install-elevated.log'" 2>/dev/null | tr -d '\r')
+          if command -v cygpath >/dev/null 2>&1; then
+            _ps_log_bash=$(cygpath -u "$_ps_log_win" 2>/dev/null || echo "")
+          else
+            _ps_log_bash=$(printf '%s' "$_ps_log_win" | sed 's|\\|/|g; s|^\([A-Za-z]\):|/\L\1|')
+          fi
+          info "  elevated log: $_ps_log_win  (also at $_ps_log_bash from Git Bash)"
+          # Run the elevated payload. Start-Process exits 0 if it could
+          # launch the elevated process; the payload's own exit code is
+          # what we care about (it explicitly `exit $LASTEXITCODE`s based
+          # on try/catch).
           powershell.exe -NoProfile -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile -Command \"$_elevated_payload\"'" 2>&1 \
-            && ok "OpenSSH.Server installed + started + HNS port-22 reserved + auto-start." \
-            || warn "Self-elevation failed. Run in admin PowerShell:
-    Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
-    reg add HKLM\\SYSTEM\\CurrentControlSet\\Services\\hns\\State /v EnableExcludedPortRange /d 0 /f
-    netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1
-    Start-Service sshd
-    Set-Service -Name sshd -StartupType Automatic"
+            || _elev_rc=$?
+          # Always dump the transcript — success or failure, the user
+          # sees what happened. If transcript file is missing, the
+          # payload didn't even start (UAC denied / Start-Process
+          # itself failed).
+          if [ -n "$_ps_log_bash" ] && [ -f "$_ps_log_bash" ]; then
+            echo ""
+            info "─── elevated PowerShell output ───"
+            sed 's/^/    /' "$_ps_log_bash"
+            info "─── (end log; full file: $_ps_log_win) ───"
+            echo ""
+            # Detect failure inside the transcript even if Start-Process
+            # itself returned 0 (the elevated PS process could exit
+            # non-zero; Start-Process -Wait still propagates that, but
+            # check airc-elevated-error pattern as belt-and-suspenders).
+            if grep -q "airc-elevated-error:" "$_ps_log_bash"; then
+              _elev_rc=1
+            fi
+          else
+            warn "  Elevated transcript not written — UAC denied, or Start-Process failed."
+          fi
+          if [ "$_elev_rc" = "0" ]; then
+            ok "OpenSSH.Server installed + started + HNS port-22 reserved + auto-start + DefaultShell=bash."
+          else
+            warn "Elevated payload failed (exit $_elev_rc). See log above."
+            warn "Manual fix (admin PowerShell):"
+            warn "    Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0"
+            warn "    reg add HKLM\\SYSTEM\\CurrentControlSet\\Services\\hns\\State /v EnableExcludedPortRange /d 0 /f"
+            warn "    netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1"
+            warn "    Start-Service sshd"
+            warn "    Set-Service -Name sshd -StartupType Automatic"
+            warn "    New-ItemProperty -Path 'HKLM:\\SOFTWARE\\OpenSSH' -Name DefaultShell -Value 'C:\\Program Files\\Git\\bin\\bash.exe' -PropertyType String -Force"
+          fi
           ;;
         *)
           warn "sshd state unknown (Get-Service returned: '$_state'). Run airc doctor to diagnose."
@@ -294,16 +362,25 @@ try {
 
 tailscale_present() {
   # macOS GUI install puts Tailscale.app at /Applications without putting
-  # `tailscale` on PATH — `command -v tailscale` then lies about a missing
-  # install and we'd brew-cask over the user's working Tailscale (sudo
-  # prompt + kernel extension churn). Check the GUI bundle path too.
-  # Windows Git Bash: winget installs to Program Files; PATH may not
-  # include it in the current shell yet. Same trap.
+  # `tailscale` on PATH; Windows winget can install to Program Files OR
+  # LocalAppData (user scope) depending on package metadata. Probe many
+  # locations cheap-to-thorough.
   command -v tailscale >/dev/null 2>&1 && return 0
+  command -v tailscale.exe >/dev/null 2>&1 && return 0
   [ -d /Applications/Tailscale.app ] && return 0
   [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ] && return 0
   [ -x "/c/Program Files/Tailscale/tailscale.exe" ] && return 0
   [ -x "/c/Program Files (x86)/Tailscale/tailscale.exe" ] && return 0
+  # Last-resort Windows probe: `where.exe` searches every PATH+PATHEXT
+  # location and catches winget user-scope installs (%LOCALAPPDATA%\...)
+  # that aren't in any of the hard-coded paths above. Joel's catch
+  # 2026-04-28: post-install said "Tailscale is optional but recommended"
+  # even though winget had just installed it to user scope; bash's
+  # `command -v tailscale` didn't honor PATHEXT, none of the hard-coded
+  # paths matched, so we lied to the user.
+  if command -v where.exe >/dev/null 2>&1; then
+    where.exe tailscale.exe >/dev/null 2>&1 && return 0
+  fi
   return 1
 }
 
