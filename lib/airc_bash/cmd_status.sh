@@ -44,6 +44,21 @@ cmd_status() {
     echo "  identity:    $my_name (hosting on port ${my_port})"
   fi
 
+  # Channel participation (#149). Post-Phase-2B.3 the canonical source
+  # is config.json's subscribed_channels; first element is the default
+  # channel that cmd_send stamps. Display the list with a marker for
+  # the default.
+  local _channels; _channels=$("$AIRC_PYTHON" -m airc_core.config read_channels --config "$CONFIG" 2>/dev/null)
+  if [ -n "$_channels" ]; then
+    local _default; _default=$(echo "$_channels" | head -1)
+    local _rest; _rest=$(echo "$_channels" | tail -n +2 | tr '\n' ',' | sed 's/,$//' | sed 's/,/, #/g')
+    if [ -n "$_rest" ]; then
+      echo "  channels:    #${_default} (default), #${_rest}"
+    else
+      echo "  channels:    #${_default}"
+    fi
+  fi
+
   # Monitor alive? Read the scope's pidfile — cmd_connect writes its own PID
   # there. pgrep'd descendants (python listener, tail loop) should be children
   # of that PID. If the main PID is gone, the monitor is down.
