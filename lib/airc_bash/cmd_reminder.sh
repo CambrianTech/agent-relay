@@ -18,6 +18,13 @@ cmd_reminder() {
   local reminder_file="$AIRC_WRITE_DIR/reminder"
 
   case "$arg" in
+    -h|--help)
+      echo "Usage:"
+      echo "  airc reminder              show current state"
+      echo "  airc reminder <seconds>    set interval (e.g. 300)"
+      echo "  airc reminder pause        pause reminders without losing the saved interval"
+      echo "  airc reminder off          disable reminders entirely"
+      return 0 ;;
     off|0)
       rm -f "$reminder_file"
       echo "  Reminders off."
@@ -39,6 +46,16 @@ cmd_reminder() {
       fi
       ;;
     *)
+      # Defense in depth: only accept positive-integer seconds. Same
+      # anti-pattern as cmd_channel — without this, `airc reminder
+      # --foo` (any flag-shaped token we don't enumerate) would be
+      # written into the reminder file as the interval.
+      case "$arg" in
+        ''|*[!0-9]*)
+          echo "  Refusing to set reminder interval to '$arg' — must be a positive integer (seconds)." >&2
+          echo "  Try: airc reminder --help" >&2
+          return 2 ;;
+      esac
       echo "$arg" > "$reminder_file"
       echo "  Reminder every ${arg}s if no messages."
       ;;

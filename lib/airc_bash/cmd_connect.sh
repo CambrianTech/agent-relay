@@ -92,6 +92,22 @@ cmd_connect() {
   local positional=()
   while [ $# -gt 0 ]; do
     case "$1" in
+      -h|--help)
+        echo "Usage: airc connect [target] [flags]"
+        echo "  airc connect                   auto-discover mesh on your gh account"
+        echo "  airc connect <gist-id>         join via shared gist id (cross-account)"
+        echo "  airc connect <mnemonic>        join via humanhash phrase (same account)"
+        echo "  airc connect <invite-string>   join via inline invite (legacy)"
+        echo ""
+        echo "Flags:"
+        echo "  --room <name>                  set channel intent (auto-scoped from cwd if absent)"
+        echo "  --room-only <name>             --room + --no-general"
+        echo "  --no-room                      disable substrate entirely (legacy 1:1 invite)"
+        echo "  --no-general                   keep project room, skip #general subscription"
+        echo "  --general                      re-opt-in to #general after a prior /part"
+        echo "  --no-gist                      don't publish/discover via gh gist (test mode)"
+        echo "  --no-tailscale                 skip Tailscale even if installed"
+        return 0 ;;
       --gist|-gist) use_gist=1; shift ;;
       --no-gist|-no-gist) use_gist=0; shift ;;
       --room|-room) room_name="${2:-general}"; use_room=1; room_explicit=1; shift 2 ;;
