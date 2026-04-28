@@ -1161,16 +1161,26 @@ monitor() {
   # Wrapped in a reconnect loop so a dropped SSH session / transient
   # filesystem error doesn't permanently stop notifications. A brief sleep
   # between retries avoids hot-looping if the remote is down.
-  # Start position for tail: resume from saved offset if we've run before.
-  # This prevents [rename] markers that arrived during a teardown window
-  # from being skipped on reconnect. First-ever run starts at current EOF
-  # (no history replay).
+  # Start position for tail: resume from saved offset if we've run before
+  # AND the offset is meaningful (positive integer). This prevents
+  # [rename] markers that arrived during a teardown window from being
+  # skipped on reconnect, but does NOT replay full history.
+  #
+  # Bug found by continuum-b741 2026-04-28: an empty monitor_offset
+  # file (or one containing "0") expanded to `tail -n +1` which is
+  # "print from line 1" = the entire file. Joiners saw days of
+  # accumulated host history dumped on connect. Now we treat empty /
+  # zero / non-numeric as "no usable offset" → -n 0 (current EOF).
   local offset_file="$AIRC_WRITE_DIR/monitor_offset"
-  local tail_pos
+  local tail_pos="-n 0"
   if [ -f "$offset_file" ]; then
-    tail_pos="-n +$(($(cat "$offset_file" 2>/dev/null || echo 0) + 1))"
-  else
-    tail_pos="-n 0"
+    local _saved_offset; _saved_offset=$(cat "$offset_file" 2>/dev/null | tr -d '[:space:]')
+    case "$_saved_offset" in
+      ''|0|*[!0-9]*) ;; # empty / zero / non-numeric → keep -n 0
+      *)
+        tail_pos="-n +$((_saved_offset + 1))"
+        ;;
+    esac
   fi
 
   if [ -n "$host_target" ]; then
