@@ -243,59 +243,252 @@ _ensure_sshd_running() {
        # blinks for a half second so i have no idea"). Log lives at
        # $env:TEMP\airc-install-elevated.log; bash side surfaces it
        # below regardless of success/failure.
-      local _elevated_payload='
-$ErrorActionPreference = "Stop";
-# Use [System.IO.Path]::GetTempPath() not $env:TEMP — when called from
-# Git Bash, the inherited TEMP env var can be the bash-side /tmp, not
-# the Windows user temp directory. GetTempPath() asks the OS directly
-# (resolves to %LOCALAPPDATA%\Temp on Windows) regardless of the env.
+      # Stage payload as a .ps1 file in $CLONE_DIR (Joel + continuum-b69f
+      # 2026-04-28). Pre-fix: payload was inlined as
+      #   ... -ArgumentList '-NoProfile -Command "$_elevated_payload"'
+      # but the payload itself contains many "" (PowerShell strings) and
+      # \\ (registry paths). Four layers of escaping (bash-double, ps1-
+      # outer-Command, Start-Process-ArgumentList-single, inner-Command-
+      # double) silently mangled the payload — PowerShell never parsed it,
+      # the elevated window opened, ran nothing, exited silently, no
+      # transcript ever written. continuum verified the .ps1 file approach
+      # writes a clean transcript every time.
+      local _elevated_ps1="$CLONE_DIR/install-elevated.ps1"
+      mkdir -p "$CLONE_DIR"
+      # NOTE: keep this heredoc ASCII-only. PowerShell 5.1 reads BOMless
+      # .ps1 files as the system codepage (cp1252 on most Windows). A
+      # UTF-8 em-dash (0xE2 0x80 0x94) ends in byte 0x94, which in
+      # cp1252 is RIGHT-DOUBLE-QUOTATION-MARK -- the parser sees it as
+      # a closing string quote and the rest of the file fails to parse.
+      # We also add a UTF-8 BOM below as defense-in-depth, AND the bash
+      # side runs a parse-check pass before invoking elevation so any
+      # parser error fails loud (no silent .ps1 launch).
+      cat > "$_elevated_ps1" <<'PSPAYLOAD'
 $logPath = Join-Path ([System.IO.Path]::GetTempPath()) "airc-install-elevated.log";
 Start-Transcript -Path $logPath -Force | Out-Null;
-try {
-  Write-Host "==> OpenSSH.Server capability";
-  $cap = Get-WindowsCapability -Online -Name "OpenSSH.Server*";
-  if ($cap.State -ne "Installed") { Add-WindowsCapability -Online -Name $cap.Name | Out-Null; Write-Host "  installed: $($cap.Name)" } else { Write-Host "  already installed" }
-  Write-Host "==> HNS port-22 reservation";
-  $reg = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\hns\State" -Name "EnableExcludedPortRange" -ErrorAction SilentlyContinue).EnableExcludedPortRange;
-  if ($reg -ne 0) { reg add "HKLM\SYSTEM\CurrentControlSet\Services\hns\State" /v "EnableExcludedPortRange" /d 0 /f | Out-Null; Write-Host "  HNS auto-exclusion disabled" } else { Write-Host "  HNS auto-exclusion already off" }
-  $excl = netsh int ipv4 show excludedportrange protocol=tcp | Out-String;
-  if ($excl -notmatch "(?m)^\s*22\s+22\b") { netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1 | Out-Null; Write-Host "  port 22 reserved in static excluded-port-range" } else { Write-Host "  port 22 already reserved" }
-  Write-Host "==> Firewall rule";
-  if (-not (Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -DisplayName "OpenSSH Server (sshd)" -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null;
-    Write-Host "  inbound TCP/22 rule created"
-  } else { Write-Host "  inbound TCP/22 rule already exists" }
-  Write-Host "==> sshd service";
-  Start-Service sshd;
-  Set-Service -Name sshd -StartupType Automatic;
-  Write-Host "  started + auto-start on boot";
-  Write-Host "==> DefaultShell registry";
-  $bashCandidates = @("C:\Program Files\Git\bin\bash.exe", "C:\Program Files (x86)\Git\bin\bash.exe", "$env:USERPROFILE\AppData\Local\Programs\Git\bin\bash.exe");
-  $bashPath = $null;
-  foreach ($c in $bashCandidates) { if (Test-Path $c) { $bashPath = $c; break } }
-  if (-not $bashPath) { $cmd = Get-Command bash.exe -ErrorAction SilentlyContinue; if ($cmd) { $bashPath = $cmd.Source } }
-  if ($bashPath) {
-    $cur = (Get-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -ErrorAction SilentlyContinue).DefaultShell;
-    if ($cur -ne $bashPath) {
-      if (-not (Test-Path "HKLM:\SOFTWARE\OpenSSH")) { New-Item -Path "HKLM:\SOFTWARE\OpenSSH" -Force | Out-Null }
-      New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -Value $bashPath -PropertyType String -Force | Out-Null;
-      Write-Host "  DefaultShell -> $bashPath"
-    } else { Write-Host "  DefaultShell already $bashPath" }
-  } else { Write-Host "  WARN: bash.exe not found; DefaultShell left at OS default (cmd.exe). Install Git for Windows + re-run." }
-  Write-Host "";
-  Write-Host "airc: sshd ready (capability + HNS + firewall + service auto-start + DefaultShell=bash)";
-  $global:LASTEXITCODE = 0;
-} catch {
-  Write-Host "";
-  Write-Host "airc-elevated-error: $_";
-  Write-Host "Stack trace:";
-  Write-Host $_.ScriptStackTrace;
-  $global:LASTEXITCODE = 1;
-} finally {
-  Stop-Transcript | Out-Null;
+
+# No global try/catch, no $ErrorActionPreference = "Stop". Each step
+# runs plainly; if a cmdlet errors, PowerShell prints the error to the
+# transcript and execution continues. Bash side detects success/failure
+# from Get-Service sshd post-check, not from this script's exit code.
+# Anything wrapped in try/catch below is wrapped because the failure is
+# *expected* and *recoverable* (e.g. ssh-keygen missing -> warn + skip).
+
+Write-Host "==> OpenSSH.Server capability";
+$cap = Get-WindowsCapability -Online -Name "OpenSSH.Server*";
+if ($cap.State -ne "Installed") {
+  Add-WindowsCapability -Online -Name $cap.Name | Out-Null;
+  Write-Host "  installed: $($cap.Name)"
+} else { Write-Host "  already installed" }
+
+Write-Host "==> SSH host keys (regenerate so ACLs are clean from birth)";
+# Why "delete + regenerate" instead of "fix ACLs on existing":
+#
+# Verified on continuum-b69f's box (2026-04-28): even after icacls reset
+# to SYSTEM + Administrators only, sshd still refused with error:5
+# (ACCESS_DENIED) and error:13 (ACL fails OpenSSH secure_permission_check).
+# Apparently icacls /grant alone isn't enough -- the file owner and the
+# combination of explicit + inherited ACEs has to match what OpenSSH's
+# secure_permission_check expects, which is fragile.
+#
+# Cleaner approach: nuke any existing host keys, then run ssh-keygen -A
+# from this elevated SYSTEM-context process. ssh-keygen -A sets the
+# right ACLs at creation time (owner = SYSTEM, ACEs = SYSTEM + Admins).
+# Since this is install-time setup and the host hasn't published any
+# fingerprint yet, regenerating is safe -- nobody is trusting these
+# keys yet from a client.
+$sshKeygen = Join-Path $env:WINDIR "System32\OpenSSH\ssh-keygen.exe";
+if (-not (Test-Path $sshKeygen)) {
+  Write-Host "  WARN: ssh-keygen.exe not found at $sshKeygen -- sshd will fail to start"
+} else {
+  $sshDir = 'C:\ProgramData\ssh';
+  if (-not (Test-Path $sshDir)) { New-Item -Path $sshDir -ItemType Directory -Force | Out-Null }
+  $existing = Get-ChildItem (Join-Path $sshDir 'ssh_host_*') -ErrorAction SilentlyContinue
+  if ($existing) {
+    Write-Host "  removing $($existing.Count) existing host key file(s)"
+    $existing | Remove-Item -Force -ErrorAction SilentlyContinue
+  }
+  & $sshKeygen -A 2>&1 | ForEach-Object { Write-Host "  ssh-keygen: $_" }
+  # ssh-keygen -A on Windows leaves an ACE for the user who ran it
+  # (e.g. BIGMAMA\green:(M) for an admin elevation), even though that
+  # user is just the file creator. OpenSSH's secure_permission_check
+  # rejects any ACE that isn't owner / SYSTEM / Administrators -- so
+  # we strip the creator's ACE explicitly. Verified on continuum-b69f
+  # 2026-04-28: with regenerate alone, sshd kept failing with error 13
+  # (ACL secure_permission_check); with this strip, the ACL is just
+  # SYSTEM + Administrators and sshd accepts it.
+  # ssh-keygen -A leaves the file owner as the user who ran it
+  # (BIGMAMA\green even when running elevated). OpenSSH's
+  # secure_permission_check requires owner in {SYSTEM, Administrators,
+  # running sshd user}. Setting owner to SYSTEM is the safe default.
+  $me = (whoami).Trim()
+  $newKeys = Get-ChildItem (Join-Path $sshDir 'ssh_host_*_key') -ErrorAction SilentlyContinue
+  foreach ($k in $newKeys) {
+    icacls $k.FullName /setowner 'NT AUTHORITY\SYSTEM' 2>&1 | Out-Null
+    icacls $k.FullName /inheritance:r 2>&1 | Out-Null
+    icacls $k.FullName /grant 'NT AUTHORITY\SYSTEM:(F)' 'BUILTIN\Administrators:(F)' 2>&1 | Out-Null
+    icacls $k.FullName /remove:g $me 2>&1 | Out-Null
+  }
+  # Dump the post-fix ACL + OWNER on the rsa key so we can see in the
+  # transcript whether the result matches what sshd expects: owner must
+  # be SYSTEM or Administrators, ACEs must be only owner + SYSTEM + Admins.
+  $rsa = Join-Path $sshDir 'ssh_host_rsa_key'
+  if (Test-Path $rsa) {
+    Write-Host "  post-fix ACL on ssh_host_rsa_key:"
+    icacls $rsa 2>&1 | ForEach-Object { Write-Host "    $_" }
+    Write-Host "  post-fix OWNER on ssh_host_rsa_key: $((Get-Acl $rsa).Owner)"
+  }
 }
-exit $global:LASTEXITCODE;
-'
+
+Write-Host "==> SSH directory ACLs (C:\ProgramData\ssh + logs/)";
+# Per Microsoft KB on Error 1067 / Event 7034 (Oct 2024 Windows update
+# regression that became permanent in newer builds):
+#   "This issue occurs if the C:\ProgramData\ssh and C:\ProgramData\ssh\logs
+#    folders have incorrect permissions. The permissions might be too limited
+#    or too open. For example, the SYSTEM account or the Administrators group
+#    might not have write permissions. For a second example, regular users
+#    might have write or full control permissions."
+# https://learn.microsoft.com/en-us/troubleshoot/windows-server/system-management-components/error-1053-1067-7034-after-update-openssh-doesnt-start
+#
+# Required ACL on each folder:
+#   SYSTEM              : Full Control
+#   Administrators      : Full Control
+#   Authenticated Users : Read & execute (read-only, no write)
+# Owner: SYSTEM (not the user who created the folder).
+$sshDir = 'C:\ProgramData\ssh'
+$logsDir = Join-Path $sshDir 'logs'
+foreach ($d in @($sshDir, $logsDir)) {
+  if (-not (Test-Path $d)) { New-Item -Path $d -ItemType Directory -Force | Out-Null }
+  icacls $d /setowner 'NT AUTHORITY\SYSTEM' 2>&1 | Out-Null
+  icacls $d /inheritance:r 2>&1 | Out-Null
+  icacls $d /grant 'NT AUTHORITY\SYSTEM:(OI)(CI)(F)' 'BUILTIN\Administrators:(OI)(CI)(F)' 'NT AUTHORITY\Authenticated Users:(OI)(CI)(RX)' 2>&1 | Out-Null
+  Write-Host "  $d :"
+  icacls $d 2>&1 | Select-Object -First 5 | ForEach-Object { Write-Host "    $_" }
+}
+
+Write-Host "==> sshd dry-run (config + key load test)";
+# Run sshd -t from elevated context to surface the *real* reason sshd
+# is failing -- Start-Service sshd hides the underlying error behind a
+# generic "Failed to start service" message. -t exits non-zero with a
+# specific error message ("no hostkeys available", config syntax,
+# privilege separation user missing, etc.). Captures stderr too.
+$sshdExe = Join-Path $env:WINDIR "System32\OpenSSH\sshd.exe"
+if (Test-Path $sshdExe) {
+  $sshdTest = & $sshdExe -t 2>&1
+  $sshdTestExit = $LASTEXITCODE
+  if ($sshdTestExit -eq 0) {
+    Write-Host "  sshd -t: OK (exit 0)"
+  } else {
+    Write-Host "  sshd -t: FAILED (exit $sshdTestExit)";
+    $sshdTest | ForEach-Object { Write-Host "    $_" }
+  }
+}
+
+Write-Host "==> HNS port-22 reservation";
+$reg = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\hns\State" -Name "EnableExcludedPortRange" -ErrorAction SilentlyContinue).EnableExcludedPortRange;
+$regChanged = $false
+if ($reg -ne 0) {
+  reg add "HKLM\SYSTEM\CurrentControlSet\Services\hns\State" /v "EnableExcludedPortRange" /d 0 /f | Out-Null;
+  Write-Host "  HNS auto-exclusion disabled"
+  $regChanged = $true
+} else { Write-Host "  HNS auto-exclusion already off" }
+$excl = netsh int ipv4 show excludedportrange protocol=tcp | Out-String;
+if ($excl -notmatch "(?m)^\s*22\s+22\b") {
+  netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1 | Out-Null;
+  Write-Host "  port 22 reserved in static excluded-port-range"
+} else { Write-Host "  port 22 already reserved" }
+
+# Verify port 22 is actually claimable. If HNS has it reserved at a
+# layer below netsh-visible (Hyper-V/WSL2/Docker share dynamic port
+# ranges via HNS), a restart of the HNS service is the only way to
+# re-evaluate the reservation. Without this, netsh shows port 22
+# excluded but sshd-as-LocalSystem still gets EACCES on bind:
+#   sshd: error: Bind to port 22 on 0.0.0.0 failed: Permission denied.
+#   sshd: fatal: Cannot bind any address.
+# Verified on continuum-b69f 2026-04-28 in OpenSSH/Admin event log.
+$hns = Get-Service hns -ErrorAction SilentlyContinue
+if ($hns -and $hns.Status -eq 'Running') {
+  Write-Host "  restarting HNS service so port-22 reservation takes effect"
+  Restart-Service hns -Force -ErrorAction SilentlyContinue
+  Start-Sleep -Seconds 2
+  Write-Host "  HNS state: $((Get-Service hns).Status)"
+}
+
+Write-Host "==> Firewall rule (TCP/22 inbound)";
+if (-not (Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
+  New-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -DisplayName "OpenSSH Server (sshd)" -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null;
+  Write-Host "  inbound TCP/22 rule created"
+} else { Write-Host "  inbound TCP/22 rule already exists" }
+
+Write-Host "==> sshd service (start + auto-start on boot)";
+Start-Service sshd;
+Set-Service -Name sshd -StartupType Automatic;
+Write-Host "  Get-Service sshd: $((Get-Service sshd).Status)";
+
+Write-Host "==> DefaultShell registry (bash for joiners)";
+$bashCandidates = @("C:\Program Files\Git\bin\bash.exe", "C:\Program Files (x86)\Git\bin\bash.exe", "$env:USERPROFILE\AppData\Local\Programs\Git\bin\bash.exe");
+$bashPath = $null;
+foreach ($c in $bashCandidates) { if (Test-Path $c) { $bashPath = $c; break } }
+if (-not $bashPath) { $cmd = Get-Command bash.exe -ErrorAction SilentlyContinue; if ($cmd) { $bashPath = $cmd.Source } }
+if (-not $bashPath) {
+  Write-Host "  WARN: bash.exe not found; DefaultShell left at OS default. Install Git for Windows + re-run."
+} else {
+  $cur = (Get-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -ErrorAction SilentlyContinue).DefaultShell;
+  if ($cur -eq $bashPath) {
+    Write-Host "  DefaultShell already $bashPath"
+  } else {
+    if (-not (Test-Path "HKLM:\SOFTWARE\OpenSSH")) { New-Item -Path "HKLM:\SOFTWARE\OpenSSH" -Force | Out-Null }
+    New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -Value $bashPath -PropertyType String -Force | Out-Null;
+    Write-Host "  DefaultShell -> $bashPath"
+  }
+}
+
+Write-Host "";
+Write-Host "airc: elevated install steps complete";
+Stop-Transcript | Out-Null;
+exit 0;
+PSPAYLOAD
+
+      # Defense-in-depth: prepend a UTF-8 BOM so PowerShell 5.1 reads
+      # the .ps1 as UTF-8 (not cp1252). Heredoc is ASCII-only so this
+      # is just insurance for future edits.
+      if [ -f "$_elevated_ps1" ]; then
+        local _tmp_bom="$_elevated_ps1.bom"
+        printf '\xEF\xBB\xBF' > "$_tmp_bom"
+        cat "$_elevated_ps1" >> "$_tmp_bom"
+        mv "$_tmp_bom" "$_elevated_ps1"
+      fi
+
+      # Translate the .ps1 path to Windows form for Start-Process -File
+      # and the parse-check below.
+      local _elevated_ps1_win
+      if command -v cygpath >/dev/null 2>&1; then
+        _elevated_ps1_win=$(cygpath -w "$_elevated_ps1" 2>/dev/null)
+      else
+        # Fallback: /c/Users/foo/.airc-src/install-elevated.ps1 → C:\Users\foo\.airc-src\install-elevated.ps1
+        _elevated_ps1_win=$(printf '%s' "$_elevated_ps1" | sed 's|^/\([a-z]\)/|\U\1:\\\\|; s|/|\\\\|g')
+      fi
+
+      # Pre-flight parse-check: catch syntax errors in the staged .ps1
+      # BEFORE we trigger UAC. Without this, a parser error means the
+      # elevated window opens, fails to parse, blinks closed, no log
+      # is written, bash side reports "transcript not written" and the
+      # user has no idea what went wrong (Joel 2026-04-28: "we prefer
+      # parser issues to actually error" -- this is how we make them
+      # actually error). Parser errors here abort the install loud.
+      local _parse_errs
+      _parse_errs=$(powershell.exe -NoProfile -Command "
+        \$tokens = \$null; \$errors = \$null;
+        [System.Management.Automation.Language.Parser]::ParseFile('$_elevated_ps1_win', [ref]\$tokens, [ref]\$errors) | Out-Null;
+        if (\$errors) { \$errors | ForEach-Object { Write-Output \$_.ToString() } }
+      " 2>&1 | tr -d '\r')
+      if [ -n "$_parse_errs" ]; then
+        warn "Staged elevated payload has PARSE ERRORS -- aborting before UAC."
+        warn "  This is a bug in install.sh. File a bug w/ this output:"
+        printf '%s\n' "$_parse_errs" | sed 's/^/    /'
+        warn "  staged file: $_elevated_ps1_win"
+        return 1
+      fi
       case "$_state" in
         Running)
           ok "sshd running (Windows OpenSSH.Server)"
@@ -320,12 +513,14 @@ exit $global:LASTEXITCODE;
             # MSYS-style sed translation: 'C:\Users\...' → '/c/Users/...'
             _ps_log_bash=$(printf '%s' "$_ps_log_win" | sed 's|\\|/|g; s|^\([A-Za-z]\):|/\L\1|')
           fi
-          info "  elevated log: $_ps_log_win  (also at $_ps_log_bash from Git Bash)"
-          # Run the elevated payload. Start-Process exits 0 if it could
-          # launch the elevated process; the payload's own exit code is
-          # what we care about (it explicitly `exit $LASTEXITCODE`s based
-          # on try/catch).
-          powershell.exe -NoProfile -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile -Command \"$_elevated_payload\"'" 2>&1 \
+          info "  elevated payload: $_elevated_ps1_win"
+          info "  elevated log:     $_ps_log_win"
+          info "  (bash log path:   $_ps_log_bash)"
+          # Run the elevated payload via -File (no quoting hell). Start-
+          # Process -Wait propagates the elevated process's exit code.
+          # -ExecutionPolicy Bypass so the elevated PS doesn't refuse
+          # the unsigned .ps1.
+          powershell.exe -NoProfile -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','$_elevated_ps1_win')" 2>&1 \
             || _elev_rc=$?
           # Always dump the transcript — success or failure, the user
           # sees what happened. If transcript file is missing, the
@@ -347,10 +542,22 @@ exit $global:LASTEXITCODE;
           else
             warn "  Elevated transcript not written — UAC denied, or Start-Process failed."
           fi
-          if [ "$_elev_rc" = "0" ]; then
-            ok "OpenSSH.Server installed + started + HNS port-22 reserved + auto-start + DefaultShell=bash."
+          # Belt-and-suspenders: re-query sshd state from non-elevated PS
+          # (continuum-b69f 2026-04-28). If the elevated payload claimed
+          # exit 0 but sshd isn't actually Running, surface that — the
+          # silent-success-while-broken path was the worst version of
+          # this bug. The Get-Service call is cheap; doing it always
+          # is fine.
+          local _post_state
+          _post_state=$(powershell.exe -NoProfile -Command "(Get-Service sshd -ErrorAction SilentlyContinue).Status" 2>/dev/null | tr -d '\r ')
+          if [ "$_elev_rc" = "0" ] && [ "$_post_state" = "Running" ]; then
+            ok "OpenSSH.Server installed + sshd Running + HNS port-22 reserved + auto-start + DefaultShell=bash."
+          elif [ "$_elev_rc" = "0" ]; then
+            warn "Elevated payload exit 0 but sshd state is '$_post_state' — partial install."
+            warn "  Re-run install or check elevated log: $_ps_log_win"
+            _elev_rc=1
           else
-            warn "Elevated payload failed (exit $_elev_rc). See log above."
+            warn "Elevated payload failed (exit $_elev_rc, sshd state '$_post_state'). See log above."
             warn "Manual fix (admin PowerShell):"
             warn "    Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0"
             warn "    reg add HKLM\\SYSTEM\\CurrentControlSet\\Services\\hns\\State /v EnableExcludedPortRange /d 0 /f"
