@@ -348,35 +348,33 @@ cmd_connect() {
      [ "${AIRC_NO_DISCOVERY:-0}" != "1" ] && \
      command -v gh >/dev/null 2>&1; then
 
-    # ── Room discovery (the substrate path) ──────────────────────
-    # Match exact room name to avoid `airc room: general-test` colliding
-    # with `airc room: general`. Pick the most-recent if duplicates exist
-    # (stale hosts get re-elected on next reconnect when SSH fails).
-    if [ "$use_room" = "1" ]; then
-      _did_room_discovery=1
-      local _room_filter="airc room: ${room_name}\$"
-      local _room_candidates; _room_candidates=$(gh gist list --limit 50 2>/dev/null \
-        | awk -F'\t' -v re="$_room_filter" '$2 ~ re { print $1 "\t" $2 "\t" $4 }')
-      local _room_count; _room_count=$(printf '%s' "$_room_candidates" | grep -c . || true)
-      if [ "$_room_count" -ge 1 ]; then
-        # Most recent wins (gh gist list is reverse-chrono by update).
-        local _picked_id; _picked_id=$(printf '%s' "$_room_candidates" | head -1 | awk -F'\t' '{print $1}')
-        echo "  Found #${room_name} on your gh account → joining ($_picked_id)"
-        target="$_picked_id"
-        # fall through to gist resolver below — kind:room → invite handshake
-      else
-        echo "  No #${room_name} found on your gh account → becoming the host."
-        # Race against a concurrent host attempt is handled POST-publish
-        # (see "race-loser detection" near host_gist_id write below).
-        # Pre-publish recheck doesn't help — neither tab's gist is
-        # globally visible yet at this point.
-      fi
+    # ── Mesh discovery (singleton per gh account) ────────────────
+    # Architectural shift from the per-room model: ONE gist per gh
+    # account, description literal "airc mesh". Every `airc join` on
+    # the account converges on it. _mesh_find returns the singleton
+    # (oldest-by-created if multiple are present from a race).
+    #
+    # The --room flag still records the channel(s) this client wants
+    # to subscribe to (Phase 2 will route messages by channel), but it
+    # no longer drives gist discovery — every subscriber on the account
+    # converges on the same host.
+    _did_room_discovery=1
+    local _mesh_id; _mesh_id=$(_mesh_find)
+    if [ -n "$_mesh_id" ]; then
+      echo "  Found mesh on your gh account → joining ($_mesh_id)"
+      target="$_mesh_id"
+      # fall through to gist resolver below
+    else
+      echo "  No mesh found on your gh account → becoming the host."
+      # Race against a concurrent host attempt is handled POST-publish
+      # via _mesh_take_over (see host-publish path below).
     fi
 
-    # ── Legacy single-pair invite discovery (only if no room flow) ──
-    # Preserves the #38 behavior for users running with --no-general
-    # OR for room-mode users whose room discovery missed (we already
-    # set target in that case, so this block won't fire).
+    # ── Legacy single-pair invite discovery ──────────────────────
+    # Preserved for cross-account ad-hoc pairing where a friend on a
+    # DIFFERENT gh account shares an `airc invite for ...` gist id.
+    # Same-account discovery uses the mesh path above; this only
+    # fires when the user explicitly opted out of mesh + room.
     if [ -z "$target" ] && [ "$use_room" = "0" ]; then
       local _candidates; _candidates=$(gh gist list --limit 30 2>/dev/null \
         | awk -F'\t' '/airc invite for/ { print $1 "\t" $2 }')
@@ -432,7 +430,7 @@ cmd_connect() {
         _matched_gist_id="$_gid"
         break
       fi
-    done < <(gh gist list --limit 50 2>/dev/null | awk -F'\t' '/airc room:|airc invite for/ { print $1 "\t" $2 }')
+    done < <(gh gist list --limit 50 2>/dev/null | awk -F'\t' '/airc mesh|airc room:|airc invite for/ { print $1 "\t" $2 }')
     if [ -n "$_matched_gist_id" ]; then
       echo "  Resolved mnemonic '$target' → gist $_matched_gist_id"
       target="$_matched_gist_id"
@@ -565,14 +563,19 @@ cmd_connect() {
               resolved=$(printf '%s' "$raw_content" | jq -r '.invite // empty' 2>/dev/null \
                          | head -1 | tr -d '\r\n ')
               ;;
-            room)
-              # Persistent IRC-style channel (issue #39, the substrate).
-              # Same SSH-pair handshake as invite, but the gist persists
-              # so additional joiners can keep arriving. The room.invite
-              # field carries today's name@user@host:port#pubkey string.
+            mesh|room)
+              # Mesh: ONE persistent gist per gh account, shared across
+              # all subscribers. Same SSH-pair handshake as invite; the
+              # gist persists so additional joiners keep arriving. The
+              # `room` kind is the legacy per-room shape — handled here
+              # for back-compat with gists that haven't rolled to mesh
+              # yet (joiner can read either). The .invite field carries
+              # today's name@user@host:port#pubkey string.
               resolved=$(printf '%s' "$raw_content" | jq -r '.invite // empty' 2>/dev/null \
                          | head -1 | tr -d '\r\n ')
-              resolved_room_name=$(printf '%s' "$raw_content" | jq -r '.name // empty' 2>/dev/null)
+              # New mesh shape: .channels[]; legacy room shape: .name.
+              # Prefer channels[0] if present; fall back to .name.
+              resolved_room_name=$(printf '%s' "$raw_content" | jq -r '.channels[0] // .name // empty' 2>/dev/null)
               # Multi-address: capture host.addresses[] + host.machine_id
               # for the joiner's address-picker (peer_pick_address). Empty
               # if the host published a pre-multi-address envelope; in
@@ -615,7 +618,7 @@ cmd_connect() {
             *)
               # Unknown kind — fail loud. Old peers should reject
               # rather than silently misinterpret a future kind.
-              die "Gist uses unknown kind '$kind' (airc v$airc_ver). This receiver only supports 'invite' and 'room'. Update airc: 'airc update'."
+              die "Gist uses unknown kind '$kind' (airc v$airc_ver). This receiver only supports 'invite', 'room', and 'mesh'. Update airc: 'airc update'."
               ;;
           esac
         fi
@@ -682,7 +685,7 @@ cmd_connect() {
       # below. Two tabs concurrently deciding "host is stale" both
       # delete + publish, end up with split-brain — caught only by
       # running two tabs together.
-      _self_heal_stale_host "$_resolved_gist_id" "$resolved_room_name"
+      _self_heal_stale_host "$_resolved_gist_id"
     fi
 
     # Parse name@user@host[:port]#pubkey
@@ -844,7 +847,7 @@ except Exception:
         # competing gists for the same room name (split-brain race —
         # caught only by running two tabs against a stale gist
         # simultaneously, NOT by the integration test).
-        _self_heal_stale_host "$_resolved_gist_id" "$resolved_room_name"
+        _self_heal_stale_host "$_resolved_gist_id"
       fi
       # Either not a room flow, or no gh, or no resolved_room_name → original die.
       # Surface the captured pair-handshake stderr (continuum-b69f 2026-04-27:
@@ -1085,12 +1088,16 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
         local _gist_payload=""
 
         if [ "$use_room" = "1" ]; then
-          # Room mode (#39 substrate): persistent gist, not deleted after
-          # pair. Lets additional joiners discover + auto-join the same
-          # channel. Same SSH-pair handshake under the hood — only the
-          # gist lifecycle + envelope kind differ.
-          _gist_kind="room"
-          _gist_desc="airc room: ${room_name}"
+          # Mesh mode: ONE persistent gist per gh account (description
+          # "airc mesh"), shared by every `airc join` on the account.
+          # Same SSH-pair handshake under the hood — only the discovery
+          # contract changes from per-room to per-account-singleton.
+          #
+          # `channels` is an advisory list of the rooms this client
+          # cares about; in Phase 1 it's purely informational, in
+          # Phase 2 it'll drive message routing.
+          _gist_kind="mesh"
+          _gist_desc="$(_mesh_desc)"
           # last_heartbeat: host's presence signal, refreshed every
           # AIRC_HEARTBEAT_SEC (default 30s) by the bg loop spawned
           # below. Joiners detect stale → take over deterministically.
@@ -1110,9 +1117,8 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
           _gist_payload=$(cat <<JSON
 {
   "airc": 1,
-  "kind": "room",
-  "name": "${room_name}",
-  "topic": "",
+  "kind": "mesh",
+  "channels": ["${room_name}"],
   "invite": "$_invite_long",
   "host": {
     "name": "$name",
@@ -1159,10 +1165,11 @@ JSON
         if [ -n "$_gist_url" ]; then
           local _gist_id="${_gist_url##*/}"
           local _hh; _hh=$(humanhash "$_gist_id" 2>/dev/null)
-          # Persist the gist id locally so cmd_part can delete the room
-          # gist on graceful host exit (room mode only — invite mode is
-          # one-shot and the joiner-pair flow already prompts cleanup).
-          if [ "$_gist_kind" = "room" ]; then
+          # Persist the gist id locally so cmd_part can manage the
+          # mesh gist on graceful host exit (mesh/room mode only —
+          # invite mode is one-shot and the joiner-pair flow already
+          # prompts cleanup).
+          if [ "$_gist_kind" = "mesh" ] || [ "$_gist_kind" = "room" ]; then
             echo "$_gist_id" > "$AIRC_WRITE_DIR/room_gist_id"
             echo "$room_name" > "$AIRC_WRITE_DIR/room_name"
 
@@ -1211,9 +1218,8 @@ JSON
                 local _hb_payload; _hb_payload=$(cat <<JSON
 {
   "airc": 1,
-  "kind": "room",
-  "name": "${_hb_room}",
-  "topic": "",
+  "kind": "mesh",
+  "channels": ["${_hb_room}"],
   "invite": "${_hb_invite}",
   "host": {
     "name": "${_hb_name}",
@@ -1246,27 +1252,23 @@ JSON
             echo "$_hb_pid"  >  "$AIRC_WRITE_DIR/heartbeat.pid"
             echo "$_gist_id" >  "$AIRC_WRITE_DIR/host_gist_id"
 
-            # Post-publish race-loser detection. Two tabs that ran
-            # `airc join --room X` simultaneously can BOTH see empty
-            # gist list (gh propagation lag) and BOTH publish — pre-
-            # publish recheck doesn't help because neither's gist is
-            # globally visible yet. Solution: after publishing, look
-            # for OTHER gists with the same room name. Deterministic
-            # tiebreaker (lowest gist id alphabetically) picks the
-            # winner; loser deletes its gist + re-execs as joiner
-            # targeting the winner. Light jitter spreads the listing
-            # so we both see the same set.
-            local _race_jit; _race_jit=$(awk -v r="$RANDOM" 'BEGIN{printf "%.3f", 0.5 + (r%1000)/1000}')
-            sleep "$_race_jit"
-            local _peer_rooms; _peer_rooms=$(gh gist list --limit 50 2>/dev/null \
-              | awk -F'\t' -v re="airc room: ${room_name}\$" '$2 ~ re {print $1}' \
-              | sort)
-            local _peer_count; _peer_count=$(printf '%s\n' "$_peer_rooms" | grep -c . || true)
-            if [ "$_peer_count" -gt 1 ]; then
-              local _winner_id; _winner_id=$(printf '%s\n' "$_peer_rooms" | head -1)
-              if [ "$_winner_id" != "$_gist_id" ]; then
+            # Post-publish race-loser detection via _mesh_take_over.
+            # Two tabs that ran `airc join` simultaneously can BOTH see
+            # empty mesh-gist listing (gh propagation lag) and BOTH
+            # publish. Pre-publish recheck doesn't help — neither
+            # gist is globally visible yet at this point. _mesh_take_over
+            # waits a jitter, lists all "airc mesh" gists, picks the
+            # OLDEST by created_at as winner, and reports whether we won
+            # or lost. Loser deletes its gist + re-execs as joiner.
+            local _race; _race=$(_mesh_take_over "" "$_gist_id")
+            case "$_race" in
+              winner|"")
+                : # we won (or _mesh_take_over couldn't probe — assume winner, heartbeat will sort it)
+                ;;
+              loser:*)
+                local _winner_id="${_race#loser:}"
                 echo ""
-                echo "  ⚠  Concurrent host detected for #${room_name} — yielding to winner ($_winner_id)."
+                echo "  ⚠  Concurrent host detected — yielding to winner ($_winner_id)."
                 # Stop our heartbeat, delete our gist, clear state, re-exec as joiner.
                 kill "$_hb_pid" 2>/dev/null || true
                 gh gist delete "$_gist_id" --yes >/dev/null 2>&1 || true
@@ -1275,8 +1277,8 @@ JSON
                       "$AIRC_WRITE_DIR/room_gist_id" \
                       "$AIRC_WRITE_DIR/room_name"
                 _reexec_into rejoin "$_winner_id"
-              fi
-            fi
+                ;;
+            esac
 
             echo "  Hosting #${room_name} (gh-account substrate)."
             echo "  Other agents on your gh account auto-join via:  airc connect"
