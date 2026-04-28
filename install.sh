@@ -255,81 +255,131 @@ _ensure_sshd_running() {
       # writes a clean transcript every time.
       local _elevated_ps1="$CLONE_DIR/install-elevated.ps1"
       mkdir -p "$CLONE_DIR"
+      # NOTE: keep this heredoc ASCII-only. PowerShell 5.1 reads BOMless
+      # .ps1 files as the system codepage (cp1252 on most Windows). A
+      # UTF-8 em-dash (0xE2 0x80 0x94) ends in byte 0x94, which in
+      # cp1252 is RIGHT-DOUBLE-QUOTATION-MARK -- the parser sees it as
+      # a closing string quote and the rest of the file fails to parse.
+      # We also add a UTF-8 BOM below as defense-in-depth, AND the bash
+      # side runs a parse-check pass before invoking elevation so any
+      # parser error fails loud (no silent .ps1 launch).
       cat > "$_elevated_ps1" <<'PSPAYLOAD'
-$ErrorActionPreference = "Stop";
-# [System.IO.Path]::GetTempPath() asks the OS directly (no env-var
-# inheritance surprises). On a UAC-elevated process this resolves to
-# the user's %LOCALAPPDATA%\Temp.
 $logPath = Join-Path ([System.IO.Path]::GetTempPath()) "airc-install-elevated.log";
 Start-Transcript -Path $logPath -Force | Out-Null;
-try {
-  Write-Host "==> OpenSSH.Server capability";
-  $cap = Get-WindowsCapability -Online -Name "OpenSSH.Server*";
-  if ($cap.State -ne "Installed") { Add-WindowsCapability -Online -Name $cap.Name | Out-Null; Write-Host "  installed: $($cap.Name)" } else { Write-Host "  already installed" }
-  Write-Host "==> SSH host keys + ACLs (ssh-keygen -A)";
-  # continuum-b69f 2026-04-28: every fresh Windows OpenSSH install has
-  # a documented bug where sshd refuses to start with "no hostkeys
-  # available" because the host key files exist but have overly-
-  # permissive ACLs (Authenticated Users / BUILTIN\Users / Everyone).
-  # ssh-keygen -A is idempotent: generates missing host keys AND
-  # restores correct ACLs on existing ones (SYSTEM + Administrators
-  # only). Without this, Start-Service sshd fails with WIN32_EXIT_CODE
-  # 1067 (terminated unexpectedly) on every fresh-install machine.
-  $sshKeygen = Join-Path $env:WINDIR "System32\OpenSSH\ssh-keygen.exe";
-  if (Test-Path $sshKeygen) {
-    & $sshKeygen -A 2>&1 | ForEach-Object { Write-Host "  $_" };
-  } else {
-    Write-Host "  WARN: ssh-keygen.exe not found at $sshKeygen — sshd may fail to start";
-  }
-  Write-Host "==> HNS port-22 reservation";
-  $reg = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\hns\State" -Name "EnableExcludedPortRange" -ErrorAction SilentlyContinue).EnableExcludedPortRange;
-  if ($reg -ne 0) { reg add "HKLM\SYSTEM\CurrentControlSet\Services\hns\State" /v "EnableExcludedPortRange" /d 0 /f | Out-Null; Write-Host "  HNS auto-exclusion disabled" } else { Write-Host "  HNS auto-exclusion already off" }
-  $excl = netsh int ipv4 show excludedportrange protocol=tcp | Out-String;
-  if ($excl -notmatch "(?m)^\s*22\s+22\b") { netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1 | Out-Null; Write-Host "  port 22 reserved in static excluded-port-range" } else { Write-Host "  port 22 already reserved" }
-  Write-Host "==> Firewall rule";
-  if (-not (Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -DisplayName "OpenSSH Server (sshd)" -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null;
-    Write-Host "  inbound TCP/22 rule created"
-  } else { Write-Host "  inbound TCP/22 rule already exists" }
-  Write-Host "==> sshd service";
-  Start-Service sshd;
-  Set-Service -Name sshd -StartupType Automatic;
-  Write-Host "  started + auto-start on boot";
-  Write-Host "==> DefaultShell registry";
-  $bashCandidates = @("C:\Program Files\Git\bin\bash.exe", "C:\Program Files (x86)\Git\bin\bash.exe", "$env:USERPROFILE\AppData\Local\Programs\Git\bin\bash.exe");
-  $bashPath = $null;
-  foreach ($c in $bashCandidates) { if (Test-Path $c) { $bashPath = $c; break } }
-  if (-not $bashPath) { $cmd = Get-Command bash.exe -ErrorAction SilentlyContinue; if ($cmd) { $bashPath = $cmd.Source } }
-  if ($bashPath) {
-    $cur = (Get-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -ErrorAction SilentlyContinue).DefaultShell;
-    if ($cur -ne $bashPath) {
-      if (-not (Test-Path "HKLM:\SOFTWARE\OpenSSH")) { New-Item -Path "HKLM:\SOFTWARE\OpenSSH" -Force | Out-Null }
-      New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -Value $bashPath -PropertyType String -Force | Out-Null;
-      Write-Host "  DefaultShell -> $bashPath"
-    } else { Write-Host "  DefaultShell already $bashPath" }
-  } else { Write-Host "  WARN: bash.exe not found; DefaultShell left at OS default (cmd.exe). Install Git for Windows + re-run." }
-  Write-Host "";
-  Write-Host "airc: sshd ready (capability + HNS + firewall + service auto-start + DefaultShell=bash)";
-  $global:LASTEXITCODE = 0;
-} catch {
-  Write-Host "";
-  Write-Host "airc-elevated-error: $_";
-  Write-Host "Stack trace:";
-  Write-Host $_.ScriptStackTrace;
-  $global:LASTEXITCODE = 1;
-} finally {
-  Stop-Transcript | Out-Null;
+
+# No global try/catch, no $ErrorActionPreference = "Stop". Each step
+# runs plainly; if a cmdlet errors, PowerShell prints the error to the
+# transcript and execution continues. Bash side detects success/failure
+# from Get-Service sshd post-check, not from this script's exit code.
+# Anything wrapped in try/catch below is wrapped because the failure is
+# *expected* and *recoverable* (e.g. ssh-keygen missing -> warn + skip).
+
+Write-Host "==> OpenSSH.Server capability";
+$cap = Get-WindowsCapability -Online -Name "OpenSSH.Server*";
+if ($cap.State -ne "Installed") {
+  Add-WindowsCapability -Online -Name $cap.Name | Out-Null;
+  Write-Host "  installed: $($cap.Name)"
+} else { Write-Host "  already installed" }
+
+Write-Host "==> SSH host keys + ACLs (ssh-keygen -A)";
+# ssh-keygen -A is idempotent: generates missing host keys AND restores
+# correct ACLs on existing ones (SYSTEM + Administrators only). Without
+# this, Start-Service sshd fails with exit 1067 ("sshd: no hostkeys
+# available") on every fresh-install machine because post-capability
+# install the host keys can have overly-permissive ACLs.
+$sshKeygen = Join-Path $env:WINDIR "System32\OpenSSH\ssh-keygen.exe";
+if (Test-Path $sshKeygen) {
+  & $sshKeygen -A 2>&1 | ForEach-Object { Write-Host "  $_" }
+} else {
+  Write-Host "  WARN: ssh-keygen.exe not found at $sshKeygen -- sshd will fail to start"
 }
-exit $global:LASTEXITCODE;
+
+Write-Host "==> HNS port-22 reservation";
+$reg = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\hns\State" -Name "EnableExcludedPortRange" -ErrorAction SilentlyContinue).EnableExcludedPortRange;
+if ($reg -ne 0) {
+  reg add "HKLM\SYSTEM\CurrentControlSet\Services\hns\State" /v "EnableExcludedPortRange" /d 0 /f | Out-Null;
+  Write-Host "  HNS auto-exclusion disabled"
+} else { Write-Host "  HNS auto-exclusion already off" }
+$excl = netsh int ipv4 show excludedportrange protocol=tcp | Out-String;
+if ($excl -notmatch "(?m)^\s*22\s+22\b") {
+  netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1 | Out-Null;
+  Write-Host "  port 22 reserved in static excluded-port-range"
+} else { Write-Host "  port 22 already reserved" }
+
+Write-Host "==> Firewall rule (TCP/22 inbound)";
+if (-not (Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
+  New-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -DisplayName "OpenSSH Server (sshd)" -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null;
+  Write-Host "  inbound TCP/22 rule created"
+} else { Write-Host "  inbound TCP/22 rule already exists" }
+
+Write-Host "==> sshd service (start + auto-start on boot)";
+Start-Service sshd;
+Set-Service -Name sshd -StartupType Automatic;
+Write-Host "  Get-Service sshd: $((Get-Service sshd).Status)";
+
+Write-Host "==> DefaultShell registry (bash for joiners)";
+$bashCandidates = @("C:\Program Files\Git\bin\bash.exe", "C:\Program Files (x86)\Git\bin\bash.exe", "$env:USERPROFILE\AppData\Local\Programs\Git\bin\bash.exe");
+$bashPath = $null;
+foreach ($c in $bashCandidates) { if (Test-Path $c) { $bashPath = $c; break } }
+if (-not $bashPath) { $cmd = Get-Command bash.exe -ErrorAction SilentlyContinue; if ($cmd) { $bashPath = $cmd.Source } }
+if (-not $bashPath) {
+  Write-Host "  WARN: bash.exe not found; DefaultShell left at OS default. Install Git for Windows + re-run."
+} else {
+  $cur = (Get-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -ErrorAction SilentlyContinue).DefaultShell;
+  if ($cur -eq $bashPath) {
+    Write-Host "  DefaultShell already $bashPath"
+  } else {
+    if (-not (Test-Path "HKLM:\SOFTWARE\OpenSSH")) { New-Item -Path "HKLM:\SOFTWARE\OpenSSH" -Force | Out-Null }
+    New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -Value $bashPath -PropertyType String -Force | Out-Null;
+    Write-Host "  DefaultShell -> $bashPath"
+  }
+}
+
+Write-Host "";
+Write-Host "airc: elevated install steps complete";
+Stop-Transcript | Out-Null;
+exit 0;
 PSPAYLOAD
 
-      # Translate the .ps1 path to Windows form for Start-Process -File.
+      # Defense-in-depth: prepend a UTF-8 BOM so PowerShell 5.1 reads
+      # the .ps1 as UTF-8 (not cp1252). Heredoc is ASCII-only so this
+      # is just insurance for future edits.
+      if [ -f "$_elevated_ps1" ]; then
+        local _tmp_bom="$_elevated_ps1.bom"
+        printf '\xEF\xBB\xBF' > "$_tmp_bom"
+        cat "$_elevated_ps1" >> "$_tmp_bom"
+        mv "$_tmp_bom" "$_elevated_ps1"
+      fi
+
+      # Translate the .ps1 path to Windows form for Start-Process -File
+      # and the parse-check below.
       local _elevated_ps1_win
       if command -v cygpath >/dev/null 2>&1; then
         _elevated_ps1_win=$(cygpath -w "$_elevated_ps1" 2>/dev/null)
       else
         # Fallback: /c/Users/foo/.airc-src/install-elevated.ps1 → C:\Users\foo\.airc-src\install-elevated.ps1
         _elevated_ps1_win=$(printf '%s' "$_elevated_ps1" | sed 's|^/\([a-z]\)/|\U\1:\\\\|; s|/|\\\\|g')
+      fi
+
+      # Pre-flight parse-check: catch syntax errors in the staged .ps1
+      # BEFORE we trigger UAC. Without this, a parser error means the
+      # elevated window opens, fails to parse, blinks closed, no log
+      # is written, bash side reports "transcript not written" and the
+      # user has no idea what went wrong (Joel 2026-04-28: "we prefer
+      # parser issues to actually error" -- this is how we make them
+      # actually error). Parser errors here abort the install loud.
+      local _parse_errs
+      _parse_errs=$(powershell.exe -NoProfile -Command "
+        \$tokens = \$null; \$errors = \$null;
+        [System.Management.Automation.Language.Parser]::ParseFile('$_elevated_ps1_win', [ref]\$tokens, [ref]\$errors) | Out-Null;
+        if (\$errors) { \$errors | ForEach-Object { Write-Output \$_.ToString() } }
+      " 2>&1 | tr -d '\r')
+      if [ -n "$_parse_errs" ]; then
+        warn "Staged elevated payload has PARSE ERRORS -- aborting before UAC."
+        warn "  This is a bug in install.sh. File a bug w/ this output:"
+        printf '%s\n' "$_parse_errs" | sed 's/^/    /'
+        warn "  staged file: $_elevated_ps1_win"
+        return 1
       fi
       case "$_state" in
         Running)
