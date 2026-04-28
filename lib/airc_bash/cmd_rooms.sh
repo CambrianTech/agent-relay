@@ -60,15 +60,14 @@ cmd_rooms() {
     echo "  airc IS aIRC — github gist is the coordination layer; gh is mandatory." >&2
     return 1
   fi
-  # Match BOTH the persistent IRC-style rooms (#39, prefix `airc room:`)
-  # and the legacy single-pair invites (#37/#38, prefix `airc invite for`).
-  # Show kind explicitly so the AI / human can tell them apart.
+  # Match the new mesh gist (one per gh account, description "airc mesh"),
+  # plus legacy per-room gists (`airc room:`) for accounts that haven't
+  # rolled over yet, plus single-pair invites (`airc invite for`) for
+  # cross-account ad-hoc pairing.
   # gh gist list columns: id  description  files  visibility  updated_at
-  # Use $5 (timestamp) for the updated field — pre-#82 we were using
-  # $4 (visibility, "secret") under the "updated:" label, which is a
-  # display bug fixed here on the way to adding stale markers.
   local raw; raw=$(gh gist list --limit 50 2>/dev/null \
     | awk -F'\t' '
+        /airc mesh/         { print "mesh\t"   $1 "\t" $2 "\t" $5 }
         /airc room:/        { print "room\t"   $1 "\t" $2 "\t" $5 }
         /airc invite for/   { print "invite\t" $1 "\t" $2 "\t" $5 }
       ')
@@ -122,8 +121,9 @@ cmd_rooms() {
     local hh; hh=$(humanhash "$id" 2>/dev/null)
     local marker
     case "$kind" in
-      room)   marker="#" ;;     # persistent channel
-      invite) marker="(1:1)" ;; # ephemeral pairing
+      mesh)   marker="◆" ;;     # mesh singleton (one per gh account)
+      room)   marker="#" ;;     # legacy persistent per-room channel
+      invite) marker="(1:1)" ;; # ephemeral cross-account pairing
     esac
     local age_str; age_str=$(_format_relative_time "$updated")
     local stale_marker=""
