@@ -281,15 +281,34 @@ if ($cap.State -ne "Installed") {
   Write-Host "  installed: $($cap.Name)"
 } else { Write-Host "  already installed" }
 
-Write-Host "==> SSH host keys + ACLs (ssh-keygen -A)";
-# ssh-keygen -A is idempotent: generates missing host keys AND restores
-# correct ACLs on existing ones (SYSTEM + Administrators only). Without
-# this, Start-Service sshd fails with exit 1067 ("sshd: no hostkeys
-# available") on every fresh-install machine because post-capability
-# install the host keys can have overly-permissive ACLs.
+Write-Host "==> SSH host keys (generate if missing + reset ACLs)";
+# Two-step: (a) ssh-keygen -A generates any missing host keys, (b)
+# icacls resets ACLs on private keys to SYSTEM + Administrators only.
+#
+# Without (b), Start-Service sshd fails with exit 1067 because sshd
+# refuses to open host key files whose ACLs let anyone but SYSTEM/
+# Administrators read them ("sshd: no hostkeys available"). Verified
+# via `sshd -ddd` on continuum-b69f's box (2026-04-28):
+#   Failed to open file: .../ssh_host_rsa_key error:5  (ACCESS_DENIED)
+#   Failed to open file: .../ssh_host_rsa_key error:13 (ACL fails secure_permission_check)
+#
+# ssh-keygen -A alone does NOT fix ACLs on existing keys -- it only
+# generates missing ones. The bundled FixHostFilePermissions.ps1 was
+# removed from Windows-OpenSSH years ago; the OpenSSHUtils PS module
+# from PSGallery is the official replacement, but pulling it adds a
+# network dep + module-trust prompt. icacls is in-box and bulletproof.
 $sshKeygen = Join-Path $env:WINDIR "System32\OpenSSH\ssh-keygen.exe";
 if (Test-Path $sshKeygen) {
-  & $sshKeygen -A 2>&1 | ForEach-Object { Write-Host "  $_" }
+  & $sshKeygen -A 2>&1 | ForEach-Object { Write-Host "  ssh-keygen: $_" }
+  $hostKeys = Get-ChildItem 'C:\ProgramData\ssh\ssh_host_*' -ErrorAction SilentlyContinue | Where-Object { -not $_.Name.EndsWith('.pub') }
+  foreach ($k in $hostKeys) {
+    # takeown switches owner to current admin; icacls /reset wipes
+    # inherited ACEs; /inheritance:r removes parent inheritance; then
+    # grant Full Control to SYSTEM and BUILTIN\Administrators only.
+    takeown /F $k.FullName /A 2>&1 | Out-Null
+    icacls $k.FullName /reset 2>&1 | Out-Null
+    icacls $k.FullName /inheritance:r /grant 'NT AUTHORITY\SYSTEM:(F)' /grant 'BUILTIN\Administrators:(F)' 2>&1 | ForEach-Object { Write-Host "  icacls $($k.Name): $_" }
+  }
 } else {
   Write-Host "  WARN: ssh-keygen.exe not found at $sshKeygen -- sshd will fail to start"
 }
