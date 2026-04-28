@@ -16,6 +16,13 @@
 cmd_status() {
   # Human-readable liveness view. Fast — no network calls by default; `--probe`
   # opts into a 3s SSH reachability check.
+  case "${1:-}" in
+    -h|--help)
+      echo "Usage:"
+      echo "  airc status            print local liveness snapshot (fast)"
+      echo "  airc status --probe    add a 3s SSH reachability check to the host"
+      return 0 ;;
+  esac
   ensure_init
   local probe=0
   [ "${1:-}" = "--probe" ] && probe=1

@@ -29,6 +29,12 @@ cmd_teardown() {
   local flush=0 all=0
   while [ $# -gt 0 ]; do
     case "$1" in
+      -h|--help)
+        echo "Usage:"
+        echo "  airc teardown          kill all airc processes for this scope"
+        echo "  airc teardown --flush  also wipe state dir (identity, peers, messages)"
+        echo "  airc teardown --all    nuke EVERY airc-looking process on this machine"
+        return 0 ;;
       --flush) flush=1 ;;
       --all)   all=1 ;;
       *) echo "  unknown teardown flag: $1" >&2; return 2 ;;

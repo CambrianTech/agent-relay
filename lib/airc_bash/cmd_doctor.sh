@@ -22,6 +22,13 @@ cmd_doctor() {
   #   airc doctor tests        prior default behavior; aliased on the
   #                            dispatch via `tests|test`).
   case "${1:-}" in
+    -h|--help)
+      echo "Usage: airc doctor [mode]"
+      echo "  airc doctor              environment health check (default)"
+      echo "  airc doctor --connect    pre-flight checks for 'airc connect'"
+      echo "  airc doctor --tests      run the integration test suite"
+      echo "                           (aliases: tests, test, run, suite)"
+      return 0 ;;
     --tests|-t|tests|test|run|suite) shift; _doctor_run_tests "$@"; return ;;
     --connect|-c|connect)            shift; _doctor_connect_preflight "$@"; return ;;
   esac

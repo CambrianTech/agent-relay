@@ -35,6 +35,13 @@ cmd_update() {
   local requested_channel=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      -h|--help)
+        echo "Usage:"
+        echo "  airc update                        pull latest on current channel"
+        echo "  airc update --channel <name>       switch channel + pull"
+        echo "  airc update --canary               shortcut for --channel canary"
+        echo "  airc update --main                 shortcut for --channel main"
+        return 0 ;;
       --channel|-c)
         requested_channel="${2:-}"
         [ -z "$requested_channel" ] && die "Usage: airc update --channel <name>"
@@ -124,6 +131,24 @@ cmd_channel() {
   [ -z "$current" ] && current="main"
 
   local target="${1:-}"
+  # Help-flag intercept BEFORE we'd write target to channel_file.
+  # vhsm-d1f4 + continuum-b741 + ideem-local-4bef caught this 2026-04-28:
+  # `airc channel --help` was writing "--help" as the channel preference,
+  # which would brick the next `airc update` (no such branch on origin).
+  case "$target" in
+    -h|--help)
+      target=""  # fall through to the no-arg path which prints usage
+      ;;
+  esac
+  # Reject any flag-shaped value as a channel name (channels are git
+  # branches; they can't start with '-'). Defensive against the same
+  # class of bug for arbitrary flags we don't enumerate.
+  case "$target" in
+    -*)
+      echo "  Refusing to set channel preference to '$target' — channel names cannot start with '-'." >&2
+      echo "  Run 'airc channel' (no args) to see the help block." >&2
+      return 2 ;;
+  esac
   if [ -z "$target" ]; then
     echo "  Channel: $current"
     echo "  Available channels (any branch on origin can be a channel):"

@@ -50,6 +50,16 @@
 # (airc identity set --status) still works for scripted state changes.
 cmd_away() {
   ensure_init
+  # Intercept --help BEFORE building $msg from $* — vhsm-d1f4's verb-fuzz
+  # 2026-04-28 caught `airc away --help` writing "--help" as the status
+  # string. Same anti-pattern as #231/#236; same shape fix.
+  case "${1:-}" in
+    -h|--help)
+      echo "Usage:"
+      echo "  airc away             clear away status (back)"
+      echo "  airc away <message>   set away status to <message>"
+      return 0 ;;
+  esac
   if [ $# -eq 0 ]; then
     _identity_set --status "" >/dev/null
     echo "  back — away cleared."

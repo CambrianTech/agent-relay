@@ -52,6 +52,13 @@ cmd_daemon() {
   local action="${1:-status}"
   shift 2>/dev/null || true
   case "$action" in
+    -h|--help|help)
+      echo "Usage: airc daemon [install|uninstall|status|log]"
+      echo "  install     register OS auto-restart (launchd/systemd/schtasks)"
+      echo "  uninstall   remove auto-restart registration"
+      echo "  status      print platform-native unit/plist state + log tail"
+      echo "  log [N]     tail the daemon stdout log (default 50 lines)"
+      return 0 ;;
     install)   cmd_daemon_install "$@" ;;
     uninstall|remove|stop) cmd_daemon_uninstall "$@" ;;
     status)    cmd_daemon_status "$@" ;;
