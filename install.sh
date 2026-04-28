@@ -281,36 +281,42 @@ if ($cap.State -ne "Installed") {
   Write-Host "  installed: $($cap.Name)"
 } else { Write-Host "  already installed" }
 
-Write-Host "==> SSH host keys (generate if missing + reset ACLs)";
-# Two-step: (a) ssh-keygen -A generates any missing host keys, (b)
-# icacls resets ACLs on private keys to SYSTEM + Administrators only.
+Write-Host "==> SSH host keys (regenerate so ACLs are clean from birth)";
+# Why "delete + regenerate" instead of "fix ACLs on existing":
 #
-# Without (b), Start-Service sshd fails with exit 1067 because sshd
-# refuses to open host key files whose ACLs let anyone but SYSTEM/
-# Administrators read them ("sshd: no hostkeys available"). Verified
-# via `sshd -ddd` on continuum-b69f's box (2026-04-28):
-#   Failed to open file: .../ssh_host_rsa_key error:5  (ACCESS_DENIED)
-#   Failed to open file: .../ssh_host_rsa_key error:13 (ACL fails secure_permission_check)
+# Verified on continuum-b69f's box (2026-04-28): even after icacls reset
+# to SYSTEM + Administrators only, sshd still refused with error:5
+# (ACCESS_DENIED) and error:13 (ACL fails OpenSSH secure_permission_check).
+# Apparently icacls /grant alone isn't enough -- the file owner and the
+# combination of explicit + inherited ACEs has to match what OpenSSH's
+# secure_permission_check expects, which is fragile.
 #
-# ssh-keygen -A alone does NOT fix ACLs on existing keys -- it only
-# generates missing ones. The bundled FixHostFilePermissions.ps1 was
-# removed from Windows-OpenSSH years ago; the OpenSSHUtils PS module
-# from PSGallery is the official replacement, but pulling it adds a
-# network dep + module-trust prompt. icacls is in-box and bulletproof.
+# Cleaner approach: nuke any existing host keys, then run ssh-keygen -A
+# from this elevated SYSTEM-context process. ssh-keygen -A sets the
+# right ACLs at creation time (owner = SYSTEM, ACEs = SYSTEM + Admins).
+# Since this is install-time setup and the host hasn't published any
+# fingerprint yet, regenerating is safe -- nobody is trusting these
+# keys yet from a client.
 $sshKeygen = Join-Path $env:WINDIR "System32\OpenSSH\ssh-keygen.exe";
-if (Test-Path $sshKeygen) {
-  & $sshKeygen -A 2>&1 | ForEach-Object { Write-Host "  ssh-keygen: $_" }
-  $hostKeys = Get-ChildItem 'C:\ProgramData\ssh\ssh_host_*' -ErrorAction SilentlyContinue | Where-Object { -not $_.Name.EndsWith('.pub') }
-  foreach ($k in $hostKeys) {
-    # takeown switches owner to current admin; icacls /reset wipes
-    # inherited ACEs; /inheritance:r removes parent inheritance; then
-    # grant Full Control to SYSTEM and BUILTIN\Administrators only.
-    takeown /F $k.FullName /A 2>&1 | Out-Null
-    icacls $k.FullName /reset 2>&1 | Out-Null
-    icacls $k.FullName /inheritance:r /grant 'NT AUTHORITY\SYSTEM:(F)' /grant 'BUILTIN\Administrators:(F)' 2>&1 | ForEach-Object { Write-Host "  icacls $($k.Name): $_" }
-  }
-} else {
+if (-not (Test-Path $sshKeygen)) {
   Write-Host "  WARN: ssh-keygen.exe not found at $sshKeygen -- sshd will fail to start"
+} else {
+  $sshDir = 'C:\ProgramData\ssh';
+  if (-not (Test-Path $sshDir)) { New-Item -Path $sshDir -ItemType Directory -Force | Out-Null }
+  $existing = Get-ChildItem (Join-Path $sshDir 'ssh_host_*') -ErrorAction SilentlyContinue
+  if ($existing) {
+    Write-Host "  removing $($existing.Count) existing host key file(s)"
+    $existing | Remove-Item -Force -ErrorAction SilentlyContinue
+  }
+  & $sshKeygen -A 2>&1 | ForEach-Object { Write-Host "  ssh-keygen: $_" }
+  # Dump the post-regen ACL state for one of the keys so we can see in
+  # the transcript whether the ACL is what sshd expects -- saves a UAC
+  # round-trip if it's wrong.
+  $rsa = Join-Path $sshDir 'ssh_host_rsa_key'
+  if (Test-Path $rsa) {
+    Write-Host "  post-regen ACL on ssh_host_rsa_key:"
+    icacls $rsa 2>&1 | ForEach-Object { Write-Host "    $_" }
+  }
 }
 
 Write-Host "==> HNS port-22 reservation";
