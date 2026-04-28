@@ -1169,8 +1169,18 @@ monitor() {
   # Bug found by continuum-b741 2026-04-28: an empty monitor_offset
   # file (or one containing "0") expanded to `tail -n +1` which is
   # "print from line 1" = the entire file. Joiners saw days of
-  # accumulated host history dumped on connect. Now we treat empty /
-  # zero / non-numeric as "no usable offset" → -n 0 (current EOF).
+  # accumulated host history dumped on connect. Treat empty / zero /
+  # non-numeric as "no usable offset" → -n 0 (current EOF).
+  #
+  # Stronger bug found by continuum-b69f 2026-04-28 (Windows e2e):
+  # saved offset can be PAST the host's current log length when the
+  # host's log got reset/truncated between sessions (teardown --flush,
+  # crash + rebuild, fresh daemon, etc.). `tail -n +<larger-than-EOF>`
+  # blocks forever waiting for a line number that won't exist until N
+  # MORE writes happen — meanwhile new writes at lines below the offset
+  # are silently invisible. Joiner sees nothing despite mesh being
+  # alive. Fix: bound-check by querying the host's current line count
+  # before committing to the saved offset.
   local offset_file="$AIRC_WRITE_DIR/monitor_offset"
   local tail_pos="-n 0"
   if [ -f "$offset_file" ]; then
@@ -1187,6 +1197,26 @@ monitor() {
     local rhome; rhome=$(remote_home)
     local ssh_key="$IDENTITY_DIR/ssh_key"
     local ssh_opts="-i $ssh_key -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=3"
+
+    # Stale-offset sanity check (continuum-b69f's Windows e2e bug).
+    # If our saved offset is past the host's current log length, the
+    # SSH tail will block forever. Probe the host's line count first;
+    # if our offset > line count, reset to EOF (-n 0) and clear the
+    # stale offset file. Quick cheap query — single ssh round-trip,
+    # only on the first cycle of the reconnect loop.
+    if [ "$tail_pos" != "-n 0" ]; then
+      local _saved_off; _saved_off=$(cat "$offset_file" 2>/dev/null | tr -d '[:space:]')
+      local _host_lines; _host_lines=$(ssh $ssh_opts "$host_target" "wc -l < $rhome/messages.jsonl 2>/dev/null || echo 0" 2>/dev/null | tr -d '[:space:]')
+      case "$_host_lines" in
+        ''|*[!0-9]*) _host_lines=0 ;;
+      esac
+      if [ "$_host_lines" -gt 0 ] && [ "$_saved_off" -gt "$_host_lines" ]; then
+        echo "  ⚠  Saved monitor offset ($_saved_off) is past host's current log length ($_host_lines)."
+        echo "     Host log was reset/truncated between sessions. Clearing offset, resuming at EOF."
+        rm -f "$offset_file" 2>/dev/null || true
+        tail_pos="-n 0"
+      fi
+    fi
     # Monitor escalation (no-claude-left-behind): count consecutive watchdog
     # timeouts (formatter exit code 2 = no inbound in WATCHDOG_SEC). After
     # ESCALATE_AFTER consecutive timeouts, the host is genuinely gone (sleep
