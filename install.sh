@@ -493,8 +493,25 @@ EOF
     exit 1
   fi
 else
-  info "Installing AIRC"
-  git clone --quiet "$REPO_URL" "$CLONE_DIR"
+  # First install. Honor AIRC_CHANNEL if set so users can land on canary
+  # directly via `AIRC_CHANNEL=canary curl|bash` without a follow-up
+  # `airc canary && airc update` dance. Default to main (the release
+  # branch) when AIRC_CHANNEL is unset. Caught by vhsm-d1f4 2026-04-28
+  # during the #191 release-gate fresh-install verification: env var was
+  # silently ignored, install landed on main.
+  CHANNEL_TARGET="${AIRC_CHANNEL:-main}"
+  case "$CHANNEL_TARGET" in
+    main|canary) ;;
+    *)
+      warn "AIRC_CHANNEL='$CHANNEL_TARGET' is not a known channel (main, canary). Defaulting to main."
+      CHANNEL_TARGET="main"
+      ;;
+  esac
+  info "Installing AIRC (channel: $CHANNEL_TARGET)"
+  git clone --quiet --branch "$CHANNEL_TARGET" "$REPO_URL" "$CLONE_DIR"
+  # Persist the channel choice so future `airc update` follows the same
+  # branch. Mirrors what `airc canary` / `airc main` write.
+  echo "$CHANNEL_TARGET" > "$CLONE_DIR/.channel"
 fi
 
 # ── airc on PATH ───────────────────────────────────────────────────────
