@@ -325,7 +325,7 @@ function Advise-TailscaleIfDown {
     if (-not $ts) {
         Write-Host '   Tailscale is not installed. airc needs it only for cross-machine mesh.'
         Write-Host '   Install:'
-        Write-Host '     winget install --id tailscale.tailscale'
+        Write-Host '     winget install --id Tailscale.Tailscale'
         Write-Host '     (or https://tailscale.com/download/windows)'
         Write-Host ''
         Write-Host '   After install, bring the tailnet up and re-run airc join.'
@@ -1290,7 +1290,7 @@ function Invoke-Doctor {
 
     Probe 'tailscale (optional)' {
         Get-Command tailscale -ErrorAction SilentlyContinue
-    } 'winget install --id tailscale.tailscale  (then: tailscale up)  - LAN-only mode works without it'
+    } 'winget install --id Tailscale.Tailscale  (then: tailscale up)  - LAN-only mode works without it'
 
     # State-dir + identity
     Write-Host ''
@@ -1317,6 +1317,15 @@ function Invoke-Doctor {
         Write-Host '    iwr https://raw.githubusercontent.com/CambrianTech/airc/canary/install.ps1 | iex'
     }
     Write-Host ''
+    # Always exit 0 from the default `airc doctor` — informational, like
+    # `git status`. Probes use `& gh auth status` etc which leak
+    # $LASTEXITCODE; without an explicit reset the script's natural-end
+    # exit picks up whatever the last external returned (typically
+    # gh-not-authed → 1 in CI / fresh installs). Match the bash doctor's
+    # behavior (cmd_doctor.sh — issues counter, no exit). For hard-fail
+    # semantics the user should run `airc doctor --connect`, which is
+    # the documented preflight gate that does exit non-zero on issues.
+    $global:LASTEXITCODE = 0
 }
 
 # -- airc doctor --connect ---------------------------------------------
@@ -1411,13 +1420,13 @@ function Invoke-DoctorConnectPreflight {
             }
         } else {
             Write-Host "  [BLOCKED] tailscale CLI missing -- cached host is tailnet, can't reach"
-            Write-Host '         Fix: winget install --id tailscale.tailscale  (then: tailscale up)'
+            Write-Host '         Fix: winget install --id Tailscale.Tailscale  (then: tailscale up)'
             $script:DoctorIssues += 'tailscale-missing'
         }
     } else {
         Probe 'tailscale (optional)' {
             $null -ne (Resolve-TailscaleBin)
-        } 'winget install --id tailscale.tailscale  (LAN-only mode works without it)'
+        } 'winget install --id Tailscale.Tailscale  (LAN-only mode works without it)'
     }
 
     # Connect-specific: AIRC_PORT free

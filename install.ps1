@@ -264,7 +264,7 @@ Install-IfMissing -Name 'Python 3'           -WingetId 'Python.Python.3.12'  -Te
 }
 Install-IfMissing -Name 'GitHub CLI (gh)'    -WingetId 'GitHub.cli'          -TestCmd { Get-Command gh -ErrorAction SilentlyContinue }
 Install-IfMissing -Name 'jq'                 -WingetId 'jqlang.jq'           -TestCmd { Get-Command jq -ErrorAction SilentlyContinue }
-Install-IfMissing -Name 'Tailscale'          -WingetId 'tailscale.tailscale' -TestCmd { Get-Command tailscale -ErrorAction SilentlyContinue }
+Install-IfMissing -Name 'Tailscale'          -WingetId 'Tailscale.Tailscale' -TestCmd { Get-Command tailscale -ErrorAction SilentlyContinue }
 
 Install-OpenSSHClient
 Install-OpenSSHServer
