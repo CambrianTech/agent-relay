@@ -48,6 +48,15 @@ cmd_send() {
   # Phase 2B.3 deletes --room's re-exec path and makes --room an
   # alias for --channel.
   local channel_override=""
+  # _explicit_channel: user used --room/--channel to target a specific
+  # channel. When set, we MUST find a gist mapping for that channel —
+  # silently falling back to the scope's primary room_gist_id has the
+  # phantom-room failure mode (banner says "→ #qa-experiment", message
+  # actually goes to #general's gist with channel field "qa-experiment",
+  # no new gist ever created). User reported 2026-04-29: "I sent to
+  # #qa-experiment, #qa-sub-room-test, #x — all 'succeeded' with banner,
+  # NONE created a gist."
+  local _explicit_channel=0
   # --internal: best-effort send for internal informational broadcasts
   # ([rename], etc.) where the monitor-down guard is the wrong UX. Append
   # to the local log + return 0 even when the monitor isn't running.
@@ -70,10 +79,12 @@ cmd_send() {
       --room|-room)
         target_room="${2:-}"
         [ -z "$target_room" ] && die "Usage: airc send --room <name> <message>"
+        _explicit_channel=1
         shift 2 ;;
       --channel|-c)
         channel_override="${2:-}"
         [ -z "$channel_override" ] && die "Usage: airc send --channel <name> <message>"
+        _explicit_channel=1
         shift 2 ;;
       --internal)
         internal=1
@@ -244,8 +255,18 @@ cmd_send() {
     local room_gist_id=""
     room_gist_id=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
       --config "$CONFIG" --channel "$active_channel" 2>/dev/null || true)
-    if [ -z "$room_gist_id" ] && [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
-      room_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
+    # Phantom-room guard: when --room/--channel was used explicitly,
+    # NEVER fall back to the scope's primary room_gist_id — that publishes
+    # to the wrong gist with the right channel-tag, creating an invisible
+    # mis-route ("phantom success"). Only the no-override path falls back
+    # for back-compat with single-channel scopes.
+    if [ -z "$room_gist_id" ]; then
+      if [ "$_explicit_channel" = "1" ]; then
+        die "no gist mapping for channel '$active_channel' — run 'airc join --room $active_channel' first to create the room"
+      fi
+      if [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
+        room_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
+      fi
     fi
 
     local outcome
@@ -392,12 +413,20 @@ cmd_send() {
     fi
 
     # Route by channel via channel_gists (post-#283); fall back to the
-    # scope's primary room_gist_id so single-room hosts keep working.
+    # scope's primary room_gist_id so single-room hosts keep working —
+    # but only when the user did NOT explicitly target a different room
+    # (otherwise the fallback turns --room into a phantom success that
+    # silently mis-routes to the primary gist; see _explicit_channel).
     local _host_room_gist_id=""
     _host_room_gist_id=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
       --config "$CONFIG" --channel "$active_channel" 2>/dev/null || true)
-    if [ -z "$_host_room_gist_id" ] && [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
-      _host_room_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
+    if [ -z "$_host_room_gist_id" ]; then
+      if [ "$_explicit_channel" = "1" ]; then
+        die "no gist mapping for channel '$active_channel' — run 'airc join --room $active_channel' first to create the room"
+      fi
+      if [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
+        _host_room_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
+      fi
     fi
 
     if [ -n "$_host_room_gist_id" ]; then
