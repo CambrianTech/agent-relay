@@ -172,6 +172,14 @@ else:
 cmd_logs() {
   ensure_init
   local count="${1:-20}"
+  # Validate count: positive integer (ideem-local-4bef caught 2026-04-29:
+  # 'airc logs 0' and 'airc logs notanumber' silently exited 0 with no
+  # output). Tail with N=0 prints nothing; with non-numeric, tail errors
+  # and we swallow it.
+  case "$count" in
+    ''|*[!0-9]*) die "logs count must be a positive integer (got '$count')" ;;
+    0)           die "logs count must be ≥ 1 (got '$count')" ;;
+  esac
   local host_target
   host_target=$(get_config_val host_target "")
 

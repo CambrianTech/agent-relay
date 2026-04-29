@@ -101,6 +101,20 @@ cmd_send() {
       --plaintext|-plaintext)
         plaintext=1
         shift ;;
+      --)
+        # POSIX flag-terminator: anything after this is positional even
+        # if it looks like a flag. Lets users send literal --strings in
+        # message bodies: `airc msg -- --foo bar`.
+        shift
+        while [ $# -gt 0 ]; do positional+=("$1"); shift; done
+        ;;
+      --*|-*)
+        # Unknown flag — pre-fix this fell into the *) catch-all and got
+        # silently absorbed into the message body, so 'airc msg
+        # --invalidflag value body' returned exit 0 broadcast (ideem-
+        # local-4bef caught 2026-04-29). Loud failure now; users with a
+        # literal --string in the message body can use the -- terminator.
+        die "Unknown flag: $1 (use -- to terminate flags if this is part of the message body)" ;;
       *) positional+=("$1"); shift ;;
     esac
   done
@@ -137,6 +151,17 @@ cmd_send() {
     case "$1" in
       @*)
         local _p="${1#@}"
+        # Reject empty `@` (continuum-b741 + ideem-local-4bef caught
+        # 2026-04-29: `airc msg @ body` silently broadcast). Reject
+        # double-@ `@@peer` while we're here (also caught: accepted as
+        # DM to literal '@peer'). Reject numeric-only DMs as per the
+        # peer-name charset rule (`@12345` is a likely typo, not a
+        # real peer).
+        case "$_p" in
+          "")           die "Empty @ recipient (use 'airc msg <message>' for broadcast, or 'airc msg @<peer> ...' for DM)" ;;
+          @*)           die "Double @ recipient '$1' — peer names are bare, not @-prefixed" ;;
+          *[!a-z0-9,-]*) die "Invalid peer name in '$1' — must match [a-z0-9-]+ (comma-separated for multi-DM)" ;;
+        esac
         if [ -z "$_peer_csv" ]; then
           _peer_csv="$_p"
         else
@@ -178,6 +203,12 @@ cmd_send() {
     peer_name="all"
     msg="$*"
   fi
+  # Reject empty broadcast bodies — pre-fix `airc msg ""` printed the
+  # usage line but exited 0 (continuum-b741 caught 2026-04-29). The
+  # other "no message" path already dies above; this one is the
+  # explicit-empty-string case that fell through.
+  [ "$peer_name" = "all" ] && [ -z "$msg" ] \
+    && die "empty message body (use 'airc msg <text>' or omit the empty quotes)"
   ensure_init
 
   local my_name ts_val
