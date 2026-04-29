@@ -341,20 +341,15 @@ cmd_send() {
     # delivery, and the peer in the actual room waited forever for a
     # reply that never landed.
     #
-    # Detect: pidfile exists AND every PID in it is alive. Anything else
-    # = monitor dead = broadcasting into a void. Die loudly so the user
-    # immediately knows their cwd / scope / monitor state is wrong.
+    # Detect monitor liveness via the shared prune_pidfile_and_count
+    # helper (airc top-level). Same contract as cmd_status — pre-fix
+    # this used all-alive logic while status used any-alive, so a
+    # pidfile with 1 stale orphan + 2 live processes showed "monitor:
+    # running" but every msg refused. Helper auto-prunes the orphan.
     local _pidfile="$AIRC_WRITE_DIR/airc.pid"
     local _monitor_alive=0
-    if [ -f "$_pidfile" ]; then
-      local _pids; _pids=$(cat "$_pidfile" 2>/dev/null)
-      if [ -n "$_pids" ]; then
-        local _all_alive=1 _p
-        for _p in $_pids; do
-          kill -0 "$_p" 2>/dev/null || { _all_alive=0; break; }
-        done
-        [ "$_all_alive" = "1" ] && _monitor_alive=1
-      fi
+    if [ "$(prune_pidfile_and_count "$_pidfile")" -gt 0 ]; then
+      _monitor_alive=1
     fi
     if [ "$_monitor_alive" = "0" ]; then
       # --internal callers (informational broadcasts: [rename], etc.):
