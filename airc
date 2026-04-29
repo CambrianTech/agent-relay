@@ -328,25 +328,46 @@ AIRC_WRITE_DIR="$(detect_scope)"
 # Replaces 5 duplicated 3-line call sites in cmd_connect (#205 target 1).
 _reexec_into() {
   local mode="$1"; shift  # "rejoin" or "host"
-  printf '%d:%d\n' "$$" "$(date +%s)" > "$AIRC_WRITE_DIR/airc.reexec-marker" 2>/dev/null || true
+  # Best-effort: write the reexec sentinel marker. The .airc dir may
+  # have been wiped by self-heal; tolerate missing parent. Without the
+  # marker the daemon launcher (#203) can't tell intentional reexec
+  # from a crash, but the reexec itself still works — silent no-op
+  # here is the right tradeoff vs. failing the takeover.
+  if [ -d "$AIRC_WRITE_DIR" ]; then
+    printf '%d:%d\n' "$$" "$(date +%s)" > "$AIRC_WRITE_DIR/airc.reexec-marker" 2>/dev/null || true
+  fi
   local _name; _name=$(get_config_val name "")
+  # Preserve user's --room intent across exec when set (see
+  # _self_heal_stale_host). Without this, an explicit `airc join --room
+  # qa-foo` that triggers stale-host takeover loses --room and
+  # auto-scope decides instead.
+  local _intent="${AIRC_ROOM_INTENT:-}"
   if [ "$mode" = "host" ]; then
-    exec env AIRC_NO_DISCOVERY=1 ${_name:+AIRC_NAME="$_name"} "$0" connect "$@"
+    exec env AIRC_NO_DISCOVERY=1 \
+      ${_name:+AIRC_NAME="$_name"} \
+      ${_intent:+AIRC_ROOM_INTENT="$_intent"} \
+      "$0" connect "$@"
   else
-    exec env ${_name:+AIRC_NAME="$_name"} "$0" connect "$@"
+    exec env \
+      ${_name:+AIRC_NAME="$_name"} \
+      ${_intent:+AIRC_ROOM_INTENT="$_intent"} \
+      "$0" connect "$@"
   fi
 }
 
-# Stale-host self-heal + race-loser detection. Args: $1=stale gist id,
-# $2=room name. Random jitter, delete stale, re-list to see if another
-# tab self-healed first; if yes rejoin theirs, else take over as host.
-# Always exec's via _reexec_into; does not return. Wipes $CONFIG +
-# room_name first since both pointed at the dead host. Replaces 2
-# duplicated 22-line blocks in cmd_connect (#205 target 4).
+# Stale-host self-heal + race-loser detection. Args: $1=stale gist id.
+# Random jitter, delete stale, re-list to see if another tab self-healed
+# first; if yes rejoin theirs, else take over as host. Always exec's via
+# _reexec_into; does not return.
+#
+# User intent preservation across re-exec: pre-2026-04-29 this wiped
+# room_name + reexec'd with NO ARGS, which silently dropped the user's
+# `--room <name>` flag — auto-scope then took over and the user landed
+# on a different (cwd-derived) room than they asked for. Now we save
+# the explicit --room intent into AIRC_ROOM_INTENT before wiping local
+# state, restore it via env across the exec, and the post-exec arg
+# parser respects it as if the user had passed `--room` again.
 _self_heal_stale_host() {
-  # Mesh-gist takeover. Inputs: stale_id only — the room_name argument
-  # from the per-room era is gone; mesh is per-account singleton, so
-  # there's nothing to discriminate on.
   local stale_id="$1"
   local jitter; jitter=$(awk -v r="$RANDOM" 'BEGIN{printf "%.3f", 0.1 + (r%1500)/1000}')
   sleep "$jitter"
@@ -355,11 +376,19 @@ _self_heal_stale_host() {
   else
     echo "  ⚠  Stale mesh gist already gone — another tab may have taken over first."
   fi
+  # Capture the user's --room intent BEFORE wiping room_name. Caller
+  # sets ROOM_INTENT_FOR_REEXEC in the cmd_connect frame whenever the
+  # explicit --room flag was used; anywhere else it's empty and we
+  # reexec without the override (auto-scope decides as usual).
+  local _saved_intent="${ROOM_INTENT_FOR_REEXEC:-}"
   # _mesh_find returns the singleton mesh gist (oldest-by-created if
   # multiple are present from a race). If something is there, another
   # tab beat us — rejoin pointed at it.
   local picked; picked=$(_mesh_find)
   rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_name"
+  if [ -n "$_saved_intent" ]; then
+    export AIRC_ROOM_INTENT="$_saved_intent"
+  fi
   if [ -n "$picked" ] && [ "$picked" != "$stale_id" ]; then
     echo "  ✓ Another tab beat us to it — joining their fresh mesh gist ($picked)"
     echo ""
@@ -797,21 +826,11 @@ spawn_general_sidecar_if_wanted() {
 
   echo "  Also subscribing to #general (--no-general to opt out)"
 
-  # 1. Subscribe in config.
-  "$AIRC_PYTHON" -m airc_core.config subscribe \
-    --config "$CONFIG" --channel general 2>/dev/null || true
-
-  # 2. Resolve the canonical #general gist on this gh account
-  #    (find existing or create new). Reuses the same find-or-create
-  #    discovery that the primary room bootstrap goes through.
+  # Subscribe + resolve-or-create + persist mapping. Same dance every
+  # channel-add path runs (helper extracted in cmd_connect.sh, post
+  # 2026-04-29 custom-rooms refactor).
   local _general_gid
-  _general_gid=$("$AIRC_PYTHON" -m airc_core.channel_gist resolve \
-    --channel general --create-if-missing 2>/dev/null || true)
-
-  if [ -n "$_general_gid" ]; then
-    # 3. Persist channel→gist mapping so cmd_send + monitor can route.
-    "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
-      --config "$CONFIG" --channel general --gist-id "$_general_gid" 2>/dev/null || true
+  if _general_gid=$(ensure_channel_subscribed_with_gist general); then
     echo "    #general gist: $_general_gid"
   else
     echo "  ⚠ Could not resolve #general gist (no gh auth?). #general subscription is config-only; cross-room messaging won't work until resolved." >&2

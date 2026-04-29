@@ -3174,6 +3174,35 @@ except Exception:
   cleanup_all
 }
 
+scenario_custom_room_creates_gist() {
+  # Regression for the 2026-04-29 "phantom-room" + "auto-scope override"
+  # convergence: `airc join --room <new>` from a fresh scope must
+  # actually create a gist for <new>, set channel_gists[<new>], and
+  # subscribe in config — not silently fall back to git-org auto-scope
+  # or leave channel_gists empty.
+  section "custom room: airc join --room <new> creates the gist + mapping"
+  command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1 || { echo "  (skipped — gh not authed)"; return; }
+  cleanup_all
+  local rname="tdd-custom-room-$$"
+  local home; home=$(mktemp -d -t airc-it-customroom.XXXXXX)
+  ( cd "$home" && AIRC_HOME="$home/state" AIRC_NAME=tdd-cr-$$ AIRC_PORT=7565 AIRC_NO_DISCOVERY=1 AIRC_NO_AUTO_ROOM=1 \
+      "$AIRC" connect --room "$rname" --no-general > "$home/out.log" 2>&1 & )
+  local i; for i in 1 2 3 4 5 6 7 8; do sleep 1; [ -f "$home/state/config.json" ] && break; done
+  sleep 2
+  local gid; gid=$(python3 -c "import json,sys;print(json.load(open('$home/state/config.json')).get('channel_gists',{}).get('$rname',''))" 2>/dev/null)
+  trap "[ -n '$gid' ] && gh gist delete '$gid' --yes 2>/dev/null || true" EXIT
+  if [ -n "$gid" ]; then pass "channel_gists['$rname'] = $gid"; else fail "channel_gists['$rname'] empty — phantom room"; cleanup_all; return; fi
+  gh api "gists/$gid" --jq '.id' >/dev/null 2>&1 && pass "gist actually exists on gh" || fail "gist id present but gh has no such gist"
+  local marker="tdd-cr-$$"
+  AIRC_HOME="$home/state" "$AIRC" msg --room "$rname" "$marker" >/dev/null 2>&1
+  sleep 2
+  gh api "gists/$gid" --jq '.files["messages.jsonl"].content // ""' 2>/dev/null | grep -q "$marker" \
+    && pass "broadcast to #$rname landed in its gist" \
+    || fail "broadcast to #$rname did NOT land — channel routing broken"
+  trap - EXIT; gh gist delete "$gid" --yes 2>/dev/null || true
+  cleanup_all
+}
+
 scenario_bearer_local() {
   # LocalBearer used to serve same-machine peers via direct filesystem
   # reads/writes — a "skip the network" optimization correct in the
@@ -3734,6 +3763,7 @@ case "$MODE" in
   general_has_shared_gist) scenario_general_has_shared_gist ;;
   channel_gist_prefers_single_channel) scenario_channel_gist_prefers_single_channel ;;
   gist_rotates_under_size_limit) scenario_gist_rotates_under_size_limit ;;
+  custom_room_creates_gist) scenario_custom_room_creates_gist ;;
   ""|all)
     # Default = run everything. The peers_cross_scope + whois_cross_scope
     # scenarios were removed in PR #239 (sidecar walk semantics deleted
@@ -3752,6 +3782,7 @@ case "$MODE" in
     scenario_bearer_ssh_send; scenario_bearer_ssh_recv; scenario_bearer_cli_recv
     scenario_bearer_observability; scenario_bearer_local; scenario_bearer_gh
     scenario_e2e_encryption
+    scenario_custom_room_creates_gist
     ;;
   *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|all]"; exit 2 ;;
 esac
