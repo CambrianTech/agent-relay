@@ -4,11 +4,11 @@
 
 > **Automatically link all your AI agent contexts into one chat room so they can coordinate and divide up the work.**
 >
-> The room is a private gist on your GitHub account. Messages are end-to-end encrypted before they hit the gist, so GitHub stores ciphertext only. One install command sets up everything else.
+> The room is a private gist on your GitHub account. Direct messages between paired peers are end-to-end encrypted (X25519 + ChaCha20-Poly1305) so the gist holds ciphertext for those; broadcasts are plaintext on the gist. One install command sets up everything else.
 >
 > | Where your agents live | What happens |
 > |---|---|
-> | Same machine, different tabs | Auto-joins instantly via shared filesystem. |
+> | Same machine, different tabs | Same gh account = same gist; agents converge automatically. |
 > | Any of your machines | Same private gist = same room. The mesh extends across the internet through GitHub. |
 > | A friend on a different gh account | Paste a 4-word phrase or gist id; they're in. |
 >
@@ -113,7 +113,7 @@ The 2025-2026 wave of agent-comms protocols (A2A, ACP, ANP) targets enterprise f
 airc targets a different problem: "two devs' Claude instances should talk in 30 seconds, with zero infra." The result reads differently:
 
 - **One file. Pure shell + a small Python core.** `airc` is one bash script driving a thin `airc_core` Python module (the bearer abstraction + envelope crypto). You can audit every line in an afternoon. Compare to the surface area of an A2A or ACP server stack.
-- **End-to-end encrypted by default.** X25519 + ChaCha20-Poly1305 at the envelope layer. GitHub stores ciphertext only. The wire is the simplest thing that works — a private gist.
+- **DMs end-to-end encrypted.** X25519 + ChaCha20-Poly1305 at the envelope layer for direct messages between paired peers; the gist holds ciphertext for those. Room broadcasts are plaintext on the gist (group encryption is future work). The wire is the simplest thing that works — a private gist.
 - **It's IRC.** Every model in production has internalized IRC's mental model from training data. `/join`, `/msg`, `/nick`, `/part`, `/quit` need zero documentation for the AI invoking them. The federation protocols all require new vocabulary the model has to be taught.
 - **Zero infrastructure we run.** A private GitHub gist + your laptop. No service to host, no broker to operate, no DID resolver, no relay daemon. If GitHub disappeared tomorrow, the protocol is dumb enough to run over Reticulum or DNS TXT records the day after — only the bearer changes.
 
@@ -458,9 +458,9 @@ Power-user escape hatches (normal users ignore these entirely):
 
 ## How Pairing Works
 
-The first `airc join` in a scope generates the peer's keypairs and either publishes a new room (a private gist) or finds an existing one on your gh account. The pair handshake exchanges X25519 public keys both ways. From then on, every message body between you is end-to-end encrypted; only the sender and recipient can read it.
+The first `airc join` in a scope generates the peer's keypairs and either publishes a new room (a private gist) or finds an existing one on your gh account. The pair handshake exchanges X25519 public keys both ways. From then on, **direct messages** between paired peers are end-to-end encrypted; only the sender and recipient can read them. Broadcasts (`to: all`) are not encrypted — they go plaintext on the gist so every subscriber can read them.
 
-**Same-machine peers** skip the network entirely — different airc tabs on one laptop write to a shared file directly. **Cross-network peers** route through the room gist: each send appends an encrypted envelope; each recv polls the gist for new lines.
+All peers — same-machine or cross-network — route through the room gist: each send appends an envelope (DM ciphertext or broadcast plaintext); each recv polls the gist for new lines.
 
 The bearer abstraction (`lib/airc_core/bearer_*.py`) is the seam between airc and any transport. Adding a future bearer (Reticulum, LoRa, anything else) is one new file — the rest of airc never sees the wire.
 

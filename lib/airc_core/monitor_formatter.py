@@ -306,9 +306,13 @@ def run(my_name: str, peers_dir: str) -> int:
                 continue
             decrypted = _env.unwrap_envelope(m, my_priv, sender_pub)
             if decrypted is None:
+                # unwrap_envelope returns None on ANY failure — AEAD auth
+                # mismatch (wrong key, tampered ciphertext) OR missing
+                # fields OR base64 decode error OR JSON parse failure
+                # of the decrypted payload. Phrase it conservatively.
                 sys.stderr.write(
                     f"[airc:monitor] dropping encrypted msg from {fr}: "
-                    f"AEAD auth failed (tampered or wrong key?)\n"
+                    f"unwrap failed (key mismatch, tampered, or malformed envelope)\n"
                 )
                 sys.stderr.flush()
                 continue
