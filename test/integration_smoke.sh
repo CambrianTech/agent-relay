@@ -272,6 +272,192 @@ scenario_idle_then_recv() {
 # `airc part` from the host should delete the room gist on gh.
 # Joiners parting just teardown locally (host's gist persists).
 # ─────────────────────────────────────────────────────────────────────
+scenario_orphan_loops_self_reap() {
+  # Regression for #325. Bash subshells (reminder_timer_loop /
+  # flush_pending_loop) capture $PPID at start; on parent death they
+  # exit at next iteration. Pre-fix they survived parent and emitted
+  # "Reminder, silent" forever, the visible 'frozen monitor' symptom.
+  section "orphan_loops_self_reap: parent dies → reminder/flush exit within ~10s"
+  cleanup_homes_pre
+
+  local A_HOME
+  A_HOME=$(mktemp -d -t airc-orphan-loop.XXXXXX)
+  trap "cleanup_homes '$A_HOME'" RETURN
+  # Inline spawn — no gh, just need a process tree alive. Don't use
+  # spawn_real (which waits for channel_gists population, which never
+  # happens with --no-room --no-gist).
+  mkdir -p "$A_HOME/state"
+  ( cd "$A_HOME" \
+      && AIRC_HOME="$A_HOME/state" AIRC_NAME="orphan-A-$$" AIRC_PORT=7611 \
+         AIRC_NO_DISCOVERY=1 AIRC_NO_AUTO_ROOM=1 AIRC_NO_GENERAL=1 AIRC_NO_IDENTITY_PROMPT=1 \
+         "$AIRC" connect --no-room --no-gist > "$A_HOME/out.log" 2>&1 & )
+  local i
+  for i in $(seq 1 10); do
+    sleep 1
+    grep -q "Hosting as" "$A_HOME/out.log" 2>/dev/null && break
+  done
+  if ! grep -q "Hosting as" "$A_HOME/out.log" 2>/dev/null; then
+    fail "host bash never reached 'Hosting as'"; return
+  fi
+  sleep 3
+
+  # Find the parent bash via airc.pid (the parent writes its $$ there).
+  local parent_pid loop_pids
+  parent_pid=$(awk '{print $1}' "$A_HOME/state/airc.pid" 2>/dev/null)
+  [ -n "$parent_pid" ] || { fail "no airc.pid for the test scope"; return; }
+  # Filter to BASH subshell children only — those are the loops with
+  # the parent-liveness check (#325). Python descendants (handshake,
+  # monitor_formatter, etc) get reaped by other mechanisms and aren't
+  # what this test covers.
+  loop_pids=$(ps -ef | awk -v p="$parent_pid" '$3 == p && $0 ~ /\/bin\/bash/ {print $2}' | tr '\n' ' ')
+  pass "spawned: parent=$parent_pid loop-pids=[$loop_pids]"
+
+  # SIGKILL the parent (no traps run; loops are now reparented to init).
+  kill -9 "$parent_pid" 2>/dev/null
+  # Wait long enough for the 5s loop-tick to detect parent death.
+  sleep 9
+
+  # The reminder + flush loops (which #325 fixed) should be dead. The
+  # foreground monitor()'s tail/formatter pipeline children (still in
+  # progress until pipe breaks) may or may not be dead at this point
+  # depending on timing. Assert at least 2 of the loop_pids are dead
+  # — that's the regression guard for #325. Pre-fix all of them
+  # survived; post-fix at least the 2 fixed loops self-reap.
+  local total=0 dead=0
+  for p in $loop_pids; do
+    total=$((total+1))
+    kill -0 "$p" 2>/dev/null || dead=$((dead+1))
+  done
+  if [ "$dead" -ge 2 ]; then
+    pass "$dead of $total bash subshell loops self-reaped within 9s (#325 working)"
+  else
+    fail "only $dead of $total subshells exited — #325 parent-liveness check broken"
+    pkill -9 -f "$A_HOME/state" 2>/dev/null
+  fi
+}
+
+scenario_teardown_kills_env_tagged_orphans() {
+  # Regression for #326. Even when airc.pid gets out of sync (parent
+  # dies before children write their pids, or subshells reparent to
+  # init), teardown must catch every process whose env has
+  # AIRC_HOME=<scope> via the ps eww walk.
+  section "teardown_kills_env_tagged_orphans: every AIRC_HOME-tagged proc dies"
+  cleanup_homes_pre
+
+  local A_HOME
+  A_HOME=$(mktemp -d -t airc-td-orphan.XXXXXX)
+  trap "cleanup_homes '$A_HOME'" RETURN
+  mkdir -p "$A_HOME/state"
+  ( cd "$A_HOME" \
+      && AIRC_HOME="$A_HOME/state" AIRC_NAME="td-orphan-$$" AIRC_PORT=7612 \
+         AIRC_NO_DISCOVERY=1 AIRC_NO_AUTO_ROOM=1 AIRC_NO_GENERAL=1 AIRC_NO_IDENTITY_PROMPT=1 \
+         "$AIRC" connect --no-room --no-gist > "$A_HOME/out.log" 2>&1 & )
+  local i
+  for i in $(seq 1 10); do
+    sleep 1
+    grep -q "Hosting as" "$A_HOME/out.log" 2>/dev/null && break
+  done
+  grep -q "Hosting as" "$A_HOME/out.log" 2>/dev/null \
+    || { fail "host bash never reached 'Hosting as'"; return; }
+  sleep 3
+
+  # Count scope-path-tagged processes pre-teardown via pgrep -f
+  # (matches python children whose argv contains the scope path —
+  # the same matcher cmd_teardown.sh now uses for its sweep).
+  local pre_count
+  pre_count=$(pgrep -f "$A_HOME/state" 2>/dev/null | wc -l | tr -d ' ')
+  [ "$pre_count" -gt 0 ] || { fail "no scope-path-tagged procs found pre-teardown — broken setup"; return; }
+  pass "pre-teardown: $pre_count scope-path-tagged procs alive"
+
+  # Corrupt airc.pid to simulate the broken-tracking state — teardown
+  # must rely on its sweep, not the pidfile. Background + 15s timeout
+  # so a hung teardown doesn't wedge the test.
+  echo "999999" > "$A_HOME/state/airc.pid"
+  ( AIRC_HOME="$A_HOME/state" "$AIRC" teardown >/dev/null 2>&1 ) &
+  local td_pid=$!
+  local i
+  for i in $(seq 1 15); do
+    sleep 1
+    kill -0 "$td_pid" 2>/dev/null || break
+  done
+  if kill -0 "$td_pid" 2>/dev/null; then
+    fail "airc teardown hung beyond 15s — itself a regression"
+    kill -9 "$td_pid" 2>/dev/null
+    return
+  fi
+  sleep 1
+
+  local post_count
+  post_count=$(pgrep -f "$A_HOME/state" 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$post_count" = "0" ]; then
+    pass "post-teardown: zero scope-path-tagged procs (sweep worked)"
+  else
+    fail "post-teardown: $post_count procs still alive — #326 sweep didn't catch them"
+    pgrep -f "$A_HOME/state" 2>/dev/null | xargs -I{} ps -p {} -o pid,command 2>/dev/null | head -5
+  fi
+}
+
+scenario_my_scope_in_mesh() {
+  # Joel 2026-04-29: 'remember you need to be part of it'. The other
+  # scenarios spawn ephemeral test peers in /tmp and never include
+  # the user's actual long-running airc scope. This one DOES — it
+  # asserts that the live authenticator-448f scope (whatever scope
+  # is running in the user's primary cwd) receives messages a fresh
+  # test peer sends. If my own scope's monitor is broken, this catches
+  # it where the isolated tests can't.
+  section "my_scope_in_mesh: live local scope receives messages from a fresh peer"
+  require_gh || return
+
+  local MY_HOME="${HOME}/Development/ideem/authenticator/.airc"
+  if [ ! -f "$MY_HOME/config.json" ]; then
+    skip "primary scope ($MY_HOME) not initialized — run 'airc join' there first"
+    return
+  fi
+
+  # Confirm my scope's monitor is running. If not, the test pre-condition
+  # fails — the user must have a healthy scope before this test runs.
+  local my_pids
+  my_pids=$(ps eww -o pid,command 2>/dev/null \
+            | awk -v home="AIRC_HOME=$MY_HOME" '$0 ~ home {print $1}' | head -3)
+  if [ -z "$my_pids" ]; then
+    skip "no running airc procs for primary scope — start it with 'airc join'"
+    return
+  fi
+  pass "primary scope alive (pids: $(echo $my_pids | tr '\n' ' '))"
+
+  local marker; marker="my-scope-test-$(date +%s%N)"
+  local TEST_HOME
+  TEST_HOME=$(mktemp -d -t airc-myscope.XXXXXX)
+  trap "cleanup_homes '$TEST_HOME'" RETURN
+  spawn_real "$TEST_HOME" "myscope-tester-$$" 7613 \
+    || { fail "test peer failed to join"; return; }
+  sleep 4
+
+  AIRC_HOME="$TEST_HOME/state" "$AIRC" msg --room general "$marker" >/dev/null 2>&1
+  pass "test peer sent marker"
+
+  # Watch the user's primary log for ~45s (gh poll cycle + buffer).
+  local i seen=0
+  for i in $(seq 1 22); do
+    sleep 2
+    grep -qF "$marker" "$MY_HOME/messages.jsonl" 2>/dev/null && { seen=1; break; }
+  done
+
+  if [ "$seen" = "1" ]; then
+    pass "primary scope's local log received the marker via gist polling"
+  else
+    fail "primary scope did NOT see the marker in 45s — bearer pipeline broken in user scope"
+    echo "    user scope last 3 events: $(tail -3 $MY_HOME/messages.jsonl 2>/dev/null | head -c 400)"
+  fi
+}
+
+# Helper: pre-test cleanup of any leftover test-scope orphans on this
+# machine (conservative — only matches our test prefixes).
+cleanup_homes_pre() {
+  pkill -9 -f "/tmp/airc-orphan-loop\|/tmp/airc-td-orphan\|/tmp/airc-myscope" 2>/dev/null || true
+  sleep 1
+}
+
 scenario_status_agrees_with_send() {
   # Today's bug Joel called out: 'airc status' said monitor: not running
   # while 'airc msg' worked + landed in gist. The two diagnostics
@@ -404,23 +590,29 @@ scenario_part_deletes_host_gist() {
 # Dispatch
 # ─────────────────────────────────────────────────────────────────────
 case "${1:-all}" in
-  passive_recv)              scenario_passive_recv ;;
-  round_trip)                scenario_round_trip ;;
-  idle_then_recv)            scenario_idle_then_recv ;;
-  part_deletes_host_gist)    scenario_part_deletes_host_gist ;;
-  status_agrees_with_send)   scenario_status_agrees_with_send ;;
-  stale_config_auto_resyncs) scenario_stale_config_auto_resyncs ;;
+  passive_recv)                   scenario_passive_recv ;;
+  round_trip)                     scenario_round_trip ;;
+  idle_then_recv)                 scenario_idle_then_recv ;;
+  part_deletes_host_gist)         scenario_part_deletes_host_gist ;;
+  status_agrees_with_send)        scenario_status_agrees_with_send ;;
+  stale_config_auto_resyncs)      scenario_stale_config_auto_resyncs ;;
+  orphan_loops_self_reap)         scenario_orphan_loops_self_reap ;;
+  teardown_kills_env_tagged_orphans) scenario_teardown_kills_env_tagged_orphans ;;
+  my_scope_in_mesh)               scenario_my_scope_in_mesh ;;
   all)
+    scenario_orphan_loops_self_reap
+    scenario_teardown_kills_env_tagged_orphans
     scenario_passive_recv
     scenario_round_trip
     scenario_status_agrees_with_send
     scenario_stale_config_auto_resyncs
     scenario_part_deletes_host_gist
+    scenario_my_scope_in_mesh
     # idle_then_recv last — slow (45s+ idle wait)
     scenario_idle_then_recv
     ;;
   *)
-    echo "Usage: $0 [passive_recv|round_trip|idle_then_recv|part_deletes_host_gist|status_agrees_with_send|stale_config_auto_resyncs|all]"
+    echo "Usage: $0 [passive_recv|round_trip|idle_then_recv|part_deletes_host_gist|status_agrees_with_send|stale_config_auto_resyncs|orphan_loops_self_reap|teardown_kills_env_tagged_orphans|my_scope_in_mesh|all]"
     exit 2
     ;;
 esac
