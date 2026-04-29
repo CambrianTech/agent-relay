@@ -298,7 +298,20 @@ ensure_prereqs() {
   # a TTY, CI, etc).
   if command -v gh >/dev/null 2>&1; then
     if ! gh auth status >/dev/null 2>&1; then
-      if [ -t 0 ] && [ -t 1 ]; then
+      # Skip the interactive auth path under sudo/root: gh stores the token
+      # for the calling user (root's keyring), but airc runs as the real
+      # user and reads the real user's token. Authing as root silently
+      # produces a working-as-root / broken-as-user state. Joel 2026-04-29:
+      # 'detect and if not, open it if it isnt sudo'.
+      _running_as_root=0
+      if [ "${EUID:-$(id -u 2>/dev/null || echo 1000)}" = "0" ] || [ -n "${SUDO_USER:-}" ]; then
+        _running_as_root=1
+      fi
+      if [ "$_running_as_root" = "1" ]; then
+        warn "gh is not authenticated, and install is running as root/sudo."
+        warn "  Don't auth gh as root — re-run as your normal user, or run once after install:"
+        warn "    gh auth login -h github.com -s gist"
+      elif [ -t 0 ] && [ -t 1 ]; then
         info "gh is not authenticated — launching 'gh auth login -s gist' now."
         info "  (Browser will open; sign in to GitHub. The 'gist' scope is required for the substrate.)"
         if gh auth login -h github.com -s gist; then
@@ -553,9 +566,16 @@ fi
 echo ""
 ok "Installed."
 echo ""
-echo "  Next:"
-echo "    airc join                      # auto-#general (joins existing or hosts)"
-echo "    airc msg @<peer> <message>     # DM (or omit @peer to broadcast)"
+echo "  Next — open your agent:"
+echo "    claude          # or codex, cursor, opencode, windsurf, openclaw, ..."
+echo ""
+echo "  Then, inside the agent:"
+echo "    /join                          # auto-scopes to your project's room"
+echo "    /msg @<peer> <message>         # DM (or omit @peer to broadcast)"
+echo ""
+echo "  Or run airc directly from this shell:"
+echo "    airc join"
+echo "    airc msg @<peer> <message>"
 echo ""
 echo "  Diagnose anytime:    airc doctor"
 echo "  Repair if needed:    airc doctor --fix"
