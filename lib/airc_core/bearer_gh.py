@@ -59,6 +59,18 @@ _MESSAGES_FILE = "messages.jsonl"
 _DEFAULT_POLL_INTERVAL = 15.0  # seconds; tuned for gh rate limit headroom
 _GH_API_TIMEOUT = 10.0          # per-call seconds; total wall time bounded by retry policy
 
+# Rotation thresholds (gh hard limit on a gist file is 1MB; we trim
+# proactively well before that so the next append always has headroom).
+# An average envelope post-Phase-E is ~300-500 bytes (sig + ts + AEAD
+# nonce + ciphertext); 600KB ≈ 1500-2000 envelopes per file. When we
+# cross _GIST_MAX_BYTES, we keep only the last _GIST_KEEP_LINES so the
+# substrate stays writable indefinitely. Older content is dropped —
+# losing it is preferable to the room going write-blocked forever.
+# Both can be tuned at runtime via env vars (AIRC_GIST_MAX_BYTES,
+# AIRC_GIST_KEEP_LINES) for tests + power users.
+_GIST_MAX_BYTES = 600_000   # rotate at 600KB (40% headroom under 1MB hard limit)
+_GIST_KEEP_LINES = 1000     # keep last 1000 lines after rotation
+
 
 def _resolve_gh_bin() -> str:
     """Locate gh CLI on PATH. Returns the path or raises GhBearerError.
@@ -123,6 +135,68 @@ def _gh_api_get(gist_id: str) -> Optional[dict]:
         return json.loads(r.stdout)
     except (ValueError, TypeError):
         return None
+
+
+def _rotate_if_needed(content: str) -> str:
+    """Trim the gist's messages.jsonl content when approaching gh's 1MB
+    file limit. Trim to a TARGET well below the trigger so we don't
+    re-rotate on every subsequent append — hysteresis between high-
+    and low-water marks gives the substrate breathing room.
+
+    Per Joel 2026-04-29: "when you trim, you go PAST the number so it
+    takes longer to trim again, otherwise you are constantly trimming."
+
+    High-water (MAX_BYTES, default 600KB): when content crosses, rotate.
+    Low-water (post-trim ≤ MAX_BYTES/2, ~300KB default): the rotation
+    target. Gives ~300KB of headroom for the next write burst before
+    the next rotation fires.
+
+    Also caps at KEEP_LINES (default 1000) so a flood of tiny lines
+    doesn't blow the line-count budget for line-oriented downstream
+    consumers (formatter, offset tracking).
+
+    All three knobs are env-tunable for tests + power users:
+      AIRC_GIST_MAX_BYTES    (default 600000) — trigger
+      AIRC_GIST_TARGET_BYTES (default MAX/2)  — post-trim ceiling
+      AIRC_GIST_KEEP_LINES   (default 1000)   — line-count cap
+
+    Idempotent below the trigger (returns content unchanged).
+    """
+    try:
+        max_bytes = int(os.environ.get("AIRC_GIST_MAX_BYTES", _GIST_MAX_BYTES))
+    except (TypeError, ValueError):
+        max_bytes = _GIST_MAX_BYTES
+    try:
+        target_bytes = int(os.environ.get("AIRC_GIST_TARGET_BYTES", max_bytes // 2))
+    except (TypeError, ValueError):
+        target_bytes = max_bytes // 2
+    try:
+        keep_lines = int(os.environ.get("AIRC_GIST_KEEP_LINES", _GIST_KEEP_LINES))
+    except (TypeError, ValueError):
+        keep_lines = _GIST_KEEP_LINES
+
+    # gh measures bytes, not chars; UTF-8 bytes is what counts.
+    if len(content.encode("utf-8")) <= max_bytes:
+        return content
+
+    # Walk the most-recent lines backward, accumulating bytes until we
+    # hit target_bytes OR keep_lines, whichever comes first. The walk
+    # gives us "the latest N lines that fit in target" — exactly the
+    # post-trim shape we want. Skip blanks so they don't burn the budget.
+    lines = [ln for ln in content.splitlines() if ln.strip()]
+    kept_reversed: list[str] = []
+    bytes_so_far = 0
+    for line in reversed(lines):
+        # +1 for the newline we'll add on join.
+        line_bytes = len(line.encode("utf-8")) + 1
+        if bytes_so_far + line_bytes > target_bytes:
+            break
+        if len(kept_reversed) >= keep_lines:
+            break
+        kept_reversed.append(line)
+        bytes_so_far += line_bytes
+    kept = list(reversed(kept_reversed))
+    return "\n".join(kept) + "\n" if kept else ""
 
 
 def _read_messages_content(gist_data: dict) -> str:
@@ -303,7 +377,8 @@ class GhBearer(Bearer):
                 kind="transient_failure",
                 detail="payload is not utf-8; gh-bearer requires text envelopes",
             )
-        new_content = _read_messages_content(gist) + framed_str
+        existing_content = _read_messages_content(gist)
+        new_content = _rotate_if_needed(existing_content) + framed_str
 
         ok, detail = _gh_gist_write_file(gist_id, new_content)
         if ok:
