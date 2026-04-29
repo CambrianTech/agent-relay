@@ -1318,10 +1318,13 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
         fi
 
         # Skip create-new entirely if we already adopted an existing
-        # canonical gist above (find-first convergence path).
+        # canonical gist above (find-first convergence path). Still
+        # need to set the variables downstream heartbeat setup uses
+        # — _now (timestamp) and _machine_id — since the create-new
+        # block populates them and we're skipping it.
         if [ -n "${_existing_room_gid:-}" ]; then
-          true  # No-op; downstream heartbeat + monitor setup uses
-                # _gist_id / _gist_url already set above.
+          local _now; _now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          local _machine_id; _machine_id=$(host_machine_id)
         else
         # Bootstrap basename + description match channel_gist.create_new's
         # canonical shape (airc-room-<channel>.json + "airc room: #X").
