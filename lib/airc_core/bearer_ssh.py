@@ -313,14 +313,21 @@ class SshBearer(Bearer):
             argv = _build_ssh_argv(host_target, identity_key, remote_cmd)
 
             try:
+                # Use BufferedReader (default bufsize) + explicit readline()
+                # rather than iter(proc.stdout). bufsize=0 with text=False
+                # gives a raw FileIO that doesn't yield lines on iteration;
+                # bufsize=1 (line-buffered) is text-mode only and falls back
+                # to 8KB buffering for bytes, delaying delivery by seconds.
+                # readline() blocks until \n arrives — which is immediately
+                # since ssh+tail flushes line-paced. Surfaced by
+                # scenario_bearer_ssh_recv (Phase 2b prep).
                 proc = subprocess.Popen(
                     argv,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
-                    bufsize=1,  # line-buffered
                     text=False,
                 )
-            except OSError as e:
+            except OSError:
                 # Brief backoff so we don't hot-loop on a missing ssh binary
                 # or similar permanent error. Caller's watchdog will notice
                 # extended silence via liveness() and escalate.
@@ -330,8 +337,9 @@ class SshBearer(Bearer):
             self._proc = proc
             try:
                 assert proc.stdout is not None  # Popen kw guarantees this
-                for raw_line in proc.stdout:
-                    if self._closed:
+                while not self._closed:
+                    raw_line = proc.stdout.readline()
+                    if not raw_line:  # EOF (ssh died)
                         break
                     self._on_line_received(raw_line, offset_file)
                     msg = self._parse_envelope(raw_line)
