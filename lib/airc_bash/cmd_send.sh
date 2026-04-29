@@ -274,7 +274,7 @@ cmd_send() {
       "$peer_name" "$active_channel" \
       --host-target "$host_target" \
       --remote-home "$rhome" \
-      --room-gist-id "$room_gist_id" 2>/dev/null)
+      --room-gist-id "$room_gist_id")
     local kind detail
     kind=$(printf '%s' "$outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("kind",""))' 2>/dev/null)
     detail=$(printf '%s' "$outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("detail",""))' 2>/dev/null)

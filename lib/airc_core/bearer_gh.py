@@ -371,28 +371,20 @@ class GhBearer(Bearer):
         """Append `payload` to the room gist's messages.jsonl file with
         ETag-conditional concurrency control.
 
-        Pre-2026-04-29 this was a naive GET-then-PUT race: two peers
-        chattering at the same time would each read the same content,
-        each append their own line, each PUT the result; last writer
-        won, the other's line silently vanished. continuum-b741 caught
-        only-1-of-3 PONGs reaching the gist as the highest-impact
-        symptom (#299), but every concurrent broadcast suffered the
-        same loss class.
-
-        Now: GET captures the gist's ETag, PATCH carries `If-Match: <etag>`.
-        On 412 Precondition Failed (another peer wrote first), retry up
-        to RETRIES times — each retry re-reads, so the merge keeps both
-        the racer's line AND ours. Below the chat-pace traffic level a
-        single retry suffices; bound the loop so a hot room doesn't
-        livelock.
+        Concurrency model: GitHub's gists PATCH endpoint rejects
+        conditional headers (If-Match → 400) so optimistic-locking via
+        ETag isn't an option. Instead: read-modify-PATCH loop with two
+        conflict-detection paths: (1) explicit HTTP 409 from gh ("Gist
+        cannot be updated") → retry; (2) verify-after-write — re-GET
+        and check our line is in the post-write content; if not,
+        another peer's PATCH clobbered ours silently → retry. Both
+        paths bounded by RETRIES.
 
         Outcome kinds:
-          delivered          — PATCH succeeded
-          transient_failure  — read failed, write failed, network blip,
-                               rate limit, retries exhausted on conflict
-          auth_failure       — gh auth status currently fails (the
-                               can_serve gate caught a stale state, but
-                               token expired between can_serve and now)
+          delivered          — PATCH succeeded and verify saw our line
+          transient_failure  — read/write/network failure or retries
+                               exhausted on conflicts
+          auth_failure       — 401/404/permission from gh
         """
         self._check_alive()
 

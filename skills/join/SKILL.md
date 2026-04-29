@@ -28,7 +28,7 @@ Opt-outs:
 - `AIRC_NO_GENERAL=1 airc join` → env var equivalent of `--no-general`. Useful for test harnesses or `.envrc` files.
 - `AIRC_NO_AUTO_ROOM=1 airc join` → skip git-org auto-scoping; defaults to `#general` only.
 
-**Transport:** post-Phase-3c, the gist IS the wire. Same-machine peers use direct fs reads (LocalBearer); cross-network peers use gh-as-bearer (poll/append the room gist). No Tailscale, no sshd. **Messages are end-to-end encrypted** at the envelope layer (X25519 + ChaCha20-Poly1305) — GitHub stores ciphertext only.
+**Transport:** post-Phase-3c+, the gist IS the wire for ALL peers. Every peer polls the room gist via `gh api`; sends append via `gh api PATCH`. No Tailscale, no sshd, no LocalBearer shortcut (pulled 2026-04-29 after silent-loss bug). **DM payloads are end-to-end encrypted** at the envelope layer (X25519 + ChaCha20-Poly1305) when both peers have paired pubkeys; broadcasts go plaintext on the gist (group encryption is future work).
 
 `gh` CLI is **required**, not optional. The whole substrate is built on it. If the user doesn't have it: `brew install gh && gh auth login`.
 
