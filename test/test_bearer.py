@@ -253,6 +253,171 @@ class SshBearerSendTests(unittest.TestCase):
             o.kind = "tampered"
 
 
+class SshBearerRecvStreamTests(unittest.TestCase):
+    """Phase 2a SshBearer.recv_stream() — yields ReceivedMessage events
+    parsed from ssh tail's stdout. Tests mock subprocess.Popen so no real
+    network is touched.
+    """
+
+    def _bearer(self, meta=None):
+        m = meta or {
+            "host_target": "alice@example:7547",
+            "remote_home": "$HOME/.airc",
+            "identity_key": "/tmp/fake_key",
+        }
+        b = SshBearer(m)
+        b.open("alice")
+        return b
+
+    def _fake_proc(self, lines, returncode=0):
+        """Build a mock subprocess that yields `lines` from stdout then ends."""
+        # Use BytesIO-style iterator. Popen's stdout iter yields bytes.
+        proc = mock.Mock()
+        proc.stdout = iter(lines)
+        proc.poll = mock.Mock(return_value=returncode)
+        proc.terminate = mock.Mock()
+        proc.wait = mock.Mock(return_value=returncode)
+        proc.kill = mock.Mock()
+        return proc
+
+    def test_recv_stream_without_host_target_raises(self):
+        b = SshBearer({})
+        b.open("alice")
+        with self.assertRaises(SshBearerError):
+            next(b.recv_stream())
+        b.close()
+
+    def test_envelope_parser_drops_non_json(self):
+        # Junk line → None
+        self.assertIsNone(SshBearer._parse_envelope(b"not json\n"))
+        # Empty line → None
+        self.assertIsNone(SshBearer._parse_envelope(b"\n"))
+        # JSON but not an object → None
+        self.assertIsNone(SshBearer._parse_envelope(b"[1,2,3]\n"))
+        # Object missing `from` → None
+        self.assertIsNone(SshBearer._parse_envelope(b'{"channel":"x"}\n'))
+
+    def test_envelope_parser_accepts_well_formed(self):
+        line = b'{"from":"bob","channel":"general","msg":"hi"}\n'
+        msg = SshBearer._parse_envelope(line)
+        self.assertIsNotNone(msg)
+        self.assertEqual(msg.sender_peer_id, "bob")
+        self.assertEqual(msg.channel, "general")
+        # Payload is the original line (sans trailing newline)
+        self.assertEqual(msg.payload, b'{"from":"bob","channel":"general","msg":"hi"}')
+        self.assertIn("envelope", msg.bearer_metadata)
+        self.assertEqual(msg.bearer_metadata["envelope"]["msg"], "hi")
+
+    def test_compute_tail_position_no_offset_file(self):
+        self.assertEqual(SshBearer._compute_tail_position(None), "-n 0")
+
+    def test_compute_tail_position_invalid_offsets(self):
+        import tempfile
+        for content in ("", "0", "abc", "-1", "  "):
+            with tempfile.NamedTemporaryFile("w", delete=False) as f:
+                f.write(content)
+                path = f.name
+            self.assertEqual(
+                SshBearer._compute_tail_position(path), "-n 0",
+                f"content={content!r} should produce -n 0",
+            )
+
+    def test_compute_tail_position_resumes_past_saved_line(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write("42")
+            path = f.name
+        self.assertEqual(SshBearer._compute_tail_position(path), "-n +43")
+
+    @mock.patch.object(bearer_ssh.subprocess, "Popen")
+    def test_recv_stream_yields_parsed_envelopes(self, mock_popen):
+        lines = [
+            b'{"from":"bob","channel":"general","msg":"hello"}\n',
+            b'{"from":"carol","channel":"general","msg":"world"}\n',
+            b'corrupted line\n',  # should be silently dropped
+            b'{"from":"dave","channel":"useideem","msg":"hi"}\n',
+        ]
+        mock_popen.return_value = self._fake_proc(lines)
+
+        b = self._bearer()
+        events = []
+        # Take 3 events then close (stops the iterator). The mock proc's
+        # stdout iterator will exhaust naturally.
+        gen = b.recv_stream()
+        for ev in gen:
+            events.append(ev)
+            if len(events) >= 3:
+                b.close()
+                break
+
+        self.assertEqual(len(events), 3)
+        self.assertEqual(events[0].sender_peer_id, "bob")
+        self.assertEqual(events[1].sender_peer_id, "carol")
+        # Note: events[2] is "dave" — the malformed line was skipped.
+        self.assertEqual(events[2].sender_peer_id, "dave")
+
+    @mock.patch.object(bearer_ssh.subprocess, "Popen")
+    def test_liveness_updates_on_each_event(self, mock_popen):
+        lines = [b'{"from":"bob","channel":"general","msg":"hi"}\n']
+        mock_popen.return_value = self._fake_proc(lines)
+
+        b = self._bearer()
+        # Pre-stream: no signal
+        live_before = b.liveness("alice")
+        self.assertIsNone(live_before.last_seen_ts)
+        self.assertIn("no events", live_before.bearer_diag.lower())
+
+        # Consume one event, check liveness BEFORE closing
+        gen = b.recv_stream()
+        next(gen)
+        live_after = b.liveness("alice")
+        self.assertIsNotNone(live_after.last_seen_ts)
+        self.assertIn("ssh tail", live_after.bearer_diag.lower())
+        b.close()
+
+    @mock.patch.object(bearer_ssh.subprocess, "Popen")
+    def test_recv_stream_persists_offset(self, mock_popen):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write("0")
+            offset_path = f.name
+
+        lines = [
+            b'{"from":"bob","channel":"general","msg":"a"}\n',
+            b'{"from":"bob","channel":"general","msg":"b"}\n',
+        ]
+        mock_popen.return_value = self._fake_proc(lines)
+
+        meta = {
+            "host_target": "alice@example:7547",
+            "remote_home": "$HOME/.airc",
+            "identity_key": "/tmp/fake_key",
+            "offset_file": offset_path,
+        }
+        b = self._bearer(meta)
+
+        gen = b.recv_stream()
+        next(gen)
+        next(gen)
+        b.close()
+
+        with open(offset_path) as f:
+            self.assertEqual(f.read().strip(), "2")
+
+    def test_close_terminates_recv_subprocess(self):
+        b = self._bearer()
+        # Simulate a running proc
+        fake_proc = mock.Mock()
+        fake_proc.poll = mock.Mock(return_value=None)  # still running
+        fake_proc.terminate = mock.Mock()
+        fake_proc.wait = mock.Mock(return_value=0)
+        fake_proc.kill = mock.Mock()
+        b._proc = fake_proc
+
+        b.close()
+        fake_proc.terminate.assert_called_once()
+
+
 class CgnatRegexTests(unittest.TestCase):
     """The Tailscale-CGNAT range matcher is the only Tailscale knowledge
     in the codebase outside install scripts. Until Phase 3 deletes it,

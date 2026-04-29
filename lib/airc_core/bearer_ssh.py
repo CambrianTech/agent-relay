@@ -193,6 +193,8 @@ class SshBearer(Bearer):
         self._opened_peer_id: Optional[str] = None
         self._peer_meta: dict = peer_meta or {}
         self._closed = False
+        self._proc = None  # active recv_stream Popen, if any
+        self._last_recv_ts: Optional[float] = None
 
     def _check_alive(self) -> None:
         if self._closed:
@@ -275,21 +277,217 @@ class SshBearer(Bearer):
         return SendOutcome(kind=kind, detail=detail)
 
     def recv_stream(self) -> Iterator[ReceivedMessage]:
+        """Stream events from the host's messages.jsonl via SSH-tail.
+
+        Internally manages: ssh subprocess lifecycle, line-buffered stdout
+        parsing, JSON decoding, and reconnection on SSH death. Yields one
+        ReceivedMessage per valid envelope on the wire. Malformed lines
+        are dropped silently (the formatter has caught these for years
+        — preserving that behavior). close() makes the generator return.
+
+        Reconnection: SSH dies → wait briefly → reopen with the persisted
+        line offset → resume yielding. The offset is updated as events
+        flow so a reconnect mid-stream doesn't replay or skip. Watchdog,
+        escalation counter, and any UX response to extended silence are
+        CALLER concerns — the bearer's job is to keep producing events
+        and update its own liveness signal so liveness() answers honestly.
+
+        ABC contract reminder: callers must use line-buffered IO. SSH's
+        stdout is unbuffered when tail is the underlying command, so this
+        is naturally line-paced.
+        """
         self._check_alive()
-        raise NotImplementedError(
-            "SshBearer.recv_stream is Phase 2 work; the monitor still does "
-            "SSH-tail directly. The Phase 2 PR relocates that logic here."
+
+        host_target = self._peer_meta.get("host_target")
+        if not host_target:
+            raise SshBearerError(
+                "SshBearer.recv_stream called with no host_target in peer_meta"
+            )
+        remote_home = self._peer_meta.get("remote_home", "$HOME/.airc")
+        identity_key = self._peer_meta.get("identity_key")
+        offset_file = self._peer_meta.get("offset_file")
+
+        while not self._closed:
+            tail_pos = self._compute_tail_position(offset_file)
+            remote_cmd = f"tail {tail_pos} -F {remote_home}/messages.jsonl 2>/dev/null"
+            argv = _build_ssh_argv(host_target, identity_key, remote_cmd)
+
+            try:
+                proc = subprocess.Popen(
+                    argv,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    bufsize=1,  # line-buffered
+                    text=False,
+                )
+            except OSError as e:
+                # Brief backoff so we don't hot-loop on a missing ssh binary
+                # or similar permanent error. Caller's watchdog will notice
+                # extended silence via liveness() and escalate.
+                self._sleep_or_break(3.0)
+                continue
+
+            self._proc = proc
+            try:
+                assert proc.stdout is not None  # Popen kw guarantees this
+                for raw_line in proc.stdout:
+                    if self._closed:
+                        break
+                    self._on_line_received(raw_line, offset_file)
+                    msg = self._parse_envelope(raw_line)
+                    if msg is None:
+                        continue
+                    yield msg
+            finally:
+                self._reap_proc(proc)
+                self._proc = None
+            # SSH died — backoff briefly, then reconnect (unless closed).
+            if not self._closed:
+                self._sleep_or_break(3.0)
+
+    @staticmethod
+    def _compute_tail_position(offset_file: Optional[str]) -> str:
+        """Decide tail's `-n` flag based on the persisted offset.
+
+        Mirrors the bash monitor's logic verbatim:
+          - empty / 0 / non-numeric → `-n 0` (start at EOF, no replay)
+          - positive integer N → `-n +N+1` (resume past line N)
+
+        Stale-offset detection (offset > host's current line count) is
+        deliberately NOT done here — that's a one-shot probe the caller
+        can run on first connect. Repeating it on every reconnect would
+        burn an SSH round-trip we don't need; the steady-state offset is
+        always sane because the formatter writes it monotonically.
+        """
+        if not offset_file:
+            return "-n 0"
+        try:
+            with open(offset_file, "r") as f:
+                raw = f.read().strip()
+        except OSError:
+            return "-n 0"
+        if not raw or not raw.isdigit():
+            return "-n 0"
+        try:
+            n = int(raw)
+        except ValueError:
+            return "-n 0"
+        if n <= 0:
+            return "-n 0"
+        return f"-n +{n + 1}"
+
+    def _on_line_received(self, raw_line: bytes, offset_file: Optional[str]) -> None:
+        """Update bearer-internal state on each received line.
+
+        - Bumps last_recv_ts so liveness() returns a fresh timestamp.
+        - Persists the new offset (line count) so reconnect resumes
+          past this line.
+        Persistence failures are swallowed — the bearer continues
+        streaming; a stale offset just means the next reconnect may
+        replay a few lines, which the caller can dedupe."""
+        import time as _time
+        self._last_recv_ts = _time.time()
+        if offset_file is None:
+            return
+        # Read-modify-write of the line count. Cheap because we're already
+        # the only writer (the formatter's old-path writer is replaced by
+        # this when monitor flips to recv_stream in Phase 2b).
+        try:
+            with open(offset_file, "r") as f:
+                cur = f.read().strip()
+            n = int(cur) if cur.isdigit() else 0
+        except (OSError, ValueError):
+            n = 0
+        try:
+            with open(offset_file, "w") as f:
+                f.write(str(n + 1))
+        except OSError:
+            pass
+
+    @staticmethod
+    def _parse_envelope(raw_line: bytes) -> Optional[ReceivedMessage]:
+        """Parse a single tail-stream line as a message envelope.
+
+        Returns None on malformed input — silent drop matches the prior
+        formatter behavior. Valid envelope = JSON object with at least
+        `from` and `channel` fields. The full envelope (including sig)
+        is preserved as the payload bytes so callers retain everything
+        they had before this seam existed.
+        """
+        line = raw_line.rstrip(b"\n").rstrip(b"\r")
+        if not line:
+            return None
+        import json as _json
+        try:
+            env = _json.loads(line)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(env, dict):
+            return None
+        sender = env.get("from")
+        channel = env.get("channel", "")
+        if not sender:
+            return None
+        return ReceivedMessage(
+            sender_peer_id=str(sender),
+            channel=str(channel),
+            payload=line,
+            bearer_metadata={"envelope": env},
         )
 
+    def _reap_proc(self, proc) -> None:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=1)
+        except OSError:
+            pass
+
+    def _sleep_or_break(self, seconds: float) -> None:
+        """Sleep `seconds` in small ticks so close() takes effect promptly.
+        Returns immediately if the bearer was closed during the wait."""
+        import time as _time
+        deadline = _time.time() + seconds
+        while not self._closed and _time.time() < deadline:
+            _time.sleep(0.1)
+
     def liveness(self, peer_id: str) -> LivenessResult:
+        """Report when this bearer last received an event from the peer.
+
+        SshBearer's natural liveness signal is "stream activity" — we
+        bump self._last_recv_ts on every line that comes through tail.
+        None means "no signal yet" (recv_stream hasn't yielded), not
+        "definitely dead." Caller's watchdog interprets staleness.
+
+        This is the bearer-side of the airc-status / airc-peers
+        observability fix from #270: instead of reading some external
+        heartbeat file, the SSH-bearer attests directly to "the SSH
+        stream produced an event N seconds ago."
+        """
         self._check_alive()
-        raise NotImplementedError(
-            "SshBearer.liveness is Phase 2 work; status surfaces still read "
-            "the heartbeat file directly."
+        if self._last_recv_ts is None:
+            return LivenessResult(
+                peer_id=peer_id,
+                last_seen_ts=None,
+                bearer_diag="no events received via ssh tail yet",
+            )
+        return LivenessResult(
+            peer_id=peer_id,
+            last_seen_ts=self._last_recv_ts,
+            bearer_diag="last event from ssh tail",
         )
 
     def close(self) -> None:
-        # Idempotent per ABC contract.
+        # Idempotent per ABC contract. Tear down the recv_stream
+        # subprocess if running so the generator returns promptly.
         self._closed = True
+        proc = self._proc
+        if proc is not None:
+            self._reap_proc(proc)
+            self._proc = None
         self._opened_peer_id = None
         self._peer_meta = {}
