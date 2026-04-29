@@ -1146,8 +1146,23 @@ flush_pending_loop() {
   local rhome; rhome=$(remote_home)
   local ssh_key="$IDENTITY_DIR/ssh_key"
 
+  # Parent-liveness gate (#324 follow-up): when the bash parent that
+  # launched this subshell dies (bearer pipeline dies, formatter
+  # watchdog trips, signal kills the main connect process), this
+  # subshell is reparented to init and will keep running forever
+  # without a check. That produced the 'monitor frozen, only Reminder
+  # firing' symptom Joel kept seeing — one of these orphaned loops
+  # was alive while the rest of the scope was dead. Capture parent
+  # PID at start; exit when it dies.
+  local _parent_pid="$PPID"
+
   while true; do
     sleep 5
+    if ! kill -0 "$_parent_pid" 2>/dev/null; then
+      # Parent gone — we're orphaned. Exit so we don't keep doing
+      # work for a dead scope.
+      return 0
+    fi
     [ -s "$pending" ] || continue
 
     # Re-read host_target each iteration — user might have re-paired.
@@ -1209,8 +1224,17 @@ flush_pending_loop() {
 # Periodically checks whether the user has been silent longer than their
 # configured interval. Fires ONCE per silence period (via reminded marker).
 reminder_timer_loop() {
+  # Parent-liveness gate (#324 follow-up). Without this, this subshell
+  # survives parent death and keeps emitting "Reminder: you haven't
+  # sent a message in Ns" forever — the visible symptom of the
+  # "monitor frozen but reminder firing" pattern Joel kept seeing.
+  # Capture parent PID at start; exit when it dies.
+  local _parent_pid="$PPID"
   while true; do
     sleep 5
+    if ! kill -0 "$_parent_pid" 2>/dev/null; then
+      return 0
+    fi
     local reminder_file="$AIRC_WRITE_DIR/reminder"
     local reminded_file="$AIRC_WRITE_DIR/reminded"
     [ -f "$reminder_file" ] || continue
