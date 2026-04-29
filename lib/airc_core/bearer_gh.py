@@ -138,37 +138,65 @@ def _gh_api_get(gist_id: str) -> Optional[dict]:
 
 
 def _rotate_if_needed(content: str) -> str:
-    """Trim the gist's messages.jsonl content if it's approaching gh's
-    1MB-per-file limit. Keep the last _GIST_KEEP_LINES so the substrate
-    stays writable forever; old content is dropped (the cost of an
-    eventually-write-blocked-room is far worse than losing old context).
+    """Trim the gist's messages.jsonl content when approaching gh's 1MB
+    file limit. Trim to a TARGET well below the trigger so we don't
+    re-rotate on every subsequent append — hysteresis between high-
+    and low-water marks gives the substrate breathing room.
 
-    Reads thresholds from env so tests + power users can tune:
-      AIRC_GIST_MAX_BYTES   — rotation trigger (default 600000)
-      AIRC_GIST_KEEP_LINES  — lines to retain after rotation (default 1000)
+    Per Joel 2026-04-29: "when you trim, you go PAST the number so it
+    takes longer to trim again, otherwise you are constantly trimming."
 
-    Idempotent below the threshold (returns content unchanged).
+    High-water (MAX_BYTES, default 600KB): when content crosses, rotate.
+    Low-water (post-trim ≤ MAX_BYTES/2, ~300KB default): the rotation
+    target. Gives ~300KB of headroom for the next write burst before
+    the next rotation fires.
+
+    Also caps at KEEP_LINES (default 1000) so a flood of tiny lines
+    doesn't blow the line-count budget for line-oriented downstream
+    consumers (formatter, offset tracking).
+
+    All three knobs are env-tunable for tests + power users:
+      AIRC_GIST_MAX_BYTES    (default 600000) — trigger
+      AIRC_GIST_TARGET_BYTES (default MAX/2)  — post-trim ceiling
+      AIRC_GIST_KEEP_LINES   (default 1000)   — line-count cap
+
+    Idempotent below the trigger (returns content unchanged).
     """
     try:
         max_bytes = int(os.environ.get("AIRC_GIST_MAX_BYTES", _GIST_MAX_BYTES))
     except (TypeError, ValueError):
         max_bytes = _GIST_MAX_BYTES
     try:
+        target_bytes = int(os.environ.get("AIRC_GIST_TARGET_BYTES", max_bytes // 2))
+    except (TypeError, ValueError):
+        target_bytes = max_bytes // 2
+    try:
         keep_lines = int(os.environ.get("AIRC_GIST_KEEP_LINES", _GIST_KEEP_LINES))
     except (TypeError, ValueError):
         keep_lines = _GIST_KEEP_LINES
 
-    # Encode-aware byte count: gh measures bytes, not chars. UTF-8 means
-    # multibyte chars (cyrillic, CJK, emoji) count more than 1 byte each.
+    # gh measures bytes, not chars; UTF-8 bytes is what counts.
     if len(content.encode("utf-8")) <= max_bytes:
         return content
 
-    # Trim to the last keep_lines. Skip blank lines so we don't waste
-    # the budget on empties.
+    # Walk the most-recent lines backward, accumulating bytes until we
+    # hit target_bytes OR keep_lines, whichever comes first. The walk
+    # gives us "the latest N lines that fit in target" — exactly the
+    # post-trim shape we want. Skip blanks so they don't burn the budget.
     lines = [ln for ln in content.splitlines() if ln.strip()]
-    kept = lines[-keep_lines:] if len(lines) > keep_lines else lines
-    # Trailing newline so the next append starts on its own line.
-    return "\n".join(kept) + "\n"
+    kept_reversed: list[str] = []
+    bytes_so_far = 0
+    for line in reversed(lines):
+        # +1 for the newline we'll add on join.
+        line_bytes = len(line.encode("utf-8")) + 1
+        if bytes_so_far + line_bytes > target_bytes:
+            break
+        if len(kept_reversed) >= keep_lines:
+            break
+        kept_reversed.append(line)
+        bytes_so_far += line_bytes
+    kept = list(reversed(kept_reversed))
+    return "\n".join(kept) + "\n" if kept else ""
 
 
 def _read_messages_content(gist_data: dict) -> str:
