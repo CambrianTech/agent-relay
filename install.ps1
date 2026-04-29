@@ -5,15 +5,16 @@
 # (airc.ps1) with auto-install of every prereq via winget.
 #
 # Designed for FIRST-TIME Windows users with NOTHING pre-installed.
-# Bootstraps from Windows PowerShell 5.1 (the default that ships with
-# Windows 10/11 -- no pwsh required to start). Installs:
-#   - PowerShell 7+    (airc.ps1 needs it)
+# Runs on the default Windows PowerShell 5.1 (ships with Windows 10+).
+# Installs:
 #   - Git              (clone + update)
-#   - Python 3         (used by monitor formatter heredoc + LAN-IP probe)
-#   - GitHub CLI (gh)  (gist transport -- the room substrate)
-#   - Tailscale        (peer addressing -- optional, LAN fallback works)
-# OpenSSH client is built into Windows 10+ as an Optional Feature; we
-# enable it if missing.
+#   - Python 3         (envelope crypto, formatter, helpers)
+#   - GitHub CLI (gh)  (gist transport -- the room IS a private gist)
+#   - jq               (JSON wrangling for the bash scripts)
+#
+# Post-Phase-3c: no OpenSSH server, no Tailscale, no sshd, no pwsh.
+# The substrate is gh + envelope encryption (X25519 + ChaCha20-Poly1305);
+# airc.ps1 is a thin bash shim that runs fine on PS 5.1.
 #
 # Single command setup, from any PowerShell prompt (incl. the default 5.1):
 #
@@ -22,12 +23,12 @@
 # Or clone + run:
 #
 #   git clone https://github.com/CambrianTech/airc.git $HOME\.airc-src
-#   pwsh $HOME\.airc-src\install.ps1   # or: powershell -ExecutionPolicy Bypass -File ...
+#   powershell -ExecutionPolicy Bypass -File $HOME\.airc-src\install.ps1
 #
 # After install: open a NEW shell so PATH refreshes, then `airc join`.
 
-# We deliberately DO NOT require -Version 7 here -- this script must run
-# from the default Windows PowerShell 5.1 to bootstrap pwsh itself.
+# We deliberately do NOT require -Version 7 -- this script must run from
+# the default Windows PowerShell 5.1 (the always-present default).
 $ErrorActionPreference = 'Stop'
 
 # Paths. AIRC_DIR controls where the source lives; BIN_TARGET is where
@@ -90,13 +91,13 @@ function Test-WingetAvailable {
         Write-Host '    # chocolatey (recommended for Server):'
         Write-Host '    Set-ExecutionPolicy Bypass -Scope Process -Force'
         Write-Host "    iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))"
-        Write-Host '    choco install -y python git gh openssh'
+        Write-Host '    choco install -y python git gh jq'
         Write-Host ''
         Write-Host '    # OR scoop (user-scope, no admin needed):'
         Write-Host "    iwr -useb https://get.scoop.sh | iex"
-        Write-Host '    scoop install python git gh openssh'
+        Write-Host '    scoop install python git gh jq'
         Write-Host ''
-        Write-Host '  After installing python, git, gh, openssh manually, re-run this script;'
+        Write-Host '  After installing python, git, gh, jq manually, re-run this script;'
         Write-Host '  it will detect them and skip winget.'
     } else {
         Write-Host '  winget ships with App Installer (Microsoft Store). Install or update it:'
@@ -151,181 +152,6 @@ function Install-IfMissing {
     }
 }
 
-# -- OpenSSH client (Windows Optional Feature, not winget) ---------------
-# Windows 10 build 1803+ has OpenSSH Client as an installable Capability.
-# Capability install needs admin; if we don't have it, fall back to a
-# clear instruction. Most modern Windows installs already ship it on.
-function Install-OpenSSHClient {
-    if (Get-Command ssh -ErrorAction SilentlyContinue) {
-        Write-Ok 'OpenSSH client already installed'
-        return
-    }
-    Write-Step 'Enabling OpenSSH Client (Windows Capability) ...'
-    try {
-        $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Client*' -ErrorAction Stop
-        if ($cap.State -ne 'Installed') {
-            Add-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop | Out-Null
-        }
-        Update-SessionPath
-        if (Get-Command ssh -ErrorAction SilentlyContinue) {
-            Write-Ok 'OpenSSH client installed'
-        } else {
-            Write-Warn2 'OpenSSH install reported success but ssh still not found. Open a new shell after the installer finishes.'
-        }
-    } catch {
-        Write-Warn2 "Could not auto-install OpenSSH Client (admin may be required): $_"
-        Write-Host '    Manual fix: Settings -> Apps -> Optional Features -> Add an Optional Feature -> OpenSSH Client'
-    }
-}
-
-# -- OpenSSH server (Windows Optional Feature) ---------------------------
-# Required when this Windows host serves airc rooms -- joiners ssh-tail
-# the host's messages.jsonl. Pre-fix the installer covered the CLIENT
-# only. Post-fix (Joel 2026-04-27 "this needs to be in the install dude"):
-# install.ps1 now installs+starts the server too, with auto-start on
-# boot so the mesh survives reboots without manual intervention.
-# Workaround for Windows HNS (Host Network Service) randomly reserving
-# port 22 at boot. HNS dynamically reserves port ranges to support
-# Hyper-V / WSL2 / Docker Desktop networking; the reservations rotate
-# per-boot and are NOT visible in `netsh int ipv4 show excludedportrange`
-# (that command shows static admin reservations only). When port 22
-# happens to fall inside a dynamic HNS range, sshd bind() returns EPERM
-# even with admin. Diagnosis credit: continuum-b69f via cross-Mac/Windows
-# coord gist 2026-04-27. Two-step persistent fix:
-#
-#   1. Disable HNS auto-exclusion via registry -- survives reboots.
-#   2. Explicitly reserve port 22 in the static excluded-port-range so
-#      HNS can't grab it on subsequent boots.
-#
-# References:
-#   keasigmadelta.com/blog/how-to-solve-cannot-bind-to-port-due-to-permission-denied-on-windows
-#   github.com/docker/for-win/issues/3171
-function Set-HnsPortFreedomFor22 {
-    # Idempotent -- both checks before writing so re-runs of install
-    # don't double-write or noisy on a healthy system.
-    $regPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\hns\State'
-    $regName = 'EnableExcludedPortRange'
-    $needRegWrite = $true
-    try {
-        $cur = (Get-ItemProperty -Path $regPath -Name $regName -ErrorAction SilentlyContinue).$regName
-        if ($cur -eq 0) { $needRegWrite = $false }
-    } catch { }
-    if ($needRegWrite) {
-        Write-Host '    Disabling HNS auto-exclusion (HKLM\...\hns\State EnableExcludedPortRange = 0) ...'
-        & reg add 'HKLM\SYSTEM\CurrentControlSet\Services\hns\State' /v 'EnableExcludedPortRange' /d 0 /f 2>$null | Out-Null
-    }
-
-    # Check if port 22 is already in the static excluded-port-range.
-    $existing = & netsh int ipv4 show excludedportrange protocol=tcp 2>$null | Out-String
-    if ($existing -match '(?m)^\s*22\s+22\b') {
-        # Already reserved.
-        return
-    }
-    Write-Host '    Reserving port 22 in static excluded-port-range (netsh) ...'
-    & netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1 2>$null | Out-Null
-}
-
-# -- DefaultShell -- bash, not cmd.exe (#98) ----------------------------
-# Windows OpenSSH defaults DefaultShell to cmd.exe, which lacks `cat`,
-# heredoc redirection, the rest of the POSIX shell vocabulary that airc
-# remote commands rely on (`cat >> $rhome/messages.jsonl`, etc.). Result
-# without this fix: every Windows airc HOST fails the moment a peer
-# tries to send a message -- the remote `cat` command is "not recognized
-# as an internal or external command", airc records [QUEUED] forever,
-# and the user sees no errors locally.
-#
-# Set DefaultShell to Git for Windows bash. Bash is what airc.ps1's
-# remote commands assume (POSIX paths, redirects). Git for Windows is
-# already a hard prereq for Windows users (we install it above), so
-# its bash.exe is a stable target.
-function Set-OpenSSHDefaultShellBash {
-    $regPath = 'HKLM:\SOFTWARE\OpenSSH'
-    # Locate Git for Windows bash.exe. Standard install paths first,
-    # fall through to PATH lookup. Without bash.exe we can't set it,
-    # so warn loudly -- every airc host on this machine will break
-    # silently otherwise.
-    $bashCandidates = @(
-        'C:\Program Files\Git\bin\bash.exe',
-        'C:\Program Files (x86)\Git\bin\bash.exe',
-        "$env:USERPROFILE\AppData\Local\Programs\Git\bin\bash.exe"
-    )
-    $bashPath = $null
-    foreach ($c in $bashCandidates) {
-        if (Test-Path $c) { $bashPath = $c; break }
-    }
-    if (-not $bashPath) {
-        $cmd = Get-Command bash.exe -ErrorAction SilentlyContinue
-        if ($cmd) { $bashPath = $cmd.Source }
-    }
-    if (-not $bashPath) {
-        Write-Warn2 "Could not locate Git for Windows bash.exe -- leaving OpenSSH DefaultShell at OS default (cmd.exe)."
-        Write-Host '    Without bash, this Windows machine cannot HOST an airc room -- joiners will see [QUEUED] forever.'
-        Write-Host '    Fix: install Git for Windows, then re-run install.ps1.'
-        return
-    }
-    # Idempotent -- read current, only write if different.
-    try {
-        $cur = (Get-ItemProperty -Path $regPath -Name DefaultShell -ErrorAction SilentlyContinue).DefaultShell
-    } catch { $cur = $null }
-    if ($cur -eq $bashPath) {
-        Write-Ok "OpenSSH DefaultShell already set to $bashPath"
-        return
-    }
-    try {
-        if (-not (Test-Path $regPath)) {
-            New-Item -Path $regPath -Force | Out-Null
-        }
-        New-ItemProperty -Path $regPath -Name DefaultShell -Value $bashPath -PropertyType String -Force | Out-Null
-        Write-Ok "OpenSSH DefaultShell set to $bashPath (was: $cur)"
-    } catch {
-        Write-Warn2 "Could not set DefaultShell registry value (admin required): $_"
-        Write-Host '    Manual fix (admin PowerShell):'
-        Write-Host "      New-ItemProperty -Path '$regPath' -Name DefaultShell -Value '$bashPath' -PropertyType String -Force"
-    }
-}
-
-function Install-OpenSSHServer {
-    $svc = Get-Service sshd -ErrorAction SilentlyContinue
-    if ($svc -and $svc.Status -eq 'Running') {
-        Write-Ok 'OpenSSH server already installed + running'
-        return
-    }
-    Write-Step 'Installing + starting OpenSSH Server (admin required) ...'
-    try {
-        # 1. Capability install (if not already).
-        $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop
-        if ($cap.State -ne 'Installed') {
-            Add-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop | Out-Null
-            Write-Host '    OpenSSH.Server capability installed.'
-        }
-        # 2. HNS port-22 reservation (Hyper-V quirk -- see Set-HnsPortFreedomFor22).
-        Set-HnsPortFreedomFor22
-        # 3. Firewall rule for inbound TCP/22. The capability install
-        # usually creates 'OpenSSH-Server-In-TCP' but it may be disabled
-        # or missing on some systems. Idempotent.
-        if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
-            Write-Host '    Creating firewall rule for inbound SSH (TCP/22) ...'
-            New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' `
-                                -DisplayName 'OpenSSH Server (sshd)' `
-                                -Enabled True -Direction Inbound -Protocol TCP `
-                                -Action Allow -LocalPort 22 -ErrorAction SilentlyContinue | Out-Null
-        }
-        # 4. Start + persist.
-        Start-Service sshd -ErrorAction Stop
-        Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
-        Write-Ok 'OpenSSH server installed + started + auto-start on boot'
-    } catch {
-        Write-Warn2 "Could not auto-install OpenSSH Server (run install.ps1 in admin PowerShell): $_"
-        Write-Host '    Manual fix (admin PowerShell):'
-        Write-Host '      Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0'
-        Write-Host '      reg add HKLM\SYSTEM\CurrentControlSet\Services\hns\State /v EnableExcludedPortRange /d 0 /f'
-        Write-Host '      netsh int ipv4 add excludedportrange protocol=tcp startport=22 numberofports=1'
-        Write-Host '      Start-Service sshd'
-        Write-Host '      Set-Service -Name sshd -StartupType Automatic'
-        Write-Host '    (The reg+netsh lines work around Windows HNS holding port 22 randomly per boot.)'
-    }
-}
-
 # -- Banner --------------------------------------------------------------
 Write-Host ''
 Write-Host '  AIRC installer (Windows native)'
@@ -335,12 +161,13 @@ Write-Host ''
 Test-WingetAvailable
 
 # -- Install prereqs -----------------------------------------------------
-# Order matters lightly: git first so we can clone, then pwsh + python
-# for runtime, then gh + tailscale for the substrate. OpenSSH last
-# because it uses a different mechanism (Capability) than winget.
+# Order matters lightly: git first so we can clone, then python for the
+# runtime helpers, then gh + jq for the substrate (gist transport).
+# pwsh (PowerShell 7+) is intentionally NOT installed -- airc.ps1 is a
+# thin bash shim that runs fine on the built-in PS 5.1, and dropping it
+# removes a 30+ second prereq install (and the visible UAC prompt).
 
 Install-IfMissing -Name 'Git for Windows'    -WingetId 'Git.Git'             -TestCmd { Get-Command git -ErrorAction SilentlyContinue }
-Install-IfMissing -Name 'PowerShell 7+'      -WingetId 'Microsoft.PowerShell' -TestCmd { Get-Command pwsh -ErrorAction SilentlyContinue }
 Install-IfMissing -Name 'Python 3'           -WingetId 'Python.Python.3.12'  -TestCmd {
     # Probe both the launcher (`py -3`) and direct `python`. Either is fine
     # for airc.ps1's Python invocations. Skip the App Execution Alias stub
@@ -352,11 +179,7 @@ Install-IfMissing -Name 'Python 3'           -WingetId 'Python.Python.3.12'  -Te
 }
 Install-IfMissing -Name 'GitHub CLI (gh)'    -WingetId 'GitHub.cli'          -TestCmd { Get-Command gh -ErrorAction SilentlyContinue }
 Install-IfMissing -Name 'jq'                 -WingetId 'jqlang.jq'           -TestCmd { Get-Command jq -ErrorAction SilentlyContinue }
-Install-IfMissing -Name 'Tailscale'          -WingetId 'Tailscale.Tailscale' -TestCmd { Get-Command tailscale -ErrorAction SilentlyContinue }
 
-Install-OpenSSHClient
-Install-OpenSSHServer
-Set-OpenSSHDefaultShellBash
 
 Write-Host ''
 
@@ -405,8 +228,9 @@ if (-not (Test-Path $channelFile) -or (Get-Content $channelFile -Raw -ErrorActio
 # -- Drop airc.cmd + airc.ps1 into BIN_TARGET ----------------------------
 # The .cmd shim is the magic that makes `airc <verb>` work from PowerShell,
 # cmd.exe, Windows Run dialog, scheduled tasks -- anywhere a Windows user
-# expects a normal command. It launches pwsh on the .ps1 by absolute path
-# so users never type pwsh, they just type `airc`.
+# expects a normal command. It launches the built-in powershell.exe (PS 5.1)
+# on the .ps1 by absolute path so users never type powershell, they just
+# type `airc`.
 Write-Step "Wiring airc binary into $BIN_TARGET"
 New-Item -ItemType Directory -Force -Path $BIN_TARGET | Out-Null
 
@@ -422,7 +246,8 @@ if (-not (Test-Path $srcPs1)) {
 
 # Try a symlink first (so `git pull` updates pick up automatically); fall
 # back to copy if Developer Mode / admin isn't available. Either way the
-# .cmd shim launches the pwsh script by absolute path.
+# .cmd shim launches the .ps1 script by absolute path via the built-in
+# powershell.exe (PS 5.1).
 foreach ($pair in @(
     @{ Src = $srcPs1; Dst = $dstPs1 },
     @{ Src = $srcCmd; Dst = $dstCmd }
@@ -443,9 +268,10 @@ if (-not (Test-Path $dstCmd)) {
     $shimPs1Path = $dstPs1
     $cmdContent = @"
 @echo off
-REM airc.cmd - Windows shim. Launches pwsh on airc.ps1 with all args.
+REM airc.cmd - Windows shim. Launches built-in PowerShell on airc.ps1
+REM with all forwarded arguments.
 REM Generated by install.ps1 when the repo predates a checked-in airc.cmd.
-pwsh -NoLogo -NoProfile -File "$shimPs1Path" %*
+powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$shimPs1Path" %*
 "@
     Set-Content -Path $dstCmd -Value $cmdContent -Encoding ASCII
 }
@@ -457,6 +283,50 @@ if ($userPath -notlike "*$BIN_TARGET*") {
     $newPath = if ($userPath.Length -gt 0) { "$userPath;$BIN_TARGET" } else { $BIN_TARGET }
     [Environment]::SetEnvironmentVariable('PATH', $newPath, 'User')
     Write-Step "Added $BIN_TARGET to user PATH (open a NEW shell to pick up)"
+}
+
+# -- Python venv with crypto deps (Phase E: envelope encryption) --------
+# Mirrors install.sh's venv setup. Per the "no scary popups" rule, this
+# never elevates: pip-install --user is fine, but we use a self-contained
+# venv to avoid PEP 668 issues on managed Pythons. airc's bash wrapper
+# detects this venv at AIRC_PYTHON resolution time. Failure → plaintext
+# fallback (warning, not error).
+$venvDir = Join-Path $CLONE_DIR '.venv'
+if (-not (Test-Path $venvDir)) {
+    $py = (Get-Command python -ErrorAction SilentlyContinue)
+    if (-not $py) { $py = (Get-Command python3 -ErrorAction SilentlyContinue) }
+    if ($py) {
+        try {
+            & $py.Source -m venv $venvDir 2>&1 | Out-Null
+            Write-Ok "Python venv created: $venvDir"
+        } catch {
+            Write-Warn2 "Could not create Python venv. airc will run in plaintext mode: $_"
+        }
+    } else {
+        Write-Warn2 "python not on PATH; skipping venv setup. airc will run in plaintext mode."
+    }
+}
+$venvPip = Join-Path $venvDir 'Scripts\pip.exe'
+$venvPython = Join-Path $venvDir 'Scripts\python.exe'
+if (Test-Path $venvPip) {
+    $hasCrypto = $false
+    if (Test-Path $venvPython) {
+        try { & $venvPython -c "import cryptography" 2>$null; $hasCrypto = ($LASTEXITCODE -eq 0) } catch {}
+    }
+    if (-not $hasCrypto) {
+        try {
+            & $venvPip install -q --upgrade pip 2>&1 | Out-Null
+            & $venvPip install -q cryptography 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Ok "cryptography installed in venv (envelope encryption ready)"
+            } else {
+                Write-Warn2 "cryptography install failed; airc will run in plaintext mode"
+                Write-Host "    Manual fix:  $venvPip install cryptography"
+            }
+        } catch {
+            Write-Warn2 "cryptography install threw: $_"
+        }
+    }
 }
 
 # -- Skills wiring -------------------------------------------------------
@@ -503,28 +373,6 @@ if (Test-Path $skillsSrc) {
     }
 }
 
-# -- Tailscale login check -----------------------------------------------
-# Tailscale-installed-but-logged-out is the most common 'tailscale down'
-# state in practice (post-reboot, fresh install, expired auth). Detect
-# proactively and tell the user to sign in before they hit a confusing
-# 'daemon down' error on their first 'airc join'. Mirrors install.sh
-# ts_post_check.
-$tsBin = $null
-if (Get-Command tailscale -ErrorAction SilentlyContinue) {
-    $tsBin = 'tailscale'
-} elseif (Test-Path 'C:\Program Files\Tailscale\tailscale.exe') {
-    $tsBin = 'C:\Program Files\Tailscale\tailscale.exe'
-}
-if ($tsBin) {
-    $tsOut = & $tsBin status 2>&1 | Out-String
-    if ($tsOut -match 'Logged out|NeedsLogin') {
-        Write-Host ''
-        Write-Warn2 "Tailscale is installed but you're not signed in."
-        Write-Host '    Click the Tailscale tray icon to sign in, or run:  tailscale up'
-        Write-Host '    Do this BEFORE airc join, or cross-machine joins will hang.'
-    }
-}
-
 # -- Final guidance ------------------------------------------------------
 Write-Host ''
 Write-Ok 'airc installed.'
@@ -532,19 +380,14 @@ Write-Host ''
 Write-Host '  Next:'
 Write-Host '    1. Open a NEW PowerShell window (so PATH refreshes)'
 Write-Host '    2. Authenticate gh once:    gh auth login -s gist'
-Write-Host "    3. Sign in to Tailscale:    click tray icon, or 'tailscale up'  (or skip - LAN works without it)"
-Write-Host '    4. Join the mesh:           airc join'
+Write-Host '    3. Join the mesh:           airc join'
 Write-Host ''
 Write-Host '  Diagnose anytime:    airc doctor'
 Write-Host ''
 
-# Explicit successful exit. Earlier external probes (winget, tailscale
-# status, etc.) leak their $LASTEXITCODE through to the script's
-# natural-end exit -- most notably `tailscale status` returns non-zero
-# when the user hasn't logged in yet (a perfectly normal post-install
-# state we already report via Write-Warn2 above). Without this, every
-# fresh install on a runner / VM with not-yet-signed-in tailscale exits
-# 1 from install.ps1 even though the install fully succeeded. CI sees
-# the install as failed, despite the binary being correctly placed.
+# Explicit successful exit. External probes (winget, gh, etc.) can leak
+# a non-zero $LASTEXITCODE through to the script's natural-end exit even
+# when the install fully succeeded. Pin it to 0 so CI doesn't see a
+# spurious failure.
 $global:LASTEXITCODE = 0
 exit 0

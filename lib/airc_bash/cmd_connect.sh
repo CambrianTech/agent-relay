@@ -22,6 +22,75 @@
 # heartbeat are clearly separable), but step 1 is splitting it out of
 # the top-level monolith without changing behavior.
 
+# ensure_channel_subscribed_with_gist <channel> [--first]
+#
+# Single-concern helper: make this scope a fully-functional subscriber
+# of <channel>. Three steps that MUST happen together — pre-2026-04-29
+# they were inlined at 4+ call sites, the divergent-room path silently
+# omitted step 2, and custom rooms became uncreatable. Centralized so
+# every call site does the right thing; future channel-add paths just
+# call this.
+#
+#   1. Subscribe in config (subscribed_channels[]).
+#      --first: prepend (sets the scope's default channel).
+#      default: append.
+#   2. Resolve-or-create the canonical gist for the channel on the
+#      user's gh account (airc_core.channel_gist resolve
+#      --create-if-missing). Idempotent across runs.
+#   3. Persist the channel→gist mapping in channel_gists{} so cmd_send's
+#      route-by-channel and the multi-channel monitor's per-channel
+#      bearer_cli recv both have a destination.
+#
+# Echoes the gist id on success. Empty (and non-zero exit) on failure;
+# caller decides whether that's fatal — the #general sidecar path
+# treats it as a warning, the primary-room path treats it as fatal.
+#
+# Per CLAUDE.md "never swallow errors": stderr from the python
+# subprocesses is redirected to a status file, then echoed if non-empty
+# on failure. Routine 2>/dev/null suppression would have hidden the
+# heartbeat-multifile bug for another sprint.
+ensure_channel_subscribed_with_gist() {
+  local channel="${1:-}" mode="${2:-append}"
+  if [ -z "$channel" ]; then
+    echo "ensure_channel_subscribed_with_gist: missing channel arg" >&2
+    return 2
+  fi
+
+  local _err; _err=$(mktemp -t airc-ensure-ch.XXXXXX)
+  trap '[ -n "${_err:-}" ] && rm -f "$_err"' RETURN
+
+  # 1. Subscribe in config.
+  local _first_flag=""
+  [ "$mode" = "--first" ] && _first_flag="--first"
+  if ! "$AIRC_PYTHON" -m airc_core.config subscribe \
+       --config "$CONFIG" --channel "$channel" $_first_flag 2>"$_err"; then
+    echo "  ⚠ Could not subscribe to #${channel}:" >&2
+    [ -s "$_err" ] && sed 's/^/      /' "$_err" >&2
+    return 1
+  fi
+
+  # 2. Resolve-or-create the canonical gist on this gh account.
+  local _gid
+  _gid=$("$AIRC_PYTHON" -m airc_core.channel_gist resolve \
+         --channel "$channel" --create-if-missing 2>"$_err")
+  if [ -z "$_gid" ]; then
+    echo "  ⚠ Could not resolve gist for #${channel}:" >&2
+    [ -s "$_err" ] && sed 's/^/      /' "$_err" >&2
+    return 1
+  fi
+
+  # 3. Persist channel→gist mapping for cmd_send + monitor routing.
+  if ! "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+       --config "$CONFIG" --channel "$channel" --gist-id "$_gid" 2>"$_err"; then
+    echo "  ⚠ Could not persist channel→gist mapping for #${channel}:" >&2
+    [ -s "$_err" ] && sed 's/^/      /' "$_err" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$_gid"
+  return 0
+}
+
 cmd_connect() {
   # Flag parsing. Issue #37 — host display shapes:
   #   default (gh installed + authed): gist ID + humanhash mnemonic + long invite
@@ -56,6 +125,19 @@ cmd_connect() {
   local room_name="general"
   local room_explicit=0  # set to 1 when user passes --room explicitly
   local use_room=1   # default ON — auto-#general substrate
+
+  # AIRC_ROOM_INTENT: re-exec env var preserving the user's --room
+  # across a stale-host-takeover exec. Pre-fix this was lost on every
+  # self-heal: user typed `airc join --room qa-foo`, we exec'd back
+  # into `airc connect` with NO ARGS, auto-scope decided based on cwd
+  # instead. Treat the env var as if --room was passed (since it was,
+  # one process ago).
+  if [ -n "${AIRC_ROOM_INTENT:-}" ] && [ "$room_explicit" = "0" ]; then
+    room_name="$AIRC_ROOM_INTENT"
+    use_room=1
+    room_explicit=1
+    unset AIRC_ROOM_INTENT  # one-shot — don't pollute child invocations
+  fi
   local general_sidecar=1   # default ON (issue #121) — also subscribe to #general
   local _force_general_sidecar=0   # set by --general flag (issue #136 re-opt-in)
   # Recursion guard: when WE are the sidecar (spawned by another airc
@@ -110,7 +192,14 @@ cmd_connect() {
         return 0 ;;
       --gist|-gist) use_gist=1; shift ;;
       --no-gist|-no-gist) use_gist=0; shift ;;
-      --room|-room) room_name="${2:-general}"; use_room=1; room_explicit=1; shift 2 ;;
+      --room|-room)
+        room_name="${2:-general}"
+        use_room=1
+        room_explicit=1
+        # Stash for re-exec preservation. Read by _self_heal_stale_host
+        # in airc top-level when a stale-host-takeover happens mid-flow.
+        ROOM_INTENT_FOR_REEXEC="$room_name"
+        shift 2 ;;
       --no-room|-no-room) use_room=0; shift ;;
       --no-general|-no-general)
         # NEW semantic (issue #121): keep the project room substrate,
@@ -132,6 +221,7 @@ cmd_connect() {
         # Combo: explicit project room + skip general sidecar. For
         # focused work where lobby noise would distract.
         room_name="${2:-general}"; use_room=1; room_explicit=1; general_sidecar=0
+        ROOM_INTENT_FOR_REEXEC="$room_name"  # preserve across self-heal exec
         shift 2 ;;
       --no-tailscale|-no-tailscale)
         # Opt out of Tailscale entirely: skips the login prompt AND
@@ -162,12 +252,9 @@ cmd_connect() {
     fi
   fi
 
-  # Tailscale-installed-but-logged-out nudge. Runs AFTER flag parsing
-  # so --no-tailscale takes effect. Default behavior: if Tailscale is
-  # installed, "just works" — prompt the user to sign in (Mac: opens
-  # Tailscale.app). The 90% case is "I have it and want it on";
-  # --no-tailscale is the explicit opt-out for the few who don't.
-  tailscale_login_check_or_prompt
+  # Phase 3c: Tailscale login nudge removed. Cross-network mesh now
+  # routes via gh-as-bearer (envelope-encrypted gist), no Tailscale
+  # daemon required. See project_airc_transport_architecture memory.
 
   # `airc join` (no args) auto-scopes to the room matching the current cwd.
   # Resolution: git remote org first ('useideem/authenticator' → #useideem),
@@ -295,27 +382,28 @@ cmd_connect() {
   # if a prior monitor was still around — easy to forget, often resulted in
   # duplicate monitors or port collisions. Now a single `airc connect` or
   # `airc resume` does the right thing.
+  # #292 fix: refuse to stomp a live monitor. Pre-fix this block
+  # auto-killed any PIDs in airc.pid before continuing — which silently
+  # destroyed a live monitor in a sibling shell when the user ran
+  # `airc connect` from a second terminal to verify state. That made
+  # multi-tab sanity-checking destructive. Post-fix: detect liveness,
+  # print a one-liner pointing to the right tools, exit 0 cleanly.
+  # Stale pidfile (no live PIDs) still gets cleaned up + we proceed.
   local stale_pidfile="$AIRC_WRITE_DIR/airc.pid"
   if [ -f "$stale_pidfile" ]; then
     local stale_pids; stale_pids=$(cat "$stale_pidfile" 2>/dev/null | tr '\n' ' ')
-    local all_stale="$stale_pids"
+    local any_alive=0
     for p in $stale_pids; do
-      # `|| true` — pgrep returns 1 when the parent PID is already dead (no
-      # children to find). With `set -euo pipefail` at the top of the script,
-      # that would abort this block *before* reaching the rm on line 442 that
-      # self-heals the stale pidfile. Result: joiner wedged forever after a
-      # parent crash / laptop sleep until someone manually rm'd the pidfile.
-      all_stale="$all_stale $(proc_children "$p" | tr '\n' ' ' || true)"
+      kill -0 "$p" 2>/dev/null && any_alive=1
     done
-    # Quiet kill — don't warn unless there was actually a live process.
-    if [ -n "$all_stale" ]; then
-      local any_alive=0
-      for p in $all_stale; do kill -0 "$p" 2>/dev/null && any_alive=1; done
-      if [ "$any_alive" = "1" ]; then
-        kill -9 $all_stale 2>/dev/null || true
-        sleep 1
-      fi
+    if [ "$any_alive" = "1" ]; then
+      echo "  airc connect: this scope's monitor is already running (PIDs: $stale_pids)."
+      echo "    To stop it:        airc teardown"
+      echo "    To restart it:     airc teardown && airc connect"
+      echo "    To check it:       airc status"
+      return 0
     fi
+    # Stale pidfile (no live processes) — safe to clean.
     rm -f "$stale_pidfile"
   fi
 
@@ -801,18 +889,20 @@ cmd_connect() {
       local _intent="$room_name"
       if [ -z "$_intent" ] || [ "$_intent" = "$resolved_room_name" ]; then
         echo "$resolved_room_name" > "$AIRC_WRITE_DIR/room_name"
-        "$AIRC_PYTHON" -m airc_core.config subscribe \
-          --config "$CONFIG" --channel "$resolved_room_name" --first 2>/dev/null || true
+        ensure_channel_subscribed_with_gist "$resolved_room_name" --first >/dev/null \
+          || die "Could not bootstrap #${resolved_room_name}; refusing to join with broken state"
         echo "  Joined #${resolved_room_name}"
       else
         # Diverged: user wanted X, host advertises Y. Subscribe to both,
         # X first (default for cmd_send), Y appended (display shows
-        # host's channel traffic too).
+        # host's channel traffic too). The user's intent gets a real
+        # gist (find-or-create) — that's what was missing pre-2026-04-29
+        # and turned `airc join --room qa-foo` into a phantom-room.
         echo "$_intent" > "$AIRC_WRITE_DIR/room_name"
-        "$AIRC_PYTHON" -m airc_core.config subscribe \
-          --config "$CONFIG" --channel "$_intent" --first 2>/dev/null || true
-        "$AIRC_PYTHON" -m airc_core.config subscribe \
-          --config "$CONFIG" --channel "$resolved_room_name" 2>/dev/null || true
+        ensure_channel_subscribed_with_gist "$_intent" --first >/dev/null \
+          || die "Could not bootstrap #${_intent}; refusing to join with broken state"
+        ensure_channel_subscribed_with_gist "$resolved_room_name" >/dev/null \
+          || echo "  ⚠ Could not bootstrap host's channel #${resolved_room_name}; subscribed to #${_intent} only" >&2
         echo "  Joined mesh — host primarily labels #${resolved_room_name}; subscribed: #${_intent} (default), #${resolved_room_name}"
       fi
       # Identity bootstrap nudge (#146). Skill /join SKILL.md prompts
@@ -839,22 +929,19 @@ cmd_connect() {
     # Exchange keys with host via TCP
     local peer_host_only="${ssh_target##*@}"
 
-    # Tailscale-down pre-flight on fresh-pair / gist-discovery paths.
-    # Resume path (line ~1241) already calls advise_tailscale_if_down, but
-    # that gate doesn't cover (a) cold-start `airc join <invite>` from a
-    # fresh scope or (b) the gist-discovery resolution that lands here
-    # with a tailnet host_target. Without this check, a logged-out
-    # Tailscale produced a silent unreachable-host + self-heal cascade
-    # (issue #78, Memento's case 2026-04-25). Same call site shape as the
-    # resume path: detect-and-instruct, do not auto-tailscale-up.
-    if ! advise_tailscale_if_down "$peer_host_only"; then
-      die "Re-run airc join after starting Tailscale."
-    fi
+    # Phase 3c: Tailscale-down pre-flight removed. Cross-network mesh
+    # routes via gh-as-bearer (envelope-encrypted gist) which doesn't
+    # need Tailscale at all.
 
     echo "  Connecting to $peer_host_only:$peer_port..."
-    local my_ssh_pub my_sign_pub
+    local my_ssh_pub my_sign_pub my_x25519_pub
     my_ssh_pub=$(cat "$IDENTITY_DIR/ssh_key.pub" 2>/dev/null)
     my_sign_pub=$(cat "$IDENTITY_DIR/public.pem" 2>/dev/null)
+    # Phase E.2: include our X25519 pubkey for envelope encryption.
+    # bootstrap is idempotent (no-ops if keypair exists). Empty value
+    # if cryptography isn't installed — handshake stays compatible
+    # with peers running pre-Phase-E airc.
+    my_x25519_pub=$("$AIRC_PYTHON" -m airc_core.identity bootstrap --dir "$IDENTITY_DIR" 2>/dev/null || echo "")
 
     # Read own identity blob to send in handshake (issue #34 v2 — peers
     # cache each other's identity at pair-time so airc whois works fast).
@@ -882,6 +969,7 @@ except Exception:
                   --my-host "$(whoami)@$(get_host)" \
                   --my-ssh-pub "$my_ssh_pub" \
                   --my-sign-pub "$my_sign_pub" \
+                  --my-x25519-pub "$my_x25519_pub" \
                   --my-airc-home "$AIRC_WRITE_DIR" \
                   --my-identity-json "$my_identity_json" 2>&1) || _pair_ok=0
 
@@ -962,9 +1050,12 @@ except Exception:
     # Save host as a peer (with their airc_home so wire paths are correct).
     # Drop any existing peer records with the same host first — stale names
     # from a prior rename chain must not linger alongside the current one.
-    local host_airc_home
+    local host_airc_home host_x25519_pub
     host_airc_home=$(printf '%s' "$response" | "$AIRC_PYTHON" -m airc_core.handshake get_field airc_home "" 2>/dev/null || true)
-    "$AIRC_PYTHON" -c "
+    # Phase E.2: capture host's X25519 pubkey from handshake response
+    # so cmd_send can encrypt envelopes destined for this peer.
+    host_x25519_pub=$(printf '%s' "$response" | "$AIRC_PYTHON" -m airc_core.handshake get_field x25519_pub "" 2>/dev/null || true)
+    HOST_X25519_PUB="$host_x25519_pub" "$AIRC_PYTHON" -c "
 import json, os
 peers_dir = os.path.expanduser('$PEERS_DIR')
 os.makedirs(peers_dir, exist_ok=True)
@@ -990,6 +1081,9 @@ record = {
     'airc_home': '$host_airc_home',
     'paired': '$(timestamp)'
 }
+host_x = os.environ.get('HOST_X25519_PUB', '')
+if host_x:
+    record['x25519_pub'] = host_x
 with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
     json.dump(record, f, indent=2)
 " 2>/dev/null || true
@@ -1000,6 +1094,12 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
     # (issue #83). Cleared by cmd_part on graceful leave.
     if [ -n "$_resolved_gist_id" ]; then
       echo "$_resolved_gist_id" > "$AIRC_WRITE_DIR/room_gist_id"
+      # #283: also map this channel→gist in channel_gists so the
+      # multi-channel monitor polls it and cmd_send routes by channel.
+      if [ -n "$resolved_room_name" ]; then
+        "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+          --config "$CONFIG" --channel "$resolved_room_name" --gist-id "$_resolved_gist_id" 2>/dev/null || true
+      fi
     fi
 
     # Persist host details in own config so `airc invite` can reconstruct
@@ -1248,6 +1348,11 @@ JSON
           if [ "$_gist_kind" = "mesh" ] || [ "$_gist_kind" = "room" ]; then
             echo "$_gist_id" > "$AIRC_WRITE_DIR/room_gist_id"
             echo "$room_name" > "$AIRC_WRITE_DIR/room_name"
+            # #283: also map this channel→gist in channel_gists so
+            # the multi-channel monitor polls it and cmd_send routes
+            # by channel.
+            "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+              --config "$CONFIG" --channel "$room_name" --gist-id "$_gist_id" 2>/dev/null || true
 
             # Heartbeat loop: keep last_heartbeat fresh in the gist so
             # joiners can deterministically detect a dead host. Without
@@ -1350,7 +1455,22 @@ print(json.dumps(chans))
 }
 JSON
 )
-                local _hb_tmp; _hb_tmp=$(mktemp -t airc-hb.XXXXXX)
+                # Heartbeat target file basename MUST match the canonical
+                # in-gist filename (`airc-room-<channel>.json` per
+                # channel_gist.py). When the gist has multiple files
+                # (messages.jsonl + the room-metadata JSON) and we pass
+                # gh a path with a basename that matches NEITHER, gh
+                # errors with "unsure what file to edit; either specify
+                # --filename or run interactively" — heartbeat fails N
+                # times in a row and the host self-evicts (deletes its
+                # own gist + respawns) when nothing was actually wrong.
+                # That eviction loop is the surface ideem-local-4bef
+                # root-caused 2026-04-29; it's also what nuked the
+                # #useideem gist mid-ping-debug. Ensuring the temp
+                # basename matches the canonical filename closes the
+                # whole convergent class.
+                local _hb_tmpdir; _hb_tmpdir=$(mktemp -d -t airc-hb.XXXXXX)
+                local _hb_tmp="${_hb_tmpdir}/airc-room-${_hb_room}.json"
                 printf '%s\n' "$_hb_payload" > "$_hb_tmp"
                 # Rotate the host's messages.jsonl when it exceeds the
                 # AIRC_LOG_MAX_LINES threshold (default 5000). Trims
@@ -1388,7 +1508,7 @@ JSON
                     exit 0
                   fi
                 fi
-                rm -f "$_hb_tmp"
+                rm -rf "$_hb_tmpdir"
               done
             ) &
             local _hb_pid=$!

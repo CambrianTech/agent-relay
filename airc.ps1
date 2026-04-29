@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+#!/usr/bin/env powershell
 # airc.ps1 — Windows entry point. Forwards to the bash `airc` via Git Bash.
 #
 # History: this file used to be a 2968-line full PowerShell port of the
@@ -11,6 +11,11 @@
 # bash `airc` from PowerShell by locating bash.exe and forwarding all
 # arguments. One codebase, zero drift, instant feature parity.
 #
+# Runtime: Windows PowerShell 5.1 (built-in on Windows 10+) is fine.
+# Earlier versions of this file required pwsh 7+ but that was a
+# leftover from the deleted full-PS port; the shim uses no PS-7-only
+# features. Dropping pwsh removes one whole prereq install step.
+#
 # Probe order for bash.exe:
 #   1. PATH (whichever `bash` is first — usually Git Bash when the user
 #      ran install.ps1's git step)
@@ -21,7 +26,6 @@
 #
 # If no Git Bash found: print install instructions, exit 1.
 
-#Requires -Version 7.0
 $ErrorActionPreference = 'Stop'
 
 function Resolve-BashExe {

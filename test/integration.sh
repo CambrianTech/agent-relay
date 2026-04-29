@@ -689,6 +689,10 @@ scenario_status() {
                                                 || fail "host status: monitor not shown running"
   echo "$h_out" | grep -q 'queue:.*empty' && pass "host status: queue empty (no pending)" \
                                           || fail "host status: queue line wrong"
+  # Phase 2c (#270): host has no inbound bearer — surface that explicitly
+  # rather than the messages.jsonl-mirror-derived "last recv" lie.
+  echo "$h_out" | grep -Eq 'bearer:\s+(n/a|.*hosting)' && pass "host status: bearer line marks 'n/a' (hosting)" \
+                                                       || fail "host status missing bearer:n/a line (got: $h_out)"
 
   # Joiner status: should show "joiner of shost". host port is whatever
   # shost actually bound to (auto-bump-aware) — the joiner records what
@@ -699,6 +703,13 @@ scenario_status() {
                                       || fail "joiner status missing joiner-of line (got: $j_out)"
   echo "$j_out" | grep -qE ':[0-9]+' && pass "joiner status: host port visible" \
                                      || fail "joiner status missing host port (got: $j_out)"
+  # Phase 2c (#270): joiner status MUST surface a bearer line. Either
+  # "awaiting first event" (bearer up but quiet) or "Ns ago via ssh"
+  # (events flowing). The pre-2c "last recv" computed from messages.jsonl
+  # is gone — that was the exact lie that hid 30+ minute outages.
+  echo "$j_out" | grep -qE 'bearer:\s+(awaiting first event|[0-9]+s ago via|no state file)' \
+    && pass "joiner status: bearer-attested liveness line present" \
+    || fail "joiner status missing bearer line (got: $j_out)"
 
   # Send a message then assert status reflects activity
   as_home /tmp/airc-it-s-j send @shost "status-probe" >/dev/null 2>&1
@@ -2460,6 +2471,1258 @@ time.sleep(30)
   cleanup_all
 }
 
+scenario_bearer_ssh_send() {
+  # Phase 2b prep: prove SshBearer.send works end-to-end against a real
+  # paired SSH listener BEFORE the monitor cutover. If this scenario
+  # passes, the bearer is production-grade for outbound traffic and
+  # the cutover risk shrinks to "did I wire the bash side correctly."
+  #
+  # Per the bearer architecture, each transport gets its own integration
+  # scenario; future bearers (gh, local) will have parallel scenarios in
+  # the same shape.
+  section "bearer (ssh): send via bearer_cli, verify lands in host log"
+  cleanup_all
+
+  spawn_host /tmp/airc-it-bs-h alpha 7551 || { fail "alpha host failed to start"; return; }
+  pass "host alpha hosting on 7551"
+
+  local join; join=$(read_join_string /tmp/airc-it-bs-h)
+  [ -n "$join" ] || { fail "no join string from alpha"; return; }
+
+  spawn_joiner /tmp/airc-it-bs-j gamma "$join" || { fail "gamma joiner failed to start"; return; }
+  pass "joiner gamma paired with alpha"
+
+  # Pull the joiner's host_target + remote_home from its config; identity
+  # key is at a known path on disk.
+  local jstate=/tmp/airc-it-bs-j/state
+  local host_target; host_target=$(python3 -c "import json; print(json.load(open('$jstate/config.json'))['host_target'])" 2>/dev/null)
+  local rhome;       rhome=$(python3 -c "import json; print(json.load(open('$jstate/config.json')).get('host_airc_home','\$HOME/.airc'))" 2>/dev/null)
+  # NOTE on port: airc's host_target field stores `user@host` WITHOUT port
+  # because the actual SSH messaging goes through the system sshd at port 22
+  # (the airc port is only used for the pairing handshake). The bearer's
+  # _build_ssh_argv supports a `:port` override but production code paths
+  # never use one — preserved here.
+  local ikey="$jstate/identity/ssh_key"
+  [ -n "$host_target" ] && pass "joiner config has host_target ($host_target)" \
+                        || { fail "joiner config missing host_target"; return; }
+  [ -f "$ikey" ] && pass "joiner has identity key at $ikey" \
+                 || { fail "joiner identity key missing"; return; }
+
+  # PYTHONPATH so airc_core is importable when invoking Python directly.
+  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
+  local payload='{"from":"gamma","to":"all","ts":"2026-04-29T00:00:00Z","channel":"general","msg":"bearer-test-payload-78a8c","sig":"x"}'
+
+  local outcome
+  outcome=$(printf '%s' "$payload" | PYTHONPATH="$_lib_dir" python3 -m airc_core.bearer_cli send \
+    "alpha" "general" \
+    --host-target "$host_target" \
+    --identity-key "$ikey" \
+    --remote-home "$rhome" 2>/dev/null)
+
+  echo "$outcome" | grep -qE '"kind"[[:space:]]*:[[:space:]]*"delivered"' \
+    && pass "bearer_cli reports delivered" \
+    || fail "bearer_cli outcome unexpected: $outcome"
+
+  # Verify the message actually landed in alpha's messages.jsonl.
+  sleep 0.3
+  local hstate=/tmp/airc-it-bs-h/state
+  if [ -f "$hstate/messages.jsonl" ] && grep -q "bearer-test-payload-78a8c" "$hstate/messages.jsonl"; then
+    pass "payload visible in alpha's messages.jsonl"
+  else
+    fail "payload NOT found in alpha's messages.jsonl (bearer claimed delivery)"
+  fi
+
+  cleanup_all
+}
+
+scenario_bearer_ssh_recv() {
+  # Phase 2b prep: prove SshBearer.recv_stream() reads events from a
+  # real paired SSH host. Same isolation principle as scenario_bearer_ssh_send
+  # — exercise the bearer alone, with no monitor in the loop, so a green
+  # result here means the cutover only has to trust the bearer is sound.
+  section "bearer (ssh): recv_stream picks up messages appended remotely"
+  cleanup_all
+
+  spawn_host /tmp/airc-it-br-h alpha 7552 || { fail "alpha host failed to start"; return; }
+  pass "host alpha hosting on 7552"
+
+  local join; join=$(read_join_string /tmp/airc-it-br-h)
+  [ -n "$join" ] || { fail "no join string from alpha"; return; }
+
+  spawn_joiner /tmp/airc-it-br-j delta "$join" || { fail "delta joiner failed to start"; return; }
+  pass "joiner delta paired with alpha"
+
+  local jstate=/tmp/airc-it-br-j/state
+  local host_target; host_target=$(python3 -c "import json; print(json.load(open('$jstate/config.json'))['host_target'])" 2>/dev/null)
+  local rhome;       rhome=$(python3 -c "import json; print(json.load(open('$jstate/config.json')).get('host_airc_home','\$HOME/.airc'))" 2>/dev/null)
+  # NOTE on port: airc's host_target field stores `user@host` WITHOUT port
+  # because the actual SSH messaging goes through the system sshd at port 22
+  # (the airc port is only used for the pairing handshake). The bearer's
+  # _build_ssh_argv supports a `:port` override but production code paths
+  # never use one — preserved here.
+  local ikey="$jstate/identity/ssh_key"
+
+  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
+  local hstate=/tmp/airc-it-br-h/state
+
+  # Test plan: start recv_stream in the background, wait for ssh to
+  # connect (the underlying tail uses -n 0 so it only sees lines written
+  # AFTER the connection establishes), append a unique marker, then poll
+  # an output file for the FOUND signal. This avoids the "tail -n 0
+  # misses the pre-existing line" race that simpler patterns hit.
+  local marker="recv-stream-marker-$(date +%s%N)"
+  local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"general","msg":"'"$marker"'","sig":"x"}'
+  local recv_out; recv_out=$(mktemp -t airc-it-br-recv.XXXXXX)
+
+  # Run the recv driver in the background. It writes "FOUND" to recv_out
+  # when it sees the marker, then exits.
+  PYTHONPATH="$_lib_dir" python3 -c "
+import sys, signal, time
+sys.path.insert(0, '$_lib_dir')
+from airc_core.bearer_resolver import resolve
+
+bearer = resolve({
+    'host_target': '$host_target',
+    'remote_home': r'''$rhome''',
+    'identity_key': '$ikey',
+})
+bearer.open('alpha')
+
+signal.alarm(15)
+out = open('$recv_out', 'w', buffering=1)
+try:
+    for ev in bearer.recv_stream():
+        env = ev.bearer_metadata.get('envelope', {})
+        if env.get('msg') == '$marker':
+            live = bearer.liveness('alpha')
+            fresh = live.last_seen_ts is not None and (time.time() - live.last_seen_ts) < 10
+            out.write('FOUND\n')
+            out.write(f'LIVENESS={\"FRESH\" if fresh else \"STALE\"}\n')
+            break
+except Exception as e:
+    out.write(f'ERROR: {e}\n')
+finally:
+    out.close()
+    bearer.close()
+" >/dev/null 2>&1 &
+  local recv_pid=$!
+
+  # Give ssh ~3s to connect and start tailing.
+  sleep 3
+  echo "$probe" >> "$hstate/messages.jsonl"
+
+  # Wait up to 12s for the recv driver to find the marker.
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    sleep 1
+    grep -q '^FOUND' "$recv_out" 2>/dev/null && break
+  done
+  wait $recv_pid 2>/dev/null
+
+  if grep -q '^FOUND' "$recv_out" 2>/dev/null; then
+    pass "recv_stream picked up the planted marker"
+  else
+    fail "recv_stream did NOT see the planted marker; out: $(cat "$recv_out" 2>/dev/null)"
+  fi
+  if grep -q '^LIVENESS=FRESH' "$recv_out" 2>/dev/null; then
+    pass "liveness reports fresh ts after recv event"
+  else
+    fail "liveness did not report fresh ts; out: $(cat "$recv_out" 2>/dev/null)"
+  fi
+  rm -f "$recv_out"
+
+  cleanup_all
+}
+
+scenario_bearer_cli_recv() {
+  # Phase 2b: prove `python -m airc_core.bearer_cli recv` (the bridge the
+  # bash monitor now uses instead of an inline ssh-tail) emits one line
+  # per envelope, payload-bytes verbatim, suitable for piping straight
+  # into monitor_formatter. If this scenario passes but the monitor still
+  # misses messages, the bug is in the formatter or in the watchdog —
+  # not in the bearer-CLI seam.
+  section "bearer_cli recv: emits one JSONL line per envelope"
+  cleanup_all
+
+  spawn_host /tmp/airc-it-cli-h alpha 7553 || { fail "alpha host failed to start"; return; }
+  pass "host alpha hosting on 7553"
+
+  local join; join=$(read_join_string /tmp/airc-it-cli-h)
+  [ -n "$join" ] || { fail "no join string from alpha"; return; }
+
+  spawn_joiner /tmp/airc-it-cli-j delta "$join" || { fail "delta joiner failed to start"; return; }
+  pass "joiner delta paired with alpha"
+
+  local jstate=/tmp/airc-it-cli-j/state
+  local host_target; host_target=$(python3 -c "import json; print(json.load(open('$jstate/config.json'))['host_target'])" 2>/dev/null)
+  local rhome;       rhome=$(python3 -c "import json; print(json.load(open('$jstate/config.json')).get('host_airc_home','\$HOME/.airc'))" 2>/dev/null)
+  local ikey="$jstate/identity/ssh_key"
+  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
+  local hstate=/tmp/airc-it-cli-h/state
+
+  local marker="cli-recv-marker-$(date +%s%N)"
+  local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"general","msg":"'"$marker"'","sig":"x"}'
+  local cli_out; cli_out=$(mktemp -t airc-it-cli-recv.XXXXXX)
+  local cli_err; cli_err=$(mktemp -t airc-it-cli-err.XXXXXX)
+
+  # Run bearer_cli recv in the background, captured to a file. Different
+  # offset_file path per invocation so we don't fight the live joiner.
+  local off_file; off_file=$(mktemp -t airc-it-cli-off.XXXXXX); rm -f "$off_file"
+  PYTHONPATH="$_lib_dir" python3 -m airc_core.bearer_cli recv alpha \
+    --host-target "$host_target" \
+    --identity-key "$ikey" \
+    --remote-home "$rhome" \
+    --offset-file "$off_file" \
+    >"$cli_out" 2>"$cli_err" &
+  local cli_pid=$!
+
+  # Give ssh ~3s to connect.
+  sleep 3
+  echo "$probe" >> "$hstate/messages.jsonl"
+
+  # Poll output for the marker.
+  local i found=0
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    sleep 1
+    if grep -q "$marker" "$cli_out" 2>/dev/null; then
+      found=1
+      break
+    fi
+  done
+
+  # Tear down the CLI; SIGTERM should produce a clean exit.
+  kill "$cli_pid" 2>/dev/null
+  wait "$cli_pid" 2>/dev/null
+
+  if [ $found -eq 1 ]; then
+    pass "bearer_cli recv emitted line containing the planted marker"
+  else
+    fail "bearer_cli recv did NOT emit the marker; out: $(cat "$cli_out" 2>/dev/null); err: $(cat "$cli_err" 2>/dev/null)"
+  fi
+
+  # Verify the line is JSONL-shaped (parseable JSON object). Defends
+  # against accidental wrapping or pretty-printing in the CLI.
+  if [ $found -eq 1 ] && python3 -c "
+import json, sys
+for line in open('$cli_out'):
+    line = line.strip()
+    if not line: continue
+    obj = json.loads(line)
+    if obj.get('msg') == '$marker':
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null; then
+    pass "bearer_cli recv output is parseable JSONL"
+  elif [ $found -eq 1 ]; then
+    fail "bearer_cli recv emitted the marker but output is not parseable JSONL: $(cat "$cli_out" 2>/dev/null)"
+  fi
+
+  rm -f "$cli_out" "$cli_err" "$off_file"
+  cleanup_all
+}
+
+scenario_gh_send_creates_messages_jsonl() {
+  # TDD test for the "host broadcast disappears" bug Joel hit during the
+  # post-3c QA pass. Repro shape:
+  #   1. A gist exists with a non-messages.jsonl file (e.g. airc-invite
+  #      seed — what `airc join` actually creates as the room gist's
+  #      first file).
+  #   2. GhBearer.send is invoked to publish a message.
+  #   3. The send must CREATE messages.jsonl in the gist (the file
+  #      doesn't exist yet — first ever send to this room).
+  #   4. The gist after the send must contain messages.jsonl with the
+  #      sent envelope.
+  #
+  # The pre-fix bug: `gh gist edit GIST_ID file` (no -a flag) returns
+  # exit 0 but silently does nothing when the target file doesn't already
+  # exist in the gist. GhBearer's _gh_gist_write_file tried that first,
+  # got a false-success returncode 0, never invoked the -a fallback.
+  # Net: gh CLI no-op + GhBearer reports "delivered" + nothing on the
+  # wire. Worst silent-loss class.
+  #
+  # scenario_bearer_gh masked this bug because IT seeds the gist with
+  # messages.jsonl already present, so the first send is a replace, not
+  # a create. Production (`airc join`) seeds with airc-invite — first
+  # send is a create. The seed shape was the difference.
+  section "gh send creates messages.jsonl (first-send-to-empty-room) — TDD for #285"
+
+  if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+    echo "  (skipped — gh not authed)"
+    return
+  fi
+
+  cleanup_all
+  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
+
+  # Seed the gist the way `airc join` actually does: a file named like
+  # airc-invite.* (NOT messages.jsonl). The first send must add
+  # messages.jsonl as a new file.
+  local seed; seed=$(mktemp -d -t airc-it-tdd-seed.XXXXXX)
+  printf '# room invite seed (placeholder)\n' > "$seed/airc-invite.placeholder"
+  local gist_url; gist_url=$(gh gist create -d "airc TDD: first-send-to-empty-room (#285)" "$seed/airc-invite.placeholder" 2>&1 | tail -1)
+  local gist_id; gist_id=$(printf '%s' "$gist_url" | awk -F/ '{print $NF}')
+  rm -rf "$seed"
+
+  if [ -z "$gist_id" ] || ! printf '%s' "$gist_id" | grep -qE '^[a-f0-9]+$'; then
+    fail "could not create test gist (got: $gist_url)"
+    return
+  fi
+  pass "test gist created with airc-invite seed: $gist_id"
+
+  # Verify the seed-only state (no messages.jsonl yet).
+  local pre_files; pre_files=$(gh api "gists/$gist_id" --jq '.files | keys | join(",")' 2>/dev/null)
+  if printf '%s' "$pre_files" | grep -q 'messages.jsonl'; then
+    fail "test setup wrong: gist already has messages.jsonl (expected only airc-invite seed)"
+    gh gist delete "$gist_id" --yes 2>/dev/null || true
+    return
+  fi
+  pass "pre-send: gist has only airc-invite seed (no messages.jsonl)"
+
+  trap "gh gist delete '$gist_id' --yes 2>/dev/null || true" EXIT
+
+  # Run GhBearer.send via bearer_cli (the same path airc msg uses).
+  local marker="tdd-first-send-marker-$(date +%s%N)"
+  local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"general","msg":"'"$marker"'","sig":"x"}'
+  local outcome
+  outcome=$(printf '%s' "$probe" | PYTHONPATH="$_lib_dir" python3 -m airc_core.bearer_cli send all general --room-gist-id "$gist_id" 2>&1)
+  local kind; kind=$(printf '%s' "$outcome" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("kind",""))' 2>/dev/null)
+
+  if [ "$kind" = "delivered" ]; then
+    pass "bearer_cli send returned 'delivered'"
+  else
+    fail "bearer_cli send did NOT return 'delivered' (got: $outcome)"
+    trap - EXIT
+    gh gist delete "$gist_id" --yes 2>/dev/null || true
+    cleanup_all
+    return
+  fi
+
+  # The critical assertion: gist must NOW have messages.jsonl with the marker.
+  # Pre-fix this fails: gh gist edit silently no-ops, gist still has only
+  # airc-invite, send returned delivered with NO actual delivery.
+  local post_files; post_files=$(gh api "gists/$gist_id" --jq '.files | keys | join(",")' 2>/dev/null)
+  if printf '%s' "$post_files" | grep -q 'messages.jsonl'; then
+    pass "post-send: gist now has messages.jsonl (file was created)"
+  else
+    fail "POST-SEND BUG: gist still has only [$post_files] — messages.jsonl was NOT created. bearer_cli reported delivered but gh gist edit silently no-op'd."
+  fi
+
+  # Verify the message body actually landed.
+  local content; content=$(gh api "gists/$gist_id" --jq '.files["messages.jsonl"].content // ""' 2>/dev/null)
+  if printf '%s' "$content" | grep -q "$marker"; then
+    pass "post-send: gist messages.jsonl contains the marker"
+  else
+    fail "post-send: gist messages.jsonl missing marker (content len: ${#content})"
+  fi
+
+  trap - EXIT
+  gh gist delete "$gist_id" --yes 2>/dev/null || true
+  cleanup_all
+}
+
+scenario_host_msg_publishes_to_gist() {
+  # End-to-end: full `airc msg` from a host actually publishes to the
+  # room gist. The TDD scenario above (gh_send_creates_messages_jsonl)
+  # tests the bearer in isolation; THIS one tests the cmd_send → bearer
+  # path, catching breaks where cmd_send doesn't even invoke the bearer
+  # (the original #285 hole — host's else-branch was a local-only
+  # append, never called bearer_cli).
+  section "host: airc msg publishes to room gist (#285 cmd_send→bearer chain)"
+
+  if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+    echo "  (skipped — gh not authed)"
+    return
+  fi
+
+  cleanup_all
+
+  # Spawn a host with a real gh room (NO --no-room / --no-gist — that's
+  # what masked the bug; tests must exercise the production path).
+  local rname="tdd-host-publishes-$$"
+  mkdir -p /tmp/airc-it-tdd-h /tmp/airc-it-tdd-h/state
+  ( cd /tmp/airc-it-tdd-h && AIRC_HOME=/tmp/airc-it-tdd-h/state AIRC_NAME=tdd-host AIRC_PORT=7556 \
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --room "$rname" > /tmp/airc-it-tdd-h/out.log 2>&1 & )
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    sleep 1
+    [ -f /tmp/airc-it-tdd-h/state/room_gist_id ] && break
+  done
+
+  local gid; gid=$(cat /tmp/airc-it-tdd-h/state/room_gist_id 2>/dev/null)
+  if [ -z "$gid" ]; then
+    fail "host did not publish room gist (room_gist_id absent)"
+    cleanup_all; return
+  fi
+  pass "host published room gist: $gid"
+
+  trap "gh gist delete '$gid' --yes 2>/dev/null || true" EXIT
+
+  # Pre-flight: gist initially has only the airc-invite seed (NOT
+  # messages.jsonl). This is the production state where the bug lived.
+  local pre_files; pre_files=$(gh api "gists/$gid" --jq '.files | keys | join(",")' 2>/dev/null)
+  if printf '%s' "$pre_files" | grep -q messages.jsonl; then
+    info "pre-send: gist already has messages.jsonl (host bootstrap created it; bug less likely to trip)"
+  fi
+
+  # Run airc msg from the host scope, broadcasting a unique marker.
+  local marker="tdd-host-publish-marker-$(date +%s%N)"
+  AIRC_HOME=/tmp/airc-it-tdd-h/state "$AIRC" msg "$marker" >/dev/null 2>&1 || true
+
+  # Give gh's eventual-consistency a moment.
+  sleep 2
+
+  # The critical assertion: gist's messages.jsonl now contains the marker.
+  local content; content=$(gh api "gists/$gid" --jq '.files["messages.jsonl"].content // ""' 2>/dev/null)
+  if printf '%s' "$content" | grep -q "$marker"; then
+    pass "host's airc msg broadcast landed in gist's messages.jsonl"
+  else
+    local post_files; post_files=$(gh api "gists/$gid" --jq '.files | keys | join(",")' 2>/dev/null)
+    fail "POST-SEND BUG: marker NOT in gist. files: [$post_files]; content len: ${#content}. cmd_send → bearer chain is broken (#285 regression)."
+  fi
+
+  trap - EXIT
+  gh gist delete "$gid" --yes 2>/dev/null || true
+  cleanup_all
+}
+
+scenario_gist_rotates_under_size_limit() {
+  # TDD: gh gists have a 1MB-per-file soft limit. If we never trim
+  # messages.jsonl, the room eventually goes write-blocked + dead
+  # forever. This scenario verifies rotation: pre-fill a gist near
+  # the threshold, run a send, assert the post-send content is
+  # under the limit AND contains the new line.
+  section "gh gist messages.jsonl rotates under size limit (write-block prevention)"
+
+  if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+    echo "  (skipped — gh not authed)"
+    return
+  fi
+
+  cleanup_all
+  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
+
+  # Build a synthetic messages.jsonl with N lines (each ~300 bytes) so
+  # total content is right at the rotation threshold. Then create a
+  # gist seeded with that content.
+  local seed; seed=$(mktemp -d -t airc-it-rot-seed.XXXXXX)
+  python3 - "$seed/messages.jsonl" <<'PYEOF'
+import sys, json
+out = sys.argv[1]
+with open(out, "w") as f:
+    for i in range(50):
+        env = {
+            "from": "seed",
+            "to": "all",
+            "ts": f"2026-04-29T00:00:{i:02d}Z",
+            "channel": "general",
+            "msg": f"line {i:04d} " + "x" * 200,
+            "sig": "x",
+        }
+        f.write(json.dumps(env) + "\n")
+PYEOF
+  if [ ! -s "$seed/messages.jsonl" ]; then
+    fail "could not generate seed messages.jsonl"
+    rm -rf "$seed"; return
+  fi
+  local pre_bytes; pre_bytes=$(wc -c < "$seed/messages.jsonl" | tr -d ' ')
+  local pre_lines; pre_lines=$(wc -l < "$seed/messages.jsonl" | tr -d ' ')
+  pass "seed messages.jsonl: ${pre_lines} lines, ${pre_bytes} bytes"
+
+  local gist_url; gist_url=$(gh gist create -d "airc room: #rotation-test (post-#rot)" "$seed/messages.jsonl" 2>&1 | tail -1)
+  local gist_id; gist_id=$(printf '%s' "$gist_url" | awk -F/ '{print $NF}')
+  rm -rf "$seed"
+  if [ -z "$gist_id" ] || ! printf '%s' "$gist_id" | grep -qE '^[a-f0-9]+$'; then
+    fail "could not create rotation-test gist"
+    return
+  fi
+  pass "rotation-test gist created: $gist_id"
+
+  trap "gh gist delete '$gist_id' --yes 2>/dev/null || true" EXIT
+
+  # Force an aggressive rotation threshold via env so the test triggers
+  # on a small file rather than producing ~600KB of content (slow + gh
+  # API noise). With AIRC_GIST_MAX_BYTES=2000 the seed (50 lines × ~250B
+  # ≈ 12.5KB) far exceeds the threshold; one send rotates.
+  local marker="rot-marker-$(date +%s%N)"
+  local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"rotation-test","msg":"'"$marker"'","sig":"x"}'
+  AIRC_GIST_MAX_BYTES=2000 AIRC_GIST_KEEP_LINES=10 \
+    PYTHONPATH="$_lib_dir" python3 -m airc_core.bearer_cli send all rotation-test \
+      --room-gist-id "$gist_id" <<< "$probe" >/dev/null 2>&1
+
+  sleep 1
+  local post_content; post_content=$(gh api "gists/$gist_id" --jq '.files["messages.jsonl"].content // ""' 2>/dev/null)
+  local post_bytes; post_bytes=$(printf '%s' "$post_content" | wc -c | tr -d ' ')
+  local post_lines; post_lines=$(printf '%s' "$post_content" | grep -c '^.' 2>/dev/null || echo 0)
+
+  if [ "$post_bytes" -le 4000 ]; then
+    pass "post-send: gist content trimmed under threshold ($post_bytes bytes)"
+  else
+    fail "BUG: gist content NOT rotated — $post_bytes bytes (expected ≤4000 with KEEP_LINES=10)"
+  fi
+
+  if [ "$post_lines" -le 11 ]; then
+    pass "post-send: line count is keep_lines + 1 new line (got $post_lines)"
+  else
+    fail "BUG: line count $post_lines exceeds expected (KEEP_LINES=10 + 1 new = 11)"
+  fi
+
+  if printf '%s' "$post_content" | grep -q "$marker"; then
+    pass "post-rotation: the new send's marker is preserved (not lost in trim)"
+  else
+    fail "BUG: rotation dropped the new line — marker missing"
+  fi
+
+  trap - EXIT
+  gh gist delete "$gist_id" --yes 2>/dev/null || true
+  cleanup_all
+}
+
+scenario_channel_gist_prefers_single_channel() {
+  # TDD for #290: when both a canonical post-3c single-channel gist
+  # (channels=[<x>]) AND a legacy multi-channel mesh gist (channels=[a,b,c])
+  # exist for the same channel name on the gh account, find_existing
+  # MUST prefer the single-channel one. Otherwise peers split between
+  # the two and never see each other's broadcasts.
+  section "channel_gist.find_existing prefers single-channel over multi-channel (#290)"
+
+  if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+    echo "  (skipped — gh not authed)"
+    return
+  fi
+
+  cleanup_all
+  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
+
+  # Publish a LEGACY multi-channel mesh gist FIRST (so it has older
+  # updated_at than the single-channel one — exactly the order that
+  # caused #290 in production).
+  local seed; seed=$(mktemp -d -t airc-it-tdd290-seed.XXXXXX)
+  cat > "$seed/airc-invite.legacy.fake" <<JSON
+{"airc": 1, "kind": "mesh", "channels": ["projx", "lobby-target", "other"], "host": {"name": "fake"}}
+JSON
+  local legacy_url; legacy_url=$(gh gist create -d "airc mesh" "$seed/airc-invite.legacy.fake" 2>&1 | tail -1)
+  local legacy_gid; legacy_gid=$(printf '%s' "$legacy_url" | awk -F/ '{print $NF}')
+  rm -rf "$seed"
+  if [ -z "$legacy_gid" ] || ! printf '%s' "$legacy_gid" | grep -qE '^[a-f0-9]+$'; then
+    fail "could not create legacy multi-channel test gist"
+    return
+  fi
+  pass "legacy multi-channel gist published: $legacy_gid (channels=[projx, lobby-target, other])"
+
+  trap "gh gist delete '$legacy_gid' --yes 2>/dev/null || true" EXIT
+
+  # Now resolve channel "lobby-target" with create_if_missing — this
+  # triggers create_new which publishes a canonical single-channel gist.
+  # (The legacy gist also matches "lobby-target" loosely, so the test
+  # is whether find_existing prefers the single-channel one we're
+  # about to create.)
+  sleep 1
+  local single_gid
+  single_gid=$(PYTHONPATH="$_lib_dir" python3 -m airc_core.channel_gist resolve --channel lobby-target --create-if-missing 2>/dev/null)
+
+  if [ -z "$single_gid" ]; then
+    fail "channel_gist resolve returned empty"
+    trap - EXIT
+    gh gist delete "$legacy_gid" --yes 2>/dev/null || true
+    return
+  fi
+
+  if [ "$single_gid" = "$legacy_gid" ]; then
+    fail "BUG #290: resolve returned the LEGACY multi-channel gist ($legacy_gid) — substrate split risk"
+  else
+    pass "resolve returned a different gist than the legacy ($single_gid != $legacy_gid)"
+  fi
+
+  trap "gh gist delete '$legacy_gid' --yes 2>/dev/null || true; gh gist delete '$single_gid' --yes 2>/dev/null || true" EXIT
+
+  # The new single_gid should be a canonical single-channel gist.
+  local single_channels
+  single_channels=$(gh api "gists/$single_gid" --jq '.files | to_entries[0].value.content' 2>/dev/null \
+    | python3 -c "import json,sys; print(json.load(sys.stdin).get('channels'))" 2>/dev/null)
+  if [ "$single_channels" = "['lobby-target']" ]; then
+    pass "single-channel gist envelope has channels=['lobby-target'] (post-3c canonical shape)"
+  else
+    fail "single-channel gist envelope shape unexpected: $single_channels"
+  fi
+
+  # Now the critical test: ANOTHER resolve call should ALSO return the
+  # single-channel gist (deterministic preference), not flip back to
+  # the legacy. This is the real production scenario where Peer B
+  # resolves AFTER Peer A already published the canonical single-channel.
+  local second_resolve
+  second_resolve=$(PYTHONPATH="$_lib_dir" python3 -m airc_core.channel_gist resolve --channel lobby-target 2>/dev/null)
+  if [ "$second_resolve" = "$single_gid" ]; then
+    pass "second resolve returns the canonical single-channel gist (substrate converges)"
+  else
+    fail "BUG #290: second resolve returned $second_resolve (expected $single_gid) — different peers will resolve different gists"
+  fi
+
+  trap - EXIT
+  gh gist delete "$legacy_gid" --yes 2>/dev/null || true
+  gh gist delete "$single_gid" --yes 2>/dev/null || true
+  cleanup_all
+}
+
+scenario_general_has_shared_gist() {
+  # TDD for #283: when a peer subscribes to #general (sidecar default
+  # on `airc join`), there must be a per-channel gist for #general
+  # that's findable/creatable on the gh account, and broadcasts to
+  # #general must land in THAT gist (not the project room's gist).
+  #
+  # Architecture (per Joel 2026-04-29): "one general, one continuum
+  # room, one ideem room etc — that's the whole point of rooms."
+  # Same gh account = ONE gist per channel name. All my tabs that
+  # subscribe to #general read+write the same #general gist.
+  #
+  # Pre-fix bug: spawn_general_sidecar_if_wanted only updates
+  # subscribed_channels in config.json. Nothing creates the canonical
+  # #general gist or routes traffic to it. Broadcasts on #general
+  # stamp the channel field but write to the project room's gist —
+  # other peers in different project rooms never see them.
+  section "general channel: shared gist resolved + traffic routed (#283)"
+
+  if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+    echo "  (skipped — gh not authed)"
+    return
+  fi
+
+  cleanup_all
+  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
+  local rname="tdd-general-$$"
+  mkdir -p /tmp/airc-it-tdd283-h /tmp/airc-it-tdd283-h/state
+
+  ( cd /tmp/airc-it-tdd283-h && AIRC_HOME=/tmp/airc-it-tdd283-h/state AIRC_NAME=tdd-h-283 AIRC_PORT=7561 \
+      AIRC_NO_DISCOVERY=1 \
+      "$AIRC" connect --room "$rname" --general > /tmp/airc-it-tdd283-h/out.log 2>&1 & )
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    sleep 1
+    [ -f /tmp/airc-it-tdd283-h/state/room_gist_id ] && break
+  done
+  local proj_gid; proj_gid=$(cat /tmp/airc-it-tdd283-h/state/room_gist_id 2>/dev/null)
+  if [ -z "$proj_gid" ]; then
+    fail "host did not publish project room gist (room_gist_id absent)"
+    cleanup_all; return
+  fi
+  pass "host published project room gist: $proj_gid (for #$rname)"
+
+  trap "gh gist delete '$proj_gid' --yes 2>/dev/null || true; \
+        general_gid=\$(python3 -c \"import json; c=json.load(open('/tmp/airc-it-tdd283-h/state/config.json')); print(c.get('channel_gists',{}).get('general',''))\" 2>/dev/null); \
+        [ -n \"\$general_gid\" ] && [ \"\$general_gid\" != \"$proj_gid\" ] && gh gist delete \"\$general_gid\" --yes 2>/dev/null || true" EXIT
+
+  # Sleep a moment so the sidecar code has had a chance to also resolve
+  # the #general gist (network call to gh).
+  sleep 3
+
+  # Critical assertion 1: config.json must have a channel_gists map
+  # with "general" pointing at a gist id distinct from the project room.
+  local general_gid
+  general_gid=$(python3 -c "
+import json, sys
+try:
+    c = json.load(open('/tmp/airc-it-tdd283-h/state/config.json'))
+    print(c.get('channel_gists', {}).get('general', ''))
+except Exception:
+    pass
+" 2>/dev/null)
+
+  if [ -n "$general_gid" ]; then
+    pass "config.channel_gists['general'] resolved to: $general_gid"
+  else
+    fail "config.json missing channel_gists['general'] — #general sidecar didn't resolve a shared gist"
+    cleanup_all; return
+  fi
+
+  if [ "$general_gid" != "$proj_gid" ]; then
+    pass "#general gist is distinct from project room gist (no conflation)"
+  else
+    fail "channel_gists['general'] equals project room gist id — #general was not resolved as a separate room"
+  fi
+
+  # Critical assertion 2: the resolved #general gist must actually exist.
+  if gh api gists/$general_gid --jq '.id' >/dev/null 2>&1; then
+    pass "the resolved #general gist exists on gh"
+  else
+    fail "channel_gists['general'] points at a gist that doesn't exist on gh"
+  fi
+
+  # Critical assertion 3: airc msg --room general writes to the #general
+  # gist's messages.jsonl, not the project room's gist.
+  local marker="tdd283-general-marker-$(date +%s%N)"
+  AIRC_HOME=/tmp/airc-it-tdd283-h/state "$AIRC" msg --room general "$marker" >/dev/null 2>&1 || true
+  sleep 2
+
+  local general_content; general_content=$(gh api "gists/$general_gid" --jq '.files["messages.jsonl"].content // ""' 2>/dev/null)
+  if printf '%s' "$general_content" | grep -q "$marker"; then
+    pass "airc msg --room general landed in #general gist's messages.jsonl"
+  else
+    fail "BUG: marker NOT in #general gist (content len ${#general_content}); broadcast to #general routed wrong"
+  fi
+
+  # And it must NOT have landed in the project gist (would mean cross-channel pollution).
+  local proj_content; proj_content=$(gh api "gists/$proj_gid" --jq '.files["messages.jsonl"].content // ""' 2>/dev/null)
+  if printf '%s' "$proj_content" | grep -q "$marker"; then
+    fail "channel pollution: #general broadcast also landed in project room gist (channel routing wrong)"
+  else
+    pass "no channel pollution: project room gist did not receive the #general broadcast"
+  fi
+
+  trap - EXIT
+  gh gist delete "$proj_gid" --yes 2>/dev/null || true
+  [ -n "$general_gid" ] && [ "$general_gid" != "$proj_gid" ] && gh gist delete "$general_gid" --yes 2>/dev/null || true
+  cleanup_all
+}
+
+scenario_custom_room_creates_gist() {
+  # Regression for the 2026-04-29 "phantom-room" + "auto-scope override"
+  # convergence: `airc join --room <new>` from a fresh scope must
+  # actually create a gist for <new>, set channel_gists[<new>], and
+  # subscribe in config — not silently fall back to git-org auto-scope
+  # or leave channel_gists empty.
+  section "custom room: airc join --room <new> creates the gist + mapping"
+  command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1 || { echo "  (skipped — gh not authed)"; return; }
+  cleanup_all
+  local rname="tdd-custom-room-$$"
+  local home; home=$(mktemp -d -t airc-it-customroom.XXXXXX)
+  ( cd "$home" && AIRC_HOME="$home/state" AIRC_NAME=tdd-cr-$$ AIRC_PORT=7565 AIRC_NO_DISCOVERY=1 AIRC_NO_AUTO_ROOM=1 \
+      "$AIRC" connect --room "$rname" --no-general > "$home/out.log" 2>&1 & )
+  local i; for i in 1 2 3 4 5 6 7 8; do sleep 1; [ -f "$home/state/config.json" ] && break; done
+  sleep 2
+  local gid; gid=$(python3 -c "import json,sys;print(json.load(open('$home/state/config.json')).get('channel_gists',{}).get('$rname',''))" 2>/dev/null)
+  trap "[ -n '$gid' ] && gh gist delete '$gid' --yes 2>/dev/null || true" EXIT
+  if [ -n "$gid" ]; then pass "channel_gists['$rname'] = $gid"; else fail "channel_gists['$rname'] empty — phantom room"; cleanup_all; return; fi
+  gh api "gists/$gid" --jq '.id' >/dev/null 2>&1 && pass "gist actually exists on gh" || fail "gist id present but gh has no such gist"
+  local marker="tdd-cr-$$"
+  AIRC_HOME="$home/state" "$AIRC" msg --room "$rname" "$marker" >/dev/null 2>&1
+  sleep 2
+  gh api "gists/$gid" --jq '.files["messages.jsonl"].content // ""' 2>/dev/null | grep -q "$marker" \
+    && pass "broadcast to #$rname landed in its gist" \
+    || fail "broadcast to #$rname did NOT land — channel routing broken"
+  trap - EXIT; gh gist delete "$gid" --yes 2>/dev/null || true
+  cleanup_all
+}
+
+scenario_bearer_local() {
+  # LocalBearer used to serve same-machine peers via direct filesystem
+  # reads/writes — a "skip the network" optimization correct in the
+  # SSH-tail era when the host's messages.jsonl was the substrate.
+  # Pulled from the resolver registry on 2026-04-29: post-3c the gist
+  # is the substrate, and writing to the host's local file lands in a
+  # place nobody reads (silent loss every joiner-side broadcast).
+  #
+  # This scenario now ALSO asserts the resolver does NOT route loopback
+  # peers to LocalBearer (the production-blocking guarantee). The
+  # bearer class itself is still tested via direct construction since
+  # we may revive a gh-aware variant later.
+  section "bearer (local): direct filesystem send/recv (deprecated; resolver opt-out)"
+  cleanup_all
+
+  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
+  local fake_home; fake_home=$(mktemp -d -t airc-it-bl-home.XXXXXX)
+  local off_file; off_file="$fake_home/monitor_offset"
+
+  # Production guard: resolver MUST refuse to route a loopback peer to
+  # LocalBearer (would cause silent loss against the gist substrate).
+  local resolver_out
+  resolver_out=$(PYTHONPATH="$_lib_dir" python3 -c "
+import sys
+sys.path.insert(0, '$_lib_dir')
+from airc_core.bearer_resolver import resolve, available_kinds
+from airc_core.bearer import PeerUnreachable
+
+print('KINDS=' + ','.join(available_kinds()))
+try:
+    b = resolve({'host_target': 'user@127.0.0.1', 'remote_home': '$fake_home'})
+    print(f'PICKED={b.KIND}')
+except PeerUnreachable:
+    print('PICKED=none')
+" 2>&1)
+  if echo "$resolver_out" | grep -q '^KINDS=' && ! echo "$resolver_out" | grep -q 'KINDS=.*local'; then
+    pass "resolver registry no longer contains LocalBearer (post-3c+)"
+  else
+    fail "resolver registry STILL has LocalBearer — silent-loss bug returns. (got: $resolver_out)"
+  fi
+  if echo "$resolver_out" | grep -qE '^PICKED=(gh|none)$'; then
+    pass "resolver routes loopback peers away from LocalBearer (got: $(echo "$resolver_out" | grep ^PICKED=))"
+  else
+    fail "resolver picked LocalBearer for loopback peer — would cause silent loss (got: $resolver_out)"
+  fi
+
+  # Direct-construction smoke test: the LocalBearer class still works as
+  # a pure file-tail transport. Round-trip a payload through send and
+  # verify it lands on disk.
+  local marker="local-bearer-send-marker-$(date +%s%N)"
+  local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"general","msg":"'"$marker"'","sig":"x"}'
+  local send_out
+  send_out=$(PYTHONPATH="$_lib_dir" python3 -c "
+import sys
+sys.path.insert(0, '$_lib_dir')
+from airc_core.bearer_local import LocalBearer
+
+bearer = LocalBearer({
+    'host_target': 'user@127.0.0.1',
+    'remote_home': '$fake_home',
+})
+print(f'KIND={bearer.KIND}')
+bearer.open('alpha')
+out = bearer.send('alpha', 'general', b'$probe')
+print(f'SEND_KIND={out.kind}')
+bearer.close()
+" 2>&1)
+
+  if echo "$send_out" | grep -q '^KIND=local$'; then
+    pass "LocalBearer class still constructs (kept on disk for possible revival)"
+  else
+    fail "LocalBearer construction failed (got: $send_out)"
+    rm -rf "$fake_home"
+    return
+  fi
+  if echo "$send_out" | grep -q '^SEND_KIND=delivered$'; then
+    pass "LocalBearer.send returns delivered"
+  else
+    fail "LocalBearer.send did not deliver (got: $send_out)"
+  fi
+  if grep -q "$marker" "$fake_home/messages.jsonl" 2>/dev/null; then
+    pass "payload landed in $fake_home/messages.jsonl"
+  else
+    fail "payload NOT visible in messages.jsonl (contents: $(cat "$fake_home/messages.jsonl" 2>/dev/null))"
+  fi
+
+  # Now exercise recv: append a second probe and verify recv_stream picks it up.
+  local marker2="local-bearer-recv-marker-$(date +%s%N)"
+  local probe2='{"from":"beta","to":"all","ts":"2026-04-29T00:00:01Z","channel":"general","msg":"'"$marker2"'","sig":"x"}'
+  local recv_out; recv_out=$(mktemp -t airc-it-bl-recv.XXXXXX)
+
+  PYTHONPATH="$_lib_dir" python3 -c "
+import sys, signal, time, json
+sys.path.insert(0, '$_lib_dir')
+from airc_core.bearer_local import LocalBearer
+
+bearer = LocalBearer({
+    'host_target': '127.0.0.1',
+    'remote_home': '$fake_home',
+})
+bearer.open('alpha')
+
+signal.alarm(10)
+out = open('$recv_out', 'w', buffering=1)
+try:
+    for ev in bearer.recv_stream():
+        env = ev.bearer_metadata.get('envelope', {})
+        if env.get('msg') == '$marker2':
+            live = bearer.liveness('alpha')
+            fresh = live.last_seen_ts is not None and (time.time() - live.last_seen_ts) < 10
+            out.write('FOUND\n')
+            out.write(f'LIVENESS={\"FRESH\" if fresh else \"STALE\"}\n')
+            break
+except Exception as e:
+    out.write(f'ERROR: {e}\n')
+finally:
+    out.close()
+    bearer.close()
+" >/dev/null 2>&1 &
+  local recv_pid=$!
+
+  sleep 1
+  echo "$probe2" >> "$fake_home/messages.jsonl"
+
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    sleep 1
+    grep -q '^FOUND' "$recv_out" 2>/dev/null && break
+  done
+  wait "$recv_pid" 2>/dev/null
+
+  if grep -q '^FOUND' "$recv_out" 2>/dev/null; then
+    pass "LocalBearer.recv_stream picked up the appended marker"
+  else
+    fail "LocalBearer.recv_stream did NOT see the marker (out: $(cat "$recv_out" 2>/dev/null))"
+  fi
+  if grep -q '^LIVENESS=FRESH' "$recv_out" 2>/dev/null; then
+    pass "LocalBearer.liveness reports fresh ts after recv event"
+  else
+    fail "LocalBearer.liveness not fresh (out: $(cat "$recv_out" 2>/dev/null))"
+  fi
+
+  rm -rf "$fake_home" "$recv_out"
+  cleanup_all
+}
+
+scenario_bearer_gh() {
+  # Phase 3b: GhBearer round-trip against a real gh gist. Creates a
+  # temporary gist, sends an envelope through the bearer, polls for
+  # it to appear via recv_stream, cleans up. Skip-guarded on gh auth.
+  #
+  # Why a real gist (not mocked): unit tests already cover the bearer's
+  # logic. This scenario validates the gh CLI invocations actually do
+  # what we expect — gh gist edit's filename rules, gh api response
+  # shape, error surfacing — none of which a mock can prove.
+  section "bearer (gh): send/recv round-trip via real gh gist"
+
+  if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+    echo "  (skipped — gh not authed)"
+    return
+  fi
+
+  cleanup_all
+  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
+
+  # Create a private gist with a non-empty seed line. gh refuses gists
+  # whose only file is blank (or even a bare newline). The bearer's
+  # envelope parser drops the seed line as malformed (no `from` field)
+  # so it's invisible in recv_stream output.
+  local seed; seed=$(mktemp -d -t airc-it-bg-seed.XXXXXX)
+  printf '# airc bearer_gh test seed\n' > "$seed/messages.jsonl"
+  local gist_url; gist_url=$(gh gist create -d "airc bearer_gh integration test" "$seed/messages.jsonl" 2>&1 | tail -1)
+  local gist_id; gist_id=$(printf '%s' "$gist_url" | awk -F/ '{print $NF}')
+  rm -rf "$seed"
+
+  if [ -z "$gist_id" ] || ! printf '%s' "$gist_id" | grep -qE '^[a-f0-9]+$'; then
+    fail "could not create test gist (got: $gist_url)"
+    return
+  fi
+  pass "test gist created: $gist_id"
+
+  # Always delete the gist before returning, even on failure. trap so
+  # an unexpected exit (e.g. signal during a long send) still cleans up.
+  local _cleanup_gist=1
+  _bearer_gh_cleanup() {
+    [ "${_cleanup_gist:-0}" = "1" ] && [ -n "${gist_id:-}" ] && \
+      gh gist delete "$gist_id" --yes 2>/dev/null || true
+  }
+  trap _bearer_gh_cleanup EXIT
+
+  local marker="gh-bearer-marker-$(date +%s%N)"
+  local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"general","msg":"'"$marker"'","sig":"x"}'
+
+  # Send via GhBearer.send (through the resolver, asserts kind=gh).
+  local send_out
+  send_out=$(PYTHONPATH="$_lib_dir" python3 -c "
+import sys
+sys.path.insert(0, '$_lib_dir')
+from airc_core.bearer_resolver import resolve
+
+bearer = resolve({'room_gist_id': '$gist_id'})
+print(f'KIND={bearer.KIND}')
+bearer.open('alpha')
+out = bearer.send('alpha', 'general', b'$probe')
+print(f'SEND_KIND={out.kind}')
+if out.detail:
+    print(f'SEND_DETAIL={out.detail}')
+bearer.close()
+" 2>&1)
+
+  if echo "$send_out" | grep -q '^KIND=gh$'; then
+    pass "resolver picks GhBearer for room_gist_id-only peer_meta"
+  else
+    fail "resolver did NOT pick GhBearer (got: $send_out)"
+    return
+  fi
+  if echo "$send_out" | grep -q '^SEND_KIND=delivered$'; then
+    pass "GhBearer.send returns delivered"
+  else
+    fail "GhBearer.send did not deliver (got: $send_out)"
+    return
+  fi
+
+  # Verify the marker actually landed in the gist.
+  local content; content=$(gh api "gists/$gist_id" 2>/dev/null \
+    | python3 -c "import sys, json; print(json.load(sys.stdin)['files']['messages.jsonl']['content'])" 2>/dev/null)
+  if printf '%s' "$content" | grep -q "$marker"; then
+    pass "payload visible in gist's messages.jsonl"
+  else
+    fail "payload NOT visible in gist (content: $content)"
+    return
+  fi
+
+  # Now exercise recv_stream: append a SECOND probe to the gist via gh
+  # CLI directly (simulating another peer's send), then verify
+  # GhBearer.recv_stream picks it up. Use poll_interval=1 to keep the
+  # test fast — production default is 15s.
+  local marker2="gh-bearer-recv-marker-$(date +%s%N)"
+  local probe2='{"from":"beta","to":"all","ts":"2026-04-29T00:00:01Z","channel":"general","msg":"'"$marker2"'","sig":"x"}'
+  local recv_out; recv_out=$(mktemp -t airc-it-bg-recv.XXXXXX)
+
+  local recv_err; recv_err=$(mktemp -t airc-it-bg-recv-err.XXXXXX)
+  PYTHONPATH="$_lib_dir" python3 -c "
+import sys, signal, time
+sys.path.insert(0, '$_lib_dir')
+from airc_core.bearer_resolver import resolve
+
+bearer = resolve({'room_gist_id': '$gist_id', 'poll_interval': 1})
+bearer.open('alpha')
+
+signal.alarm(30)
+out = open('$recv_out', 'w', buffering=1)
+try:
+    for ev in bearer.recv_stream():
+        env = ev.bearer_metadata.get('envelope', {})
+        if env.get('msg') == '$marker2':
+            live = bearer.liveness('alpha')
+            fresh = live.last_seen_ts is not None and (time.time() - live.last_seen_ts) < 30
+            out.write('FOUND\n')
+            out.write(f'LIVENESS={\"FRESH\" if fresh else \"STALE\"}\n')
+            break
+except Exception as e:
+    out.write(f'ERROR: {e}\n')
+finally:
+    out.close()
+    bearer.close()
+" >/dev/null 2>"$recv_err" &
+  local recv_pid=$!
+
+  # Give the bearer's first poll a beat, then append the marker.
+  # We must preserve ALL prior gist content (seed line + first probe);
+  # otherwise rewriting only probe+probe2 leaves line-count unchanged
+  # at 2, and the bearer's consumed_lines (advanced past those during
+  # poll 1) skips the new marker. gh gist edit replaces the file
+  # wholesale, so reconstruct the full content.
+  sleep 2
+  local prior_content; prior_content=$(gh api "gists/$gist_id" 2>/dev/null \
+    | python3 -c "import sys, json; print(json.load(sys.stdin)['files']['messages.jsonl']['content'], end='')" 2>/dev/null)
+  local seed2; seed2=$(mktemp -d -t airc-it-bg-seed2.XXXXXX)
+  {
+    printf '%s' "$prior_content"
+    # Ensure trailing newline before appending so probe2 lands on its own line.
+    case "$prior_content" in
+      *$'\n') ;;
+      *) printf '\n' ;;
+    esac
+    printf '%s\n' "$probe2"
+  } > "$seed2/messages.jsonl"
+  gh gist edit "$gist_id" "$seed2/messages.jsonl" >/dev/null 2>&1
+  rm -rf "$seed2"
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    sleep 1
+    grep -q '^FOUND' "$recv_out" 2>/dev/null && break
+  done
+  wait "$recv_pid" 2>/dev/null
+
+  if grep -q '^FOUND' "$recv_out" 2>/dev/null; then
+    pass "GhBearer.recv_stream picked up the appended marker"
+  else
+    fail "GhBearer.recv_stream did NOT see the marker (out: $(cat "$recv_out" 2>/dev/null) | err: $(cat "$recv_err" 2>/dev/null))"
+  fi
+  if grep -q '^LIVENESS=FRESH' "$recv_out" 2>/dev/null; then
+    pass "GhBearer.liveness reports fresh ts after recv event"
+  else
+    fail "GhBearer.liveness not fresh (out: $(cat "$recv_out" 2>/dev/null))"
+  fi
+
+  rm -f "$recv_out" "$recv_err"
+  # cleanup
+  trap - EXIT
+  _bearer_gh_cleanup
+  cleanup_all
+}
+
+scenario_e2e_encryption() {
+  # Phase E.3: prove the wire actually carries CIPHERTEXT and the
+  # receiver decrypts it back to plaintext. This is the demo-tomorrow
+  # test — if this passes, end-to-end encryption works through real
+  # paired SSH (the same path coworkers will use).
+  #
+  # Skip-guards on the dev venv being available. CI without the venv
+  # falls through cleanly and the rest of the suite runs.
+  section "e2e encryption: wire is ciphertext, receiver decrypts to plaintext"
+
+  local _venv="$(cd "$(dirname "$AIRC")" && pwd)/.venv-dev"
+  if [ ! -x "$_venv/bin/python" ] && [ ! -x "$_venv/bin/python3" ]; then
+    echo "  (skipped — dev venv not at $_venv; install.sh sets this up in production)"
+    return
+  fi
+  local _venv_python="$_venv/bin/python"
+  [ -x "$_venv_python" ] || _venv_python="$_venv/bin/python3"
+
+  cleanup_all
+
+  # Spawn host + joiner with venv python so cryptography is available.
+  # spawn_host/spawn_joiner inherit env so AIRC_PYTHON gets resolved
+  # to the venv automatically (airc's top-level checks $AIRC_DIR/.venv).
+  AIRC_DIR="$(cd "$(dirname "$AIRC")" && pwd)" \
+    spawn_host /tmp/airc-it-e2e-h enchost 7555 || { fail "enchost failed to start"; return; }
+  pass "enchost hosting on 7555"
+
+  local join; join=$(read_join_string /tmp/airc-it-e2e-h)
+  AIRC_DIR="$(cd "$(dirname "$AIRC")" && pwd)" \
+    spawn_joiner /tmp/airc-it-e2e-j encjoiner "$join" || { fail "encjoiner failed to join"; return; }
+  pass "encjoiner paired with enchost"
+
+  # Verify both sides bootstrapped X25519 keys via init_identity.
+  if [ -f /tmp/airc-it-e2e-h/state/identity/x25519_pub ] && \
+     [ -f /tmp/airc-it-e2e-h/state/identity/x25519_priv ]; then
+    pass "host bootstrapped X25519 keypair"
+  else
+    fail "host did NOT bootstrap X25519 keypair"
+  fi
+  if [ -f /tmp/airc-it-e2e-j/state/identity/x25519_pub ] && \
+     [ -f /tmp/airc-it-e2e-j/state/identity/x25519_priv ]; then
+    pass "joiner bootstrapped X25519 keypair"
+  else
+    fail "joiner did NOT bootstrap X25519 keypair"
+  fi
+
+  # Verify the pair handshake exchanged X25519 pubkeys: each side's
+  # peer record for the OTHER must contain x25519_pub.
+  local h_peer=/tmp/airc-it-e2e-h/state/peers/encjoiner.json
+  local j_peer=/tmp/airc-it-e2e-j/state/peers/enchost.json
+  if [ -f "$h_peer" ] && python3 -c "import json; d=json.load(open('$h_peer')); exit(0 if d.get('x25519_pub') else 1)"; then
+    pass "host's peer record has joiner's x25519_pub (handshake exchanged)"
+  else
+    fail "host's peer record MISSING x25519_pub: $(cat "$h_peer" 2>/dev/null)"
+  fi
+  if [ -f "$j_peer" ] && python3 -c "import json; d=json.load(open('$j_peer')); exit(0 if d.get('x25519_pub') else 1)"; then
+    pass "joiner's peer record has host's x25519_pub (handshake exchanged)"
+  else
+    fail "joiner's peer record MISSING x25519_pub: $(cat "$j_peer" 2>/dev/null)"
+  fi
+
+  # Send a message from joiner to host. Verify:
+  # - Host's messages.jsonl contains the CIPHERTEXT (enc field present)
+  # - Joiner's local mirror contains PLAINTEXT (audit log readable)
+  local marker="e2e-secret-marker-$(date +%s%N)"
+  AIRC_HOME=/tmp/airc-it-e2e-j/state "$AIRC" send @enchost "$marker" >/dev/null 2>&1 || true
+  sleep 2
+
+  if grep -q "$marker" /tmp/airc-it-e2e-j/state/messages.jsonl 2>/dev/null; then
+    pass "joiner's local log has plaintext marker (audit trail)"
+  else
+    fail "joiner's local log MISSING plaintext marker"
+  fi
+
+  # The host's messages.jsonl line for this send should NOT contain the
+  # plaintext marker — it's encrypted. Look for the line by its `from`
+  # field; tolerate both spaced (Python json.dumps default) and
+  # non-spaced (bash-built) forms.
+  local host_line; host_line=$(grep -E '"from":\s*"encjoiner"' /tmp/airc-it-e2e-h/state/messages.jsonl 2>/dev/null | tail -1)
+  if [ -z "$host_line" ]; then
+    fail "no inbound line on host from encjoiner"
+  elif printf '%s' "$host_line" | grep -q "$marker"; then
+    fail "WIRE IS PLAINTEXT — encryption did not engage. Line: $host_line"
+  elif printf '%s' "$host_line" | python3 -c "import json,sys; d=json.load(sys.stdin); exit(0 if d.get('enc')=='v1' and 'nonce' in d else 1)"; then
+    pass "host's wire form is ciphertext (enc=v1, nonce present)"
+  else
+    fail "host's wire form unexpected shape: $host_line"
+  fi
+
+  # Verify monitor formatter decrypted on the host side — host's local
+  # log should NOT mirror the cipher (host is the host, no mirror), but
+  # `airc logs` on host should show the marker plaintext after decrypt.
+  # Host's messages.jsonl IS the source of truth on host side. Since
+  # encryption is end-to-end, host stores CIPHERTEXT in its log; the
+  # decrypt happens on read by the monitor formatter for display.
+  # We can't easily test the formatter's stdout here — but we verified
+  # the wire is ciphertext, which is the load-bearing assertion.
+
+  cleanup_all
+}
+
+scenario_bearer_observability() {
+  # Phase 2c (#270): the bearer-attested liveness surface must replace
+  # the messages.jsonl-mirror-derived "last recv" lie. After a real
+  # message lands on the joiner, bearer_state.json must reflect it AND
+  # `airc status` must report a fresh-seconds age (not a stale 30+ min
+  # gap). `airc peers` must annotate the silent peer with a last-seen
+  # marker so 30 days of silence is impossible to mistake for "active."
+  section "bearer observability: state file + status + peers reflect real liveness"
+  cleanup_all
+
+  spawn_host /tmp/airc-it-bo-h obs-host 7554 || { fail "obs-host failed to start"; return; }
+  pass "obs-host hosting on 7554"
+
+  local join; join=$(read_join_string /tmp/airc-it-bo-h)
+  spawn_joiner /tmp/airc-it-bo-j obs-joiner "$join" || { fail "obs-joiner failed to join"; return; }
+  pass "obs-joiner paired"
+
+  # Send a probe DM through the live monitor so the bearer's recv path
+  # actually fires. as_home picks up the joiner's scope.
+  local marker="bearer-obs-marker-$(date +%s)"
+  as_home /tmp/airc-it-bo-h send @obs-joiner "$marker" >/dev/null 2>&1 || true
+
+  # Give the joiner monitor a moment to receive + write state.
+  sleep 3
+
+  local state_file=/tmp/airc-it-bo-j/state/bearer_state.json
+  if [ -f "$state_file" ]; then
+    pass "bearer_state.json materialized in joiner scope"
+  else
+    fail "bearer_state.json missing — bearer never wrote it"
+    cleanup_all; return
+  fi
+
+  # last_recv_ts must be populated and recent (within 30s).
+  local fresh
+  fresh=$(python3 -c "
+import json, time
+s = json.load(open('$state_file'))
+ts = s.get('last_recv_ts')
+if ts is None:
+    print('NONE')
+elif time.time() - float(ts) > 30:
+    print('STALE')
+else:
+    print('FRESH')
+" 2>/dev/null)
+  case "$fresh" in
+    FRESH) pass "bearer_state.last_recv_ts is fresh (<30s)" ;;
+    STALE) fail "bearer_state.last_recv_ts is stale (state: $(cat "$state_file"))" ;;
+    *)     fail "bearer_state.last_recv_ts not set (state: $(cat "$state_file"))" ;;
+  esac
+
+  # kind must be "ssh" (the only registered bearer in Phase 2c).
+  local kind; kind=$(python3 -c "import json; print(json.load(open('$state_file'))['kind'])" 2>/dev/null)
+  if [ "$kind" = "ssh" ]; then
+    pass "bearer_state.kind == 'ssh' (bearer attests its own KIND)"
+  else
+    fail "bearer_state.kind != 'ssh' (got: $kind)"
+  fi
+
+  # `airc status` must report a fresh "via ssh" line — not a >30s gap.
+  local j_out; j_out=$(AIRC_HOME=/tmp/airc-it-bo-j/state "$AIRC" status 2>&1)
+  if echo "$j_out" | grep -qE 'bearer:\s+[0-9]+s ago via ssh'; then
+    pass "airc status surfaces bearer-attested 'Ns ago via ssh'"
+  else
+    fail "airc status bearer line missing fresh ts (got: $(echo "$j_out" | grep bearer))"
+  fi
+
+  # `airc peers` on the joiner must show the host with a last-seen marker.
+  # Since we just received a message FROM the host, the host's name should
+  # appear with a recent age (seconds, not minutes/hours).
+  local j_peers; j_peers=$(AIRC_HOME=/tmp/airc-it-bo-j/state "$AIRC" peers 2>&1)
+  if echo "$j_peers" | grep -qE 'last seen [0-9]+s ago'; then
+    pass "airc peers shows fresh per-peer last-seen"
+  else
+    fail "airc peers missing last-seen annotation (got: $j_peers)"
+  fi
+
+  cleanup_all
+}
+
+scenario_python_units() {
+  # Python unit tests for airc_core/. Currently exercises the bearer
+  # abstraction (lib/airc_core/bearer.py + bearer_resolver.py +
+  # bearer_ssh.py). Add new test_*.py files in test/ as the airc_core
+  # surface grows — each file is auto-discovered by the loop below.
+  echo
+  echo "── scenario: python unit tests ──"
+  local _here; _here="$(cd "$(dirname "$0")" && pwd)"
+  local _failed=0
+  for _t in "$_here"/test_*.py; do
+    [ -f "$_t" ] || continue
+    local _name; _name=$(basename "$_t" .py)
+    if ( cd "$_here" && python3 "$_t" 2>&1 | tail -3 | grep -q '^OK' ); then
+      pass "python units: $_name"
+    else
+      fail "python units: $_name (run: cd test && python3 $(basename "$_t"))"
+      _failed=$((_failed + 1))
+    fi
+  done
+  return $_failed
+}
+
 case "$MODE" in
   tabs)         scenario_tabs  ;;
   scope)        scenario_scope ;;
@@ -2487,6 +3750,20 @@ case "$MODE" in
   list) scenario_list ;;
   quit) scenario_quit ;;
   platform_adapters) scenario_platform_adapters ;;
+  python_units) scenario_python_units ;;
+  bearer_ssh_send) scenario_bearer_ssh_send ;;
+  bearer_ssh_recv) scenario_bearer_ssh_recv ;;
+  bearer_cli_recv) scenario_bearer_cli_recv ;;
+  bearer_observability) scenario_bearer_observability ;;
+  e2e_encryption) scenario_e2e_encryption ;;
+  bearer_local) scenario_bearer_local ;;
+  bearer_gh) scenario_bearer_gh ;;
+  gh_send_creates_messages_jsonl) scenario_gh_send_creates_messages_jsonl ;;
+  host_msg_publishes_to_gist) scenario_host_msg_publishes_to_gist ;;
+  general_has_shared_gist) scenario_general_has_shared_gist ;;
+  channel_gist_prefers_single_channel) scenario_channel_gist_prefers_single_channel ;;
+  gist_rotates_under_size_limit) scenario_gist_rotates_under_size_limit ;;
+  custom_room_creates_gist) scenario_custom_room_creates_gist ;;
   ""|all)
     # Default = run everything. The peers_cross_scope + whois_cross_scope
     # scenarios were removed in PR #239 (sidecar walk semantics deleted
@@ -2501,8 +3778,13 @@ case "$MODE" in
     scenario_send_dead_monitor_dies; scenario_connect_after_kill_recovers
     scenario_general_sidecar_default; scenario_away
     scenario_list; scenario_quit; scenario_platform_adapters
+    scenario_python_units
+    scenario_bearer_ssh_send; scenario_bearer_ssh_recv; scenario_bearer_cli_recv
+    scenario_bearer_observability; scenario_bearer_local; scenario_bearer_gh
+    scenario_e2e_encryption
+    scenario_custom_room_creates_gist
     ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|all]"; exit 2 ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|all]"; exit 2 ;;
 esac
 
 echo

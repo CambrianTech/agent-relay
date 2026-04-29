@@ -48,6 +48,15 @@ cmd_send() {
   # Phase 2B.3 deletes --room's re-exec path and makes --room an
   # alias for --channel.
   local channel_override=""
+  # _explicit_channel: user used --room/--channel to target a specific
+  # channel. When set, we MUST find a gist mapping for that channel —
+  # silently falling back to the scope's primary room_gist_id has the
+  # phantom-room failure mode (banner says "→ #qa-experiment", message
+  # actually goes to #general's gist with channel field "qa-experiment",
+  # no new gist ever created). User reported 2026-04-29: "I sent to
+  # #qa-experiment, #qa-sub-room-test, #x — all 'succeeded' with banner,
+  # NONE created a gist."
+  local _explicit_channel=0
   # --internal: best-effort send for internal informational broadcasts
   # ([rename], etc.) where the monitor-down guard is the wrong UX. Append
   # to the local log + return 0 even when the monitor isn't running.
@@ -70,10 +79,12 @@ cmd_send() {
       --room|-room)
         target_room="${2:-}"
         [ -z "$target_room" ] && die "Usage: airc send --room <name> <message>"
+        _explicit_channel=1
         shift 2 ;;
       --channel|-c)
         channel_override="${2:-}"
         [ -z "$channel_override" ] && die "Usage: airc send --channel <name> <message>"
+        _explicit_channel=1
         shift 2 ;;
       --internal)
         internal=1
@@ -194,82 +205,129 @@ cmd_send() {
   if [ -n "$host_target" ]; then
     local rhome; rhome=$(remote_home)
     # Always mirror locally FIRST so we have an audit trail regardless of
-    # what the wire does. If send succeeds: local + remote both have it.
-    # If send fails: local has it (user can see it + retry), remote doesn't.
-    # This prevents silent loss where both sides forget a message that
-    # never arrived.
+    # what the wire does. Local mirror stays PLAINTEXT (the user's own
+    # audit log of what they sent — the alternative would force `airc
+    # logs` to decrypt own outbound, which is silly). Wire form may be
+    # encrypted below if the recipient has a stored x25519_pub.
     echo "$full_msg" >> "$MESSAGES"
 
-    # Fast-path: when tailscale status already reports this peer offline,
-    # don't burn 10s on the ssh ConnectTimeout — queue immediately with a
-    # cleaner "peer offline in tailnet" marker. flush_pending_loop +
-    # monitor reconnect handle the drain automatically when the peer
-    # wakes. Skipped entirely for non-CGNAT targets, LAN peers, or when
-    # tailscale CLI is unavailable (falls through to normal ssh attempt).
-    if is_peer_offline_in_tailnet "$host_target"; then
-      echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
-      local queue_marker; queue_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[QUEUED to %s — peer offline in tailnet, auto-delivers on wake]"}' \
-        "$(timestamp)" "$active_channel" "$peer_name")
-      echo "$queue_marker" >> "$MESSAGES"
-      date +%s > "$AIRC_WRITE_DIR/last_sent" 2>/dev/null
-      rm -f "$AIRC_WRITE_DIR/reminded" 2>/dev/null
-      return 0
+    # Phase E.3: wrap the wire envelope with envelope-layer encryption
+    # if we have the recipient's X25519 pubkey on file. Empty pubkey =
+    # peer is on pre-Phase-E airc (or never paired with us under E),
+    # in which case the wrap CLI passes through unchanged. Failures
+    # also pass through (loud stderr, no silent encryption skip).
+    # Phase E.3: look up recipient's X25519 pubkey for envelope encryption.
+    # Empty result = peer hasn't paired under E2E (or our cryptography
+    # package isn't installed). The wrap CLI passes through plaintext in
+    # that case, transparently.
+    local recipient_pub=""
+    if [ "$peer_name" != "all" ]; then
+      recipient_pub=$("$AIRC_PYTHON" -m airc_core.identity peer_pub \
+        --peers-dir "$PEERS_DIR" --peer-name "$peer_name" 2>/dev/null || true)
+    fi
+    local wire_msg="$full_msg"
+    if [ -n "$recipient_pub" ]; then
+      # Stderr unredirected — wrap failures surface loud (CLAUDE.md "never swallow").
+      wire_msg=$(printf '%s' "$full_msg" | "$AIRC_PYTHON" -m airc_core.envelope wrap \
+        --recipient-pub "$recipient_pub" \
+        --identity-dir "$IDENTITY_DIR" || printf '%s' "$full_msg")
+      # Diagnostic: emit the wire shape to stderr so test logs surface
+      # whether encryption actually engaged. Phase E debug aid; remove
+      # once production has verified the path. (Doubles as a sanity
+      # check for `airc doctor`.)
+      if [ -n "${AIRC_E2E_DEBUG:-}" ]; then
+        echo "[airc:e2e] wire_msg: $wire_msg" >&2
+      fi
     fi
 
-    # Attempt the wire. Trust the remote's __APPENDED__ marker — some shells
-    # bubble benign ssh stderr warnings up as non-zero exit, but the append
-    # itself succeeded. We check stdout for the marker, not the exit code.
-    # `|| true` prevents set -e from aborting when ssh itself fails (exit 255
-    # on unreachable host); we want to reach the failure-marker branch below.
-    # Pipe message via stdin so apostrophes (or any shell metachar) in the
-    # payload cannot break the single-quoted remote echo.
-    local out err
-    err=$(mktemp -t airc-send-err.XXXXXX)
-    out=$(printf '%s\n' "$full_msg" | relay_ssh "$host_target" "cat >> $rhome/messages.jsonl && echo __APPENDED__" 2>"$err" || true)
-    if ! echo "$out" | grep -q '^__APPENDED__$'; then
-      # Wire failed. Queue the payload for automatic retry by flush_pending_loop
-      # in the monitor, then annotate the local log with a [QUEUED] marker so
-      # `airc logs` makes the state obvious. Don't die() — queued is a form of
-      # success. The user's shell scripts can still check pending.jsonl if
-      # they need to block on delivery.
-      # Distinguish auth failures (user must re-pair — retrying won't help)
-      # from network failures (queue + retry makes sense). Prior behavior
-      # silently queued both the same way, hiding auth errors behind a
-      # misleading "Host unreachable" message. This bit the cross-mesh
-      # coordination: fresh-install joiner's SSH key wasn't in host's
-      # authorized_keys, cmd_send queued + returned 0, the joiner thought
-      # their send succeeded when the host never saw anything.
-      local stderr_raw; stderr_raw=$(cat "$err" 2>/dev/null)
-      local stderr; stderr=$(printf '%s' "$stderr_raw" | tr '\n' ' ' | sed 's/"/\\"/g' | cut -c1-300)
-      rm -f "$err"
-
-      local is_auth_fail=0
-      if echo "$stderr_raw" | grep -qiE 'permission denied|publickey|host key verification|authentication fail|identification has changed|no supported authentication'; then
-        is_auth_fail=1
+    # Hand the wire to the bearer abstraction. ALL transport-specific
+    # knowledge lives in lib/airc_core/bearer_*.py. cmd_send only:
+    #   1. Builds the signed envelope (above)
+    #   2. Wraps with envelope-layer crypto if recipient supports it
+    #   3. Hands payload + peer_meta to bearer_cli
+    #   4. Branches on the structured SendOutcome.kind
+    # Adding a new transport doesn't touch this file — only the
+    # resolver registers it. (Phases 1-3 of bearer rewrite; #269 #270.)
+    # Phase 3c+ (#283): route by channel. The active_channel's gist
+    # comes from channel_gists in config (populated at subscribe time).
+    # If the channel has no mapping, fall back to the scope's primary
+    # room_gist_id so single-room scopes keep working unchanged.
+    local room_gist_id=""
+    room_gist_id=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
+      --config "$CONFIG" --channel "$active_channel" 2>/dev/null || true)
+    # Phantom-room guard: when --room/--channel was used explicitly,
+    # NEVER fall back to the scope's primary room_gist_id — that publishes
+    # to the wrong gist with the right channel-tag, creating an invisible
+    # mis-route ("phantom success"). Only the no-override path falls back
+    # for back-compat with single-channel scopes.
+    if [ -z "$room_gist_id" ]; then
+      if [ "$_explicit_channel" = "1" ]; then
+        die "no gist mapping for channel '$active_channel' — run 'airc join --room $active_channel' first to create the room"
       fi
+      if [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
+        room_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
+      fi
+    fi
 
-      if [ "$is_auth_fail" = "1" ]; then
+    local outcome
+    outcome=$(printf '%s' "$wire_msg" | "$AIRC_PYTHON" -m airc_core.bearer_cli send \
+      "$peer_name" "$active_channel" \
+      --host-target "$host_target" \
+      --remote-home "$rhome" \
+      --room-gist-id "$room_gist_id")
+    local kind detail
+    kind=$(printf '%s' "$outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("kind",""))' 2>/dev/null)
+    detail=$(printf '%s' "$outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("detail",""))' 2>/dev/null)
+
+    case "$kind" in
+      delivered)
+        # Wire success. Local mirror already happened above; nothing else to do.
+        :
+        ;;
+      queued_unreachable)
+        # Bearer chose to short-circuit a predictable miss (e.g. tailnet-
+        # offline peer). Queue + marker; monitor's flush_pending_loop drains
+        # when the peer wakes.
+        echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
+        local queue_marker; queue_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[QUEUED to %s — %s]"}' \
+          "$(timestamp)" "$active_channel" "$peer_name" "${detail:-peer offline}")
+        echo "$queue_marker" >> "$MESSAGES"
+        date +%s > "$AIRC_WRITE_DIR/last_sent" 2>/dev/null
+        rm -f "$AIRC_WRITE_DIR/reminded" 2>/dev/null
+        return 0
+        ;;
+      auth_failure)
+        # Hard failure. Don't queue — every retry will fail identically.
+        # Surface loudly + die so the user re-pairs instead of sending
+        # into the void.
         local fail_marker; fail_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[AUTH FAILED to %s — repair required, NOT queued] %s"}' \
-          "$(timestamp)" "$active_channel" "$peer_name" "${stderr:-no stderr}")
+          "$(timestamp)" "$active_channel" "$peer_name" "${detail:-no detail}")
         echo "$fail_marker" >> "$MESSAGES"
         echo "  SSH auth to host FAILED. Message NOT queued — every retry would fail identically." >&2
-        echo "  SSH stderr: ${stderr}" >&2
+        echo "  Bearer: ${detail}" >&2
         echo "  Fix: airc teardown --flush && airc connect <invite-string>" >&2
         die "Authentication failure — re-pair required"
-      fi
-
-      # Network-class wire failure: legitimately transient, queue for retry.
-      echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
-      local queue_marker; queue_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[QUEUED to %s — network error, will retry] %s"}' \
-        "$(timestamp)" "$active_channel" "$peer_name" "${stderr:-no stderr}")
-      echo "$queue_marker" >> "$MESSAGES"
-      echo "  Network error reaching host — message queued for retry. Monitor will flush when host returns." >&2
-      # Surface the actual stderr so the user understands WHY — the old
-      # generic "host unreachable" was hiding real errors.
-      echo "  SSH stderr: ${stderr:-<none>}" >&2
-    else
-      rm -f "$err"
-    fi
+        ;;
+      transient_failure|"")
+        # Network-class failure or empty/malformed outcome → treat as
+        # transient + queue. Empty kind defends against bearer_cli
+        # crashing or outputting nothing — the message goes to pending
+        # rather than disappearing silently.
+        echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
+        local queue_marker; queue_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[QUEUED to %s — network error, will retry] %s"}' \
+          "$(timestamp)" "$active_channel" "$peer_name" "${detail:-no detail}")
+        echo "$queue_marker" >> "$MESSAGES"
+        echo "  Network error reaching host — message queued for retry. Monitor will flush when host returns." >&2
+        echo "  Bearer: ${detail:-<none>}" >&2
+        ;;
+      *)
+        # Unknown kind. The bearer.py SendOutcome contract enumerates the
+        # valid kinds — if we hit this, the bearer added a kind without
+        # updating callers. Queue defensively + log loudly so it's caught.
+        echo "$full_msg" >> "$AIRC_WRITE_DIR/pending.jsonl"
+        echo "  Unknown bearer outcome kind '${kind}' (detail: ${detail}). Queued defensively. Update cmd_send.sh." >&2
+        ;;
+    esac
   else
     # Host path: append to OUR messages.jsonl. Joiners' SSH tails will
     # pick it up and route to their monitors. BUT — if our monitor isn't
@@ -323,12 +381,71 @@ cmd_send() {
       else
         echo "    pidfile:  absent (monitor never started in this scope)" >&2
       fi
-      echo "  Joiners ride on the monitor's SSH tail; with the monitor down, your message reaches no one." >&2
       echo "  Fix: run 'airc connect' to start (or resume) this scope's monitor, then retry." >&2
       echo "       OR cd into the scope you actually meant to send from." >&2
       die "monitor down — refusing to silently broadcast into a void"
     fi
+
+    # Local audit log — plaintext, the user's own record of what they sent.
     echo "$full_msg" >> "$MESSAGES"
+
+    # Phase 3c critical fix (#285): host-side cmd_send must ALSO publish
+    # to the room gist so joiners (who poll the gist via GhBearer) see
+    # broadcasts and DMs from the host. Pre-3c, joiners tailed the host's
+    # local messages.jsonl over SSH; with SSH gone, joiners poll the gist
+    # — local-only append disappears into a void. Worst silent-loss
+    # class until this fix landed.
+    #
+    # Same wrap-if-recipient-known logic as the joiner branch above:
+    # encrypt msg field with recipient's X25519 pub when it's a DM and
+    # we have their pubkey on file; broadcasts go plaintext (group
+    # encryption is a future Phase E.4).
+    local _host_recipient_pub=""
+    if [ "$peer_name" != "all" ]; then
+      _host_recipient_pub=$("$AIRC_PYTHON" -m airc_core.identity peer_pub \
+        --peers-dir "$PEERS_DIR" --peer-name "$peer_name" 2>/dev/null || true)
+    fi
+    local _host_wire_msg="$full_msg"
+    if [ -n "$_host_recipient_pub" ]; then
+      _host_wire_msg=$(printf '%s' "$full_msg" | "$AIRC_PYTHON" -m airc_core.envelope wrap \
+        --recipient-pub "$_host_recipient_pub" \
+        --identity-dir "$IDENTITY_DIR" || printf '%s' "$full_msg")
+    fi
+
+    # Route by channel via channel_gists (post-#283); fall back to the
+    # scope's primary room_gist_id so single-room hosts keep working —
+    # but only when the user did NOT explicitly target a different room
+    # (otherwise the fallback turns --room into a phantom success that
+    # silently mis-routes to the primary gist; see _explicit_channel).
+    local _host_room_gist_id=""
+    _host_room_gist_id=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
+      --config "$CONFIG" --channel "$active_channel" 2>/dev/null || true)
+    if [ -z "$_host_room_gist_id" ]; then
+      if [ "$_explicit_channel" = "1" ]; then
+        die "no gist mapping for channel '$active_channel' — run 'airc join --room $active_channel' first to create the room"
+      fi
+      if [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
+        _host_room_gist_id=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
+      fi
+    fi
+
+    if [ -n "$_host_room_gist_id" ]; then
+      local _host_outcome
+      _host_outcome=$(printf '%s' "$_host_wire_msg" | "$AIRC_PYTHON" -m airc_core.bearer_cli send \
+        "$peer_name" "$active_channel" \
+        --room-gist-id "$_host_room_gist_id")
+      local _host_kind
+      _host_kind=$(printf '%s' "$_host_outcome" | "$AIRC_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("kind",""))' 2>/dev/null)
+      case "$_host_kind" in
+        delivered) : ;;
+        *)
+          echo "  ⚠ Gist publish failed (kind=${_host_kind:-empty}); broadcast did not reach joiners." >&2
+          echo "    Local audit log has the message; joiners polling the gist see nothing." >&2
+          ;;
+      esac
+    else
+      echo "  ⚠ No room_gist_id set ($AIRC_WRITE_DIR/room_gist_id missing) — host send is local-only." >&2
+    fi
   fi
 
   # Reset reminder — you sent something, clock restarts
@@ -405,10 +522,13 @@ cmd_ping() {
   local start_time
   start_time=$(date +%s)
 
-  # Use cmd_send so the ping rides the same signed-message path as
-  # normal traffic — guaranteed shape parity with what the receiver's
-  # monitor_formatter reads.
-  cmd_send "@$peer_name" "[PING:$ping_id]" >/dev/null || die "ping send failed — check SSH/auth state (airc status)"
+  # Route via #general (the universal lobby sidecar). Pre-fix: ping
+  # used the sender's default channel, but peers in different cwds
+  # auto-scope to different project channels (cambriantech vs ideem
+  # vs useideem) so the recipient often didn't poll the sender's
+  # default channel and never saw the ping. #general is the one
+  # channel everyone subscribes to — guaranteed common ground.
+  cmd_send --channel general "@$peer_name" "[PING:$ping_id]" >/dev/null || die "ping send failed (airc status)"
 
   echo "ping sent to $peer_name (id=$ping_id) — waiting up to ${timeout}s for pong..."
 

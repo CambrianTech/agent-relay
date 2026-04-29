@@ -276,36 +276,83 @@ def run(my_name: str, peers_dir: str) -> int:
             continue
         fr = m.get("from", "?")
         to = m.get("to", "")
+        # Phase E.3: decrypt envelope-layer ciphertext if present. Drop
+        # the message rather than display garbage if decrypt fails (per
+        # CLAUDE.md "never swallow errors", emit stderr first). Plaintext
+        # envelopes (no enc field) pass through unchanged.
+        if m.get("enc"):
+            try:
+                from airc_core import envelope as _env
+                from airc_core import identity as _id
+                from airc_core import crypto as _crypto
+            except ImportError:
+                # cryptography missing locally → can't decrypt anything.
+                # Drop encrypted messages with a stderr note so the user
+                # knows their setup is missing the venv/cryptography.
+                sys.stderr.write(
+                    f"[airc:monitor] dropping encrypted msg from {fr}: "
+                    f"cryptography not installed (run install.sh to set up venv)\n"
+                )
+                sys.stderr.flush()
+                continue
+            sender_pub = _id.peer_x25519_pub(peers_dir, fr) if fr else None
+            my_priv = _id.load_priv(os.path.join(scope_dir, "identity"))
+            if sender_pub is None or my_priv is None:
+                sys.stderr.write(
+                    f"[airc:monitor] dropping encrypted msg from {fr}: "
+                    f"missing pubkey/privkey for decrypt\n"
+                )
+                sys.stderr.flush()
+                continue
+            decrypted = _env.unwrap_envelope(m, my_priv, sender_pub)
+            if decrypted is None:
+                # unwrap_envelope returns None on ANY failure — AEAD auth
+                # mismatch (wrong key, tampered ciphertext) OR missing
+                # fields OR base64 decode error OR JSON parse failure
+                # of the decrypted payload. Phrase it conservatively.
+                sys.stderr.write(
+                    f"[airc:monitor] dropping encrypted msg from {fr}: "
+                    f"unwrap failed (key mismatch, tampered, or malformed envelope)\n"
+                )
+                sys.stderr.flush()
+                continue
+            m = decrypted
+            # Re-serialize the decrypted envelope as `line` so the local
+            # mirror below writes plaintext. This way `airc logs` shows
+            # readable content even though the wire was ciphertext.
+            line = json.dumps(m)
         msg = m.get("msg", "")
         # Filter own sends early, including our own [rename] markers. Read
         # the name fresh so a mid-session rename takes effect immediately.
         if fr == current_name():
             continue
-        # Mirror inbound to the local messages.jsonl ONLY when we are a
-        # joiner (tailing the remote host). For a host the local log is
-        # already the source of truth; mirroring would create a feedback
-        # loop (tail sees line -> we append line -> tail sees it again).
-        if is_joiner:
+        # Mirror inbound to local messages.jsonl. Post-3c (gh substrate)
+        # the gist is the canonical source of truth for ALL peers — the
+        # "host" no longer has a privileged local log that everyone tails
+        # over SSH. Both hosts and joiners pull from the gist via
+        # bearer_cli recv (offset-tracked), so there is no feedback loop:
+        # the monitor never re-reads what it appended here. Without this
+        # mirror, hosts never see inbound traffic in messages.jsonl,
+        # which broke `airc ping` (cmd_ping greps the local log for
+        # [PONG:uuid] and timed out forever) and any other reader of
+        # the local audit trail.
+        try:
+            with open(local_log, "a") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+        # Rotate every ~100 mirrored lines. Without this, local logs
+        # grow forever (Joel's audit 2026-04-28).
+        if (offset_counter % 100) == 0:
             try:
-                with open(local_log, "a") as f:
-                    f.write(line + "\n")
+                from airc_core.log import rotate_if_needed
+                rotate_if_needed(
+                    local_log,
+                    int(os.environ.get("AIRC_LOG_MAX_LINES", "5000")),
+                    int(os.environ.get("AIRC_LOG_KEEP_LINES", "2500")),
+                )
             except Exception:
                 pass
-            # Rotate every ~100 mirrored lines (cheap no-op when under
-            # threshold). Without this, joiner local logs grow forever —
-            # Joel's audit 2026-04-28. Host's log is rotated by the
-            # heartbeat loop on the host side; this is the joiner-side
-            # equivalent.
-            if (offset_counter % 100) == 0:
-                try:
-                    from airc_core.log import rotate_if_needed
-                    rotate_if_needed(
-                        local_log,
-                        int(os.environ.get("AIRC_LOG_MAX_LINES", "5000")),
-                        int(os.environ.get("AIRC_LOG_KEEP_LINES", "2500")),
-                    )
-                except Exception:
-                    pass
         if _handle_rename(peers_dir, msg):
             continue
         # Ping/pong monitor-liveness probe. Prefix marker on a normal
@@ -329,15 +376,30 @@ def run(my_name: str, peers_dir: str) -> int:
                 # Auto-reply pong via subprocess. Fire-and-forget. Uses
                 # airc send so the reply rides the same signed-message
                 # path as normal traffic (no protocol divergence).
+                # Preserve the ping's channel — without --channel the
+                # pong goes to the responder's default channel, which
+                # may be a channel the original sender doesn't poll,
+                # so cmd_ping's local-log grep times out forever even
+                # though we did reply (the channel of the original ping
+                # is already in our channel_gists or we wouldn't have
+                # received it).
+                ping_channel = m.get("channel", "")
                 import subprocess
+                cmd = ["airc", "send"]
+                if ping_channel:
+                    cmd += ["--channel", ping_channel]
+                cmd += [f"@{fr}", f"[PONG:{ping_id}]"]
                 try:
+                    # Stderr unredirected per CLAUDE.md "never swallow
+                    # errors" — auto-pong failures are exactly the kind
+                    # of evidence the next debugger needs.
                     subprocess.Popen(
-                        ["airc", "send", f"@{fr}", f"[PONG:{ping_id}]"],
+                        cmd,
                         stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    sys.stderr.write(f"[airc:monitor] auto-pong spawn failed: {e}\n")
+                    sys.stderr.flush()
             # Suppress from user-visible output (control traffic),
             # regardless of whether we auto-ponged.
             continue

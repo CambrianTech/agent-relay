@@ -268,8 +268,16 @@ _ensure_sshd_running() {
       # the elevated window opened, ran nothing, exited silently, no
       # transcript ever written. continuum verified the .ps1 file approach
       # writes a clean transcript every time.
-      local _elevated_ps1="$CLONE_DIR/install-elevated.ps1"
-      mkdir -p "$CLONE_DIR"
+      # Stage in TMPDIR, NOT $CLONE_DIR — git clone (line ~872) needs an
+      # empty/nonexistent target. Pre-fix, on a fresh-install user who'd
+      # nuked ~/.airc-src, this function ran first via ensure_prereqs,
+      # mkdir+wrote install-elevated.ps1 into $CLONE_DIR, and the
+      # subsequent `git clone --branch ... $CLONE_DIR` died with
+      # "destination path '...' already exists and is not an empty
+      # directory." Hostile error, no recovery hint, broke #249's
+      # Windows fresh-install row. Caught by continuum-b69f 2026-04-29.
+      local _elevated_ps1="${TMPDIR:-/tmp}/airc-install-elevated.ps1"
+      mkdir -p "$(dirname "$_elevated_ps1")"
       # NOTE: keep this heredoc ASCII-only. PowerShell 5.1 reads BOMless
       # .ps1 files as the system codepage (cp1252 on most Windows). A
       # UTF-8 em-dash (0xE2 0x80 0x94) ends in byte 0x94, which in
@@ -735,24 +743,13 @@ ensure_prereqs() {
   # because there's no Touch ID / password input — the runner job
   # silently runs for the full 6-hour timeout. Skip when CI=true so
   # the install completes cleanly and CI tests the rest of the path.
-  if [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ]; then
-    info "CI=true — skipping sshd setup (no host-capability test in CI)"
-  elif [ "${AIRC_SKIP_SSHD:-0}" != "1" ]; then
-    _ensure_sshd_running
-  fi
-
-  # Tailscale is optional -- only needed for cross-LAN mesh. LAN-only
-  # works fine without it, so we attempt install but don't fail loud.
-  # Skip in CI: brew install --cask tailscale on macOS runners is slow
-  # (multi-minute download + GUI app install) and there's no tailnet
-  # behind the runner anyway. The install itself is what we're gating
-  # on — Tailscale-as-optional is documented; CI doesn't need it.
-  if [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ]; then
-    info "CI=true — skipping Tailscale install (optional, no tailnet in CI)"
-  elif ! tailscale_present; then
-    info "Tailscale not present (optional -- LAN mesh works without it). Attempting install ..."
-    install_tailscale
-  fi
+  # Phase 3c: sshd setup + Tailscale install removed from default path.
+  # Cross-network messaging routes through gh-as-bearer (envelope-encrypted
+  # gist), which works on every platform with `gh auth login` — no
+  # privileged daemon, no sign-in popup. The functions _ensure_sshd_running
+  # and install_tailscale stay defined for any user who explicitly needs
+  # them via opt-in flag, but the default install no longer invokes them.
+  : "Phase 3c: skipping sshd + Tailscale (gh-as-bearer is the cross-network path)"
 
   # gh auth: required for the gist substrate (#general room discovery).
   # We can't auto-login (browser flow), but we surface the exact command
@@ -877,6 +874,21 @@ ln -sf "$CLONE_DIR/airc" "$BIN_DIR/airc"
 # The airc binary detects the invocation name and behaves identically.
 ln -sf "$CLONE_DIR/airc" "$BIN_DIR/relay"
 
+# Windows: also place airc.cmd + airc.ps1 forwarders on PATH.
+# Without these, `airc` invoked from native PowerShell or cmd.exe
+# resolves to the bash script, which PowerShell can't execute
+# ("Cannot run a document in the middle of a pipeline"). PR #262
+# made airc.ps1 a thin forwarder to bash, but that's moot if the
+# .ps1 isn't on PATH. cp (not ln -sf) — Windows symlinks are
+# privileged + flaky; copying is universal. Caught by
+# continuum-b69f 2026-04-29 (issue #249 PowerShell row).
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*)
+    [ -f "$CLONE_DIR/airc.cmd" ] && cp -f "$CLONE_DIR/airc.cmd" "$BIN_DIR/airc.cmd"
+    [ -f "$CLONE_DIR/airc.ps1" ] && cp -f "$CLONE_DIR/airc.ps1" "$BIN_DIR/airc.ps1"
+    ;;
+esac
+
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
   for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
     if [ -f "$rc" ] && ! grep -q 'airc' "$rc"; then
@@ -886,6 +898,56 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
     fi
   done
   export PATH="$BIN_DIR:$PATH"
+fi
+
+# ── Python venv with crypto deps (Phase E: envelope encryption) ────────
+# airc's envelope-layer end-to-end encryption needs the cryptography
+# package. We create a venv inside the install dir and pip-install
+# there because PEP 668 makes `pip install --user` fail on managed
+# Pythons (homebrew, system Python on Debian/Ubuntu/etc). The venv
+# avoids touching system Python at all — fully self-contained.
+#
+# airc's bash wrapper detects this venv at AIRC_PYTHON resolution time
+# and prefers it over system python3. If venv setup fails (no python3,
+# pip module missing, network failure during install), airc falls back
+# to system python3 and runs in plaintext mode. Per the "no scary
+# popups" rule: pip-install never elevates, never prompts; failures
+# print a non-fatal warning.
+_airc_venv="$CLONE_DIR/.venv"
+if [ ! -d "$_airc_venv" ] && command -v python3 >/dev/null 2>&1; then
+  if python3 -m venv "$_airc_venv" 2>/dev/null; then
+    ok "Python venv created: $_airc_venv"
+  else
+    warn "Could not create Python venv (python3-venv missing?). airc will run in plaintext mode."
+  fi
+fi
+# Locate venv pip — POSIX vs Windows-Git-Bash paths.
+_airc_venv_pip=""
+if [ -x "$_airc_venv/bin/pip" ]; then
+  _airc_venv_pip="$_airc_venv/bin/pip"
+elif [ -x "$_airc_venv/Scripts/pip.exe" ]; then
+  _airc_venv_pip="$_airc_venv/Scripts/pip.exe"
+fi
+if [ -n "$_airc_venv_pip" ]; then
+  # Check if cryptography is already installed (idempotent install).
+  _airc_venv_python_bin=""
+  if [ -x "$_airc_venv/bin/python" ]; then
+    _airc_venv_python_bin="$_airc_venv/bin/python"
+  elif [ -x "$_airc_venv/Scripts/python.exe" ]; then
+    _airc_venv_python_bin="$_airc_venv/Scripts/python.exe"
+  fi
+  if [ -n "$_airc_venv_python_bin" ] && \
+     "$_airc_venv_python_bin" -c "import cryptography" >/dev/null 2>&1; then
+    : # already installed; skip
+  else
+    if "$_airc_venv_pip" install -q --upgrade pip >/dev/null 2>&1; then : ; fi
+    if "$_airc_venv_pip" install -q cryptography 2>&1 | tail -3; then
+      ok "cryptography installed in venv (envelope encryption ready)"
+    else
+      warn "cryptography install failed; airc will run in plaintext mode"
+      warn "  Manual fix:  $_airc_venv_pip install cryptography"
+    fi
+  fi
 fi
 
 # ── Skills into Claude Code ─────────────────────────────────────────────
@@ -977,27 +1039,15 @@ ts_post_check() {
   esac
 }
 
-ts_post_check
+# Phase 3c: ts_post_check call removed. Tailscale is no longer used for
+# cross-network messaging — gh-as-bearer (envelope-encrypted gist) is
+# the universal path. Function definitions remain for any opt-in user.
 
 # ── Done ────────────────────────────────────────────────────────────────
 
 echo ""
 ok "Installed."
 echo ""
-# Tailscale post-install message — be honest about installed state. The
-# pre-fix text always read "Tailscale is optional but recommended:
-# https://tailscale.com" even when winget had just installed it 30s ago,
-# which (per Joel 2026-04-28) reads as a fail. ts_post_check above
-# already nudges sign-in if installed-but-logged-out, so here we only
-# print the "go install it" line when tailscale really isn't present.
-if tailscale_present; then
-  :  # ts_post_check handled the messaging if relevant
-else
-  echo "  Cross-LAN mesh? Tailscale is optional (not installed):"
-  echo "    https://tailscale.com    (then: tailscale up)"
-  echo "  Same-LAN mesh works without it; gist orchestration handles either."
-  echo ""
-fi
 echo "  Next:"
 echo "    1. gh auth login -s gist          # one-time, browser flow"
 echo "    2. airc join                      # auto-#general (joins existing or hosts)"
