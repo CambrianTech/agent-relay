@@ -322,31 +322,33 @@ def run(my_name: str, peers_dir: str) -> int:
         # the name fresh so a mid-session rename takes effect immediately.
         if fr == current_name():
             continue
-        # Mirror inbound to the local messages.jsonl ONLY when we are a
-        # joiner (tailing the remote host). For a host the local log is
-        # already the source of truth; mirroring would create a feedback
-        # loop (tail sees line -> we append line -> tail sees it again).
-        if is_joiner:
+        # Mirror inbound to local messages.jsonl. Post-3c (gh substrate)
+        # the gist is the canonical source of truth for ALL peers — the
+        # "host" no longer has a privileged local log that everyone tails
+        # over SSH. Both hosts and joiners pull from the gist via
+        # bearer_cli recv (offset-tracked), so there is no feedback loop:
+        # the monitor never re-reads what it appended here. Without this
+        # mirror, hosts never see inbound traffic in messages.jsonl,
+        # which broke `airc ping` (cmd_ping greps the local log for
+        # [PONG:uuid] and timed out forever) and any other reader of
+        # the local audit trail.
+        try:
+            with open(local_log, "a") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+        # Rotate every ~100 mirrored lines. Without this, local logs
+        # grow forever (Joel's audit 2026-04-28).
+        if (offset_counter % 100) == 0:
             try:
-                with open(local_log, "a") as f:
-                    f.write(line + "\n")
+                from airc_core.log import rotate_if_needed
+                rotate_if_needed(
+                    local_log,
+                    int(os.environ.get("AIRC_LOG_MAX_LINES", "5000")),
+                    int(os.environ.get("AIRC_LOG_KEEP_LINES", "2500")),
+                )
             except Exception:
                 pass
-            # Rotate every ~100 mirrored lines (cheap no-op when under
-            # threshold). Without this, joiner local logs grow forever —
-            # Joel's audit 2026-04-28. Host's log is rotated by the
-            # heartbeat loop on the host side; this is the joiner-side
-            # equivalent.
-            if (offset_counter % 100) == 0:
-                try:
-                    from airc_core.log import rotate_if_needed
-                    rotate_if_needed(
-                        local_log,
-                        int(os.environ.get("AIRC_LOG_MAX_LINES", "5000")),
-                        int(os.environ.get("AIRC_LOG_KEEP_LINES", "2500")),
-                    )
-                except Exception:
-                    pass
         if _handle_rename(peers_dir, msg):
             continue
         # Ping/pong monitor-liveness probe. Prefix marker on a normal
@@ -370,15 +372,30 @@ def run(my_name: str, peers_dir: str) -> int:
                 # Auto-reply pong via subprocess. Fire-and-forget. Uses
                 # airc send so the reply rides the same signed-message
                 # path as normal traffic (no protocol divergence).
+                # Preserve the ping's channel — without --channel the
+                # pong goes to the responder's default channel, which
+                # may be a channel the original sender doesn't poll,
+                # so cmd_ping's local-log grep times out forever even
+                # though we did reply (the channel of the original ping
+                # is already in our channel_gists or we wouldn't have
+                # received it).
+                ping_channel = m.get("channel", "")
                 import subprocess
+                cmd = ["airc", "send"]
+                if ping_channel:
+                    cmd += ["--channel", ping_channel]
+                cmd += [f"@{fr}", f"[PONG:{ping_id}]"]
                 try:
+                    # Stderr unredirected per CLAUDE.md "never swallow
+                    # errors" — auto-pong failures are exactly the kind
+                    # of evidence the next debugger needs.
                     subprocess.Popen(
-                        ["airc", "send", f"@{fr}", f"[PONG:{ping_id}]"],
+                        cmd,
                         stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    sys.stderr.write(f"[airc:monitor] auto-pong spawn failed: {e}\n")
+                    sys.stderr.flush()
             # Suppress from user-visible output (control traffic),
             # regardless of whether we auto-ponged.
             continue
