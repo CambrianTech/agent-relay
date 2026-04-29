@@ -22,6 +22,75 @@
 # heartbeat are clearly separable), but step 1 is splitting it out of
 # the top-level monolith without changing behavior.
 
+# ensure_channel_subscribed_with_gist <channel> [--first]
+#
+# Single-concern helper: make this scope a fully-functional subscriber
+# of <channel>. Three steps that MUST happen together — pre-2026-04-29
+# they were inlined at 4+ call sites, the divergent-room path silently
+# omitted step 2, and custom rooms became uncreatable. Centralized so
+# every call site does the right thing; future channel-add paths just
+# call this.
+#
+#   1. Subscribe in config (subscribed_channels[]).
+#      --first: prepend (sets the scope's default channel).
+#      default: append.
+#   2. Resolve-or-create the canonical gist for the channel on the
+#      user's gh account (airc_core.channel_gist resolve
+#      --create-if-missing). Idempotent across runs.
+#   3. Persist the channel→gist mapping in channel_gists{} so cmd_send's
+#      route-by-channel and the multi-channel monitor's per-channel
+#      bearer_cli recv both have a destination.
+#
+# Echoes the gist id on success. Empty (and non-zero exit) on failure;
+# caller decides whether that's fatal — the #general sidecar path
+# treats it as a warning, the primary-room path treats it as fatal.
+#
+# Per CLAUDE.md "never swallow errors": stderr from the python
+# subprocesses is redirected to a status file, then echoed if non-empty
+# on failure. Routine 2>/dev/null suppression would have hidden the
+# heartbeat-multifile bug for another sprint.
+ensure_channel_subscribed_with_gist() {
+  local channel="${1:-}" mode="${2:-append}"
+  if [ -z "$channel" ]; then
+    echo "ensure_channel_subscribed_with_gist: missing channel arg" >&2
+    return 2
+  fi
+
+  local _err; _err=$(mktemp -t airc-ensure-ch.XXXXXX)
+  trap '[ -n "${_err:-}" ] && rm -f "$_err"' RETURN
+
+  # 1. Subscribe in config.
+  local _first_flag=""
+  [ "$mode" = "--first" ] && _first_flag="--first"
+  if ! "$AIRC_PYTHON" -m airc_core.config subscribe \
+       --config "$CONFIG" --channel "$channel" $_first_flag 2>"$_err"; then
+    echo "  ⚠ Could not subscribe to #${channel}:" >&2
+    [ -s "$_err" ] && sed 's/^/      /' "$_err" >&2
+    return 1
+  fi
+
+  # 2. Resolve-or-create the canonical gist on this gh account.
+  local _gid
+  _gid=$("$AIRC_PYTHON" -m airc_core.channel_gist resolve \
+         --channel "$channel" --create-if-missing 2>"$_err")
+  if [ -z "$_gid" ]; then
+    echo "  ⚠ Could not resolve gist for #${channel}:" >&2
+    [ -s "$_err" ] && sed 's/^/      /' "$_err" >&2
+    return 1
+  fi
+
+  # 3. Persist channel→gist mapping for cmd_send + monitor routing.
+  if ! "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+       --config "$CONFIG" --channel "$channel" --gist-id "$_gid" 2>"$_err"; then
+    echo "  ⚠ Could not persist channel→gist mapping for #${channel}:" >&2
+    [ -s "$_err" ] && sed 's/^/      /' "$_err" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$_gid"
+  return 0
+}
+
 cmd_connect() {
   # Flag parsing. Issue #37 — host display shapes:
   #   default (gh installed + authed): gist ID + humanhash mnemonic + long invite
@@ -56,6 +125,19 @@ cmd_connect() {
   local room_name="general"
   local room_explicit=0  # set to 1 when user passes --room explicitly
   local use_room=1   # default ON — auto-#general substrate
+
+  # AIRC_ROOM_INTENT: re-exec env var preserving the user's --room
+  # across a stale-host-takeover exec. Pre-fix this was lost on every
+  # self-heal: user typed `airc join --room qa-foo`, we exec'd back
+  # into `airc connect` with NO ARGS, auto-scope decided based on cwd
+  # instead. Treat the env var as if --room was passed (since it was,
+  # one process ago).
+  if [ -n "${AIRC_ROOM_INTENT:-}" ] && [ "$room_explicit" = "0" ]; then
+    room_name="$AIRC_ROOM_INTENT"
+    use_room=1
+    room_explicit=1
+    unset AIRC_ROOM_INTENT  # one-shot — don't pollute child invocations
+  fi
   local general_sidecar=1   # default ON (issue #121) — also subscribe to #general
   local _force_general_sidecar=0   # set by --general flag (issue #136 re-opt-in)
   # Recursion guard: when WE are the sidecar (spawned by another airc
@@ -110,7 +192,14 @@ cmd_connect() {
         return 0 ;;
       --gist|-gist) use_gist=1; shift ;;
       --no-gist|-no-gist) use_gist=0; shift ;;
-      --room|-room) room_name="${2:-general}"; use_room=1; room_explicit=1; shift 2 ;;
+      --room|-room)
+        room_name="${2:-general}"
+        use_room=1
+        room_explicit=1
+        # Stash for re-exec preservation. Read by _self_heal_stale_host
+        # in airc top-level when a stale-host-takeover happens mid-flow.
+        ROOM_INTENT_FOR_REEXEC="$room_name"
+        shift 2 ;;
       --no-room|-no-room) use_room=0; shift ;;
       --no-general|-no-general)
         # NEW semantic (issue #121): keep the project room substrate,
@@ -132,6 +221,7 @@ cmd_connect() {
         # Combo: explicit project room + skip general sidecar. For
         # focused work where lobby noise would distract.
         room_name="${2:-general}"; use_room=1; room_explicit=1; general_sidecar=0
+        ROOM_INTENT_FOR_REEXEC="$room_name"  # preserve across self-heal exec
         shift 2 ;;
       --no-tailscale|-no-tailscale)
         # Opt out of Tailscale entirely: skips the login prompt AND
@@ -799,18 +889,20 @@ cmd_connect() {
       local _intent="$room_name"
       if [ -z "$_intent" ] || [ "$_intent" = "$resolved_room_name" ]; then
         echo "$resolved_room_name" > "$AIRC_WRITE_DIR/room_name"
-        "$AIRC_PYTHON" -m airc_core.config subscribe \
-          --config "$CONFIG" --channel "$resolved_room_name" --first 2>/dev/null || true
+        ensure_channel_subscribed_with_gist "$resolved_room_name" --first >/dev/null \
+          || die "Could not bootstrap #${resolved_room_name}; refusing to join with broken state"
         echo "  Joined #${resolved_room_name}"
       else
         # Diverged: user wanted X, host advertises Y. Subscribe to both,
         # X first (default for cmd_send), Y appended (display shows
-        # host's channel traffic too).
+        # host's channel traffic too). The user's intent gets a real
+        # gist (find-or-create) — that's what was missing pre-2026-04-29
+        # and turned `airc join --room qa-foo` into a phantom-room.
         echo "$_intent" > "$AIRC_WRITE_DIR/room_name"
-        "$AIRC_PYTHON" -m airc_core.config subscribe \
-          --config "$CONFIG" --channel "$_intent" --first 2>/dev/null || true
-        "$AIRC_PYTHON" -m airc_core.config subscribe \
-          --config "$CONFIG" --channel "$resolved_room_name" 2>/dev/null || true
+        ensure_channel_subscribed_with_gist "$_intent" --first >/dev/null \
+          || die "Could not bootstrap #${_intent}; refusing to join with broken state"
+        ensure_channel_subscribed_with_gist "$resolved_room_name" >/dev/null \
+          || echo "  ⚠ Could not bootstrap host's channel #${resolved_room_name}; subscribed to #${_intent} only" >&2
         echo "  Joined mesh — host primarily labels #${resolved_room_name}; subscribed: #${_intent} (default), #${resolved_room_name}"
       fi
       # Identity bootstrap nudge (#146). Skill /join SKILL.md prompts
