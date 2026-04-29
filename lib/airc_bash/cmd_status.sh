@@ -59,24 +59,19 @@ cmd_status() {
     fi
   fi
 
-  # Monitor alive? Read the scope's pidfile — cmd_connect writes its own PID
-  # there. pgrep'd descendants (python listener, tail loop) should be children
-  # of that PID. If the main PID is gone, the monitor is down.
+  # Monitor alive? Single helper at airc top-level (prune_pidfile_and_count)
+  # owns the contract: returns count of living pids and prunes dead orphans.
+  # Both cmd_status and cmd_send call it so they can never disagree
+  # again (the bug vhsm + authenticator hit 2026-04-29).
   local monitor_state="not running"
   local pidfile="$AIRC_WRITE_DIR/airc.pid"
-  if [ -f "$pidfile" ]; then
-    # cmd_connect writes multiple space-separated PIDs on one line (parent +
-    # python listener). Monitor is "running" if ANY of them is alive.
-    local pids_raw; pids_raw=$(cat "$pidfile" 2>/dev/null | tr '\n' ' ' || true)
-    local any_alive=""
-    for p in $pids_raw; do
-      if kill -0 "$p" 2>/dev/null; then any_alive="$p"; break; fi
-    done
-    if [ -n "$any_alive" ]; then
-      monitor_state="running (PID $any_alive)"
-    else
-      monitor_state="stale pidfile (PIDs $pids_raw not alive — run 'airc connect' to self-heal)"
-    fi
+  local live_count
+  live_count=$(prune_pidfile_and_count "$pidfile")
+  if [ "$live_count" -gt 0 ]; then
+    local first_alive; first_alive=$(awk '{print $1}' "$pidfile" 2>/dev/null)
+    monitor_state="running (PID $first_alive)"
+  elif [ -f "$pidfile" ]; then
+    monitor_state="stale pidfile (no live PIDs — run 'airc connect' to self-heal)"
   fi
   echo "  monitor:     $monitor_state"
 
