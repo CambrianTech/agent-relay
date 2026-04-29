@@ -2460,6 +2460,169 @@ time.sleep(30)
   cleanup_all
 }
 
+scenario_bearer_ssh_send() {
+  # Phase 2b prep: prove SshBearer.send works end-to-end against a real
+  # paired SSH listener BEFORE the monitor cutover. If this scenario
+  # passes, the bearer is production-grade for outbound traffic and
+  # the cutover risk shrinks to "did I wire the bash side correctly."
+  #
+  # Per the bearer architecture, each transport gets its own integration
+  # scenario; future bearers (gh, local) will have parallel scenarios in
+  # the same shape.
+  section "bearer (ssh): send via bearer_cli, verify lands in host log"
+  cleanup_all
+
+  spawn_host /tmp/airc-it-bs-h alpha 7551 || { fail "alpha host failed to start"; return; }
+  pass "host alpha hosting on 7551"
+
+  local join; join=$(read_join_string /tmp/airc-it-bs-h)
+  [ -n "$join" ] || { fail "no join string from alpha"; return; }
+
+  spawn_joiner /tmp/airc-it-bs-j gamma "$join" || { fail "gamma joiner failed to start"; return; }
+  pass "joiner gamma paired with alpha"
+
+  # Pull the joiner's host_target + remote_home from its config; identity
+  # key is at a known path on disk.
+  local jstate=/tmp/airc-it-bs-j/state
+  local host_target; host_target=$(python3 -c "import json; print(json.load(open('$jstate/config.json'))['host_target'])" 2>/dev/null)
+  local rhome;       rhome=$(python3 -c "import json; print(json.load(open('$jstate/config.json')).get('host_airc_home','\$HOME/.airc'))" 2>/dev/null)
+  # NOTE on port: airc's host_target field stores `user@host` WITHOUT port
+  # because the actual SSH messaging goes through the system sshd at port 22
+  # (the airc port is only used for the pairing handshake). The bearer's
+  # _build_ssh_argv supports a `:port` override but production code paths
+  # never use one — preserved here.
+  local ikey="$jstate/identity/ssh_key"
+  [ -n "$host_target" ] && pass "joiner config has host_target ($host_target)" \
+                        || { fail "joiner config missing host_target"; return; }
+  [ -f "$ikey" ] && pass "joiner has identity key at $ikey" \
+                 || { fail "joiner identity key missing"; return; }
+
+  # PYTHONPATH so airc_core is importable when invoking Python directly.
+  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
+  local payload='{"from":"gamma","to":"all","ts":"2026-04-29T00:00:00Z","channel":"general","msg":"bearer-test-payload-78a8c","sig":"x"}'
+
+  local outcome
+  outcome=$(printf '%s' "$payload" | PYTHONPATH="$_lib_dir" python3 -m airc_core.bearer_cli send \
+    "alpha" "general" \
+    --host-target "$host_target" \
+    --identity-key "$ikey" \
+    --remote-home "$rhome" 2>/dev/null)
+
+  echo "$outcome" | grep -qE '"kind"[[:space:]]*:[[:space:]]*"delivered"' \
+    && pass "bearer_cli reports delivered" \
+    || fail "bearer_cli outcome unexpected: $outcome"
+
+  # Verify the message actually landed in alpha's messages.jsonl.
+  sleep 0.3
+  local hstate=/tmp/airc-it-bs-h/state
+  if [ -f "$hstate/messages.jsonl" ] && grep -q "bearer-test-payload-78a8c" "$hstate/messages.jsonl"; then
+    pass "payload visible in alpha's messages.jsonl"
+  else
+    fail "payload NOT found in alpha's messages.jsonl (bearer claimed delivery)"
+  fi
+
+  cleanup_all
+}
+
+scenario_bearer_ssh_recv() {
+  # Phase 2b prep: prove SshBearer.recv_stream() reads events from a
+  # real paired SSH host. Same isolation principle as scenario_bearer_ssh_send
+  # — exercise the bearer alone, with no monitor in the loop, so a green
+  # result here means the cutover only has to trust the bearer is sound.
+  section "bearer (ssh): recv_stream picks up messages appended remotely"
+  cleanup_all
+
+  spawn_host /tmp/airc-it-br-h alpha 7552 || { fail "alpha host failed to start"; return; }
+  pass "host alpha hosting on 7552"
+
+  local join; join=$(read_join_string /tmp/airc-it-br-h)
+  [ -n "$join" ] || { fail "no join string from alpha"; return; }
+
+  spawn_joiner /tmp/airc-it-br-j delta "$join" || { fail "delta joiner failed to start"; return; }
+  pass "joiner delta paired with alpha"
+
+  local jstate=/tmp/airc-it-br-j/state
+  local host_target; host_target=$(python3 -c "import json; print(json.load(open('$jstate/config.json'))['host_target'])" 2>/dev/null)
+  local rhome;       rhome=$(python3 -c "import json; print(json.load(open('$jstate/config.json')).get('host_airc_home','\$HOME/.airc'))" 2>/dev/null)
+  # NOTE on port: airc's host_target field stores `user@host` WITHOUT port
+  # because the actual SSH messaging goes through the system sshd at port 22
+  # (the airc port is only used for the pairing handshake). The bearer's
+  # _build_ssh_argv supports a `:port` override but production code paths
+  # never use one — preserved here.
+  local ikey="$jstate/identity/ssh_key"
+
+  local _lib_dir; _lib_dir="$(cd "$(dirname "$AIRC")/lib" && pwd)"
+  local hstate=/tmp/airc-it-br-h/state
+
+  # Test plan: start recv_stream in the background, wait for ssh to
+  # connect (the underlying tail uses -n 0 so it only sees lines written
+  # AFTER the connection establishes), append a unique marker, then poll
+  # an output file for the FOUND signal. This avoids the "tail -n 0
+  # misses the pre-existing line" race that simpler patterns hit.
+  local marker="recv-stream-marker-$(date +%s%N)"
+  local probe='{"from":"alpha","to":"all","ts":"2026-04-29T00:00:00Z","channel":"general","msg":"'"$marker"'","sig":"x"}'
+  local recv_out; recv_out=$(mktemp -t airc-it-br-recv.XXXXXX)
+
+  # Run the recv driver in the background. It writes "FOUND" to recv_out
+  # when it sees the marker, then exits.
+  PYTHONPATH="$_lib_dir" python3 -c "
+import sys, signal, time
+sys.path.insert(0, '$_lib_dir')
+from airc_core.bearer_resolver import resolve
+
+bearer = resolve({
+    'host_target': '$host_target',
+    'remote_home': r'''$rhome''',
+    'identity_key': '$ikey',
+})
+bearer.open('alpha')
+
+signal.alarm(15)
+out = open('$recv_out', 'w', buffering=1)
+try:
+    for ev in bearer.recv_stream():
+        env = ev.bearer_metadata.get('envelope', {})
+        if env.get('msg') == '$marker':
+            live = bearer.liveness('alpha')
+            fresh = live.last_seen_ts is not None and (time.time() - live.last_seen_ts) < 10
+            out.write('FOUND\n')
+            out.write(f'LIVENESS={\"FRESH\" if fresh else \"STALE\"}\n')
+            break
+except Exception as e:
+    out.write(f'ERROR: {e}\n')
+finally:
+    out.close()
+    bearer.close()
+" >/dev/null 2>&1 &
+  local recv_pid=$!
+
+  # Give ssh ~3s to connect and start tailing.
+  sleep 3
+  echo "$probe" >> "$hstate/messages.jsonl"
+
+  # Wait up to 12s for the recv driver to find the marker.
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    sleep 1
+    grep -q '^FOUND' "$recv_out" 2>/dev/null && break
+  done
+  wait $recv_pid 2>/dev/null
+
+  if grep -q '^FOUND' "$recv_out" 2>/dev/null; then
+    pass "recv_stream picked up the planted marker"
+  else
+    fail "recv_stream did NOT see the planted marker; out: $(cat "$recv_out" 2>/dev/null)"
+  fi
+  if grep -q '^LIVENESS=FRESH' "$recv_out" 2>/dev/null; then
+    pass "liveness reports fresh ts after recv event"
+  else
+    fail "liveness did not report fresh ts; out: $(cat "$recv_out" 2>/dev/null)"
+  fi
+  rm -f "$recv_out"
+
+  cleanup_all
+}
+
 scenario_python_units() {
   # Python unit tests for airc_core/. Currently exercises the bearer
   # abstraction (lib/airc_core/bearer.py + bearer_resolver.py +
@@ -2510,6 +2673,8 @@ case "$MODE" in
   quit) scenario_quit ;;
   platform_adapters) scenario_platform_adapters ;;
   python_units) scenario_python_units ;;
+  bearer_ssh_send) scenario_bearer_ssh_send ;;
+  bearer_ssh_recv) scenario_bearer_ssh_recv ;;
   ""|all)
     # Default = run everything. The peers_cross_scope + whois_cross_scope
     # scenarios were removed in PR #239 (sidecar walk semantics deleted
@@ -2525,8 +2690,9 @@ case "$MODE" in
     scenario_general_sidecar_default; scenario_away
     scenario_list; scenario_quit; scenario_platform_adapters
     scenario_python_units
+    scenario_bearer_ssh_send; scenario_bearer_ssh_recv
     ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|all]"; exit 2 ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|all]"; exit 2 ;;
 esac
 
 echo

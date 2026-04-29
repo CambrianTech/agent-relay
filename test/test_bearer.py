@@ -270,10 +270,16 @@ class SshBearerRecvStreamTests(unittest.TestCase):
         return b
 
     def _fake_proc(self, lines, returncode=0):
-        """Build a mock subprocess that yields `lines` from stdout then ends."""
-        # Use BytesIO-style iterator. Popen's stdout iter yields bytes.
+        """Build a mock subprocess that yields `lines` via readline() then EOF.
+
+        The bearer reads via while-loop + readline() so EOF (empty bytes)
+        terminates the inner loop. Each line in `lines` is returned in order;
+        after exhaustion, readline returns b'' to signal EOF.
+        """
         proc = mock.Mock()
-        proc.stdout = iter(lines)
+        line_iter = iter(list(lines) + [b""])  # b"" signals EOF
+        proc.stdout = mock.Mock()
+        proc.stdout.readline = mock.Mock(side_effect=lambda: next(line_iter))
         proc.poll = mock.Mock(return_value=returncode)
         proc.terminate = mock.Mock()
         proc.wait = mock.Mock(return_value=returncode)
