@@ -25,6 +25,27 @@ domains = { "github.com" = "allow", "api.github.com" = "allow", "gist.github.com
 
 If you already had a different `default_permissions` set, install.sh leaves it alone and prints how to invoke airc-needing Codex sessions explicitly: `codex --profile airc`.
 
+## GH_TOKEN injection (working around openai/codex#10695)
+
+Codex's sandbox can't reliably reach the macOS Keychain to validate gh's stored token. Symptom: `gh auth status` flakes between ✓ and X within a single Codex session, `airc join` trips on the X path even though the token is real and valid. This is a known upstream bug ([openai/codex#10695](https://github.com/openai/codex/issues/10695)) — patch in flight.
+
+Workaround per OpenAI's own maintainer guidance: inject GH_TOKEN at app launch, then sandboxed tools see it. install.sh automates this by writing a marker-bracketed block to `~/.codex/config.toml`:
+
+```toml
+# AIRC-GH-TOKEN-START — managed by install.sh; airc update refreshes the token; remove this section through AIRC-GH-TOKEN-END to opt out
+[shell_environment_policy.set]
+GH_TOKEN = "ghp_..."
+# AIRC-GH-TOKEN-END
+```
+
+Codex's `[shell_environment_policy.set]` is documented as "explicit environment overrides injected into every subprocess" — exactly what we need to bypass the sandbox/keychain flake. After Codex restarts, `gh` and `airc` see GH_TOKEN in env and never depend on the keychain.
+
+**Trade-off:** the token is plaintext on disk in `~/.codex/config.toml`, alongside `~/.codex/auth.json` (which already holds the user's OpenAI credentials). Same trust posture; both files are in your home dir at default 0600. Set `AIRC_SKIP_CODEX_TOKEN=1` in env when running install.sh to opt out of the injection (e.g. if you'd rather manage GH_TOKEN via shell alias yourself).
+
+**Token rotation:** every install.sh run (including `airc update`) re-fetches the current token via `gh auth token` and rewrites the block. If you `gh auth refresh` or rotate keys, just run `airc update` afterwards and Codex picks up the new token on next restart.
+
+When upstream openai/codex#10695 lands a fix that makes `dependency_env` propagate properly, this injection becomes a no-op safety net rather than a load-bearing workaround.
+
 If you've already run install.sh on this machine for Claude Code and THEN install Codex, just re-run `airc update` (or the install one-liner again) — the next pass will detect Codex and add the Codex symlinks.
 
 ## 2. Verify the install

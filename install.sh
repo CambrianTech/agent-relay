@@ -729,6 +729,81 @@ if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
   _install_airc_codex_permission_profile
 fi
 
+# ── Codex GH_TOKEN env injection ───────────────────────────────────────
+# Codex's sandbox can't reliably reach the macOS Keychain to validate
+# gh's stored token. Result: gh auth status flakes between ✓ and X
+# within a single Codex session, airc join trips on the X path even
+# though the token is real and valid (Joel hit this on the codex
+# first-encounter QA; openai/codex#10695 is the upstream tracking bug
+# with confirmation from a contributor that Codex's shell handlers
+# don't merge dependency env into spawned processes; patch in flight).
+#
+# Workaround per OpenAI's own maintainer guidance ("If echo $GH_TOKEN
+# is defined at app launch it's visible to sandboxed tools"): inject
+# the current gh token into Codex's [shell_environment_policy.set]
+# block. Codex's docs confirm this map is "Explicit environment
+# overrides injected into every subprocess" — exactly what we need.
+#
+# Token plaintext on disk in ~/.codex/config.toml is the security
+# trade-off. Same trust posture as ~/.codex/auth.json (which already
+# holds the user's OpenAI credentials); both are 0600-by-default in
+# the user's home dir. Joel signed off on this trade-off as cleaner
+# than (a) PATH-shadowing codex, (b) shellrc-exporting GH_TOKEN to
+# every shell, or (c) asking the user to type the launch one-liner
+# every time.
+#
+# Idempotent + token-refreshing: every install.sh run (including
+# `airc update`) strips any prior airc-managed block and rewrites
+# with the current `gh auth token` output. Bracket markers make the
+# block detectable + removable cleanly.
+#
+# Honors AIRC_SKIP_CODEX_TOKEN=1 if the user wants the network/
+# permission profile but NOT the token injection (e.g. they prefer
+# to manage GH_TOKEN themselves via shell alias).
+
+_install_airc_codex_gh_token() {
+  local config="$HOME/.codex/config.toml"
+  [ "${AIRC_SKIP_CODEX_TOKEN:-0}" = "1" ] && return 0
+  [ -f "$config" ] || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+
+  # Pull current token. If gh is unauthed or fails for any reason,
+  # silently skip — better to leave existing block alone than write
+  # an empty token that breaks Codex sessions.
+  local token; token=$(gh auth token 2>/dev/null) || return 0
+  [ -z "$token" ] && return 0
+
+  local marker_start='# AIRC-GH-TOKEN-START — managed by install.sh; airc update refreshes the token; remove this section through AIRC-GH-TOKEN-END to opt out'
+  local marker_end='# AIRC-GH-TOKEN-END'
+
+  # Strip any prior airc-managed block (handles token rotation across
+  # install.sh runs). sed range-delete from start marker through end
+  # marker, inclusive.
+  if grep -qF "AIRC-GH-TOKEN-START" "$config" 2>/dev/null; then
+    local _tmp; _tmp=$(mktemp)
+    sed '/^# AIRC-GH-TOKEN-START/,/^# AIRC-GH-TOKEN-END/d' "$config" > "$_tmp"
+    mv "$_tmp" "$config"
+  fi
+
+  # Append fresh block. Uses [shell_environment_policy.set] sub-table
+  # rather than inline `set = { ... }` syntax so it composes with any
+  # user-defined [shell_environment_policy] keys at the parent level
+  # (e.g. inherit, include_only) without conflict.
+  cat >> "$config" <<TOML
+
+$marker_start
+[shell_environment_policy.set]
+GH_TOKEN = "$token"
+$marker_end
+TOML
+
+  ok "Codex GH_TOKEN injection refreshed in ~/.codex/config.toml (gh's current token; restart Codex to apply)"
+}
+
+if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
+  _install_airc_codex_gh_token
+fi
+
 
 # ── Done ────────────────────────────────────────────────────────────────
 
