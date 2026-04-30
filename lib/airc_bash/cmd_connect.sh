@@ -236,6 +236,41 @@ cmd_connect() {
   done
   set -- "${positional[@]+"${positional[@]}"}"
 
+  # Trust-existing-monitor short-circuit. If a live airc process is
+  # already in this scope (per airc.pid with at least one alive PID),
+  # the user's intent ("airc join") is satisfied — there's nothing
+  # to do, and the gh-auth probe below would only generate noise (or
+  # worse, false-positive failures from a flaky gh probe in environments
+  # like Codex's sandbox; #367) on a scope that's already working.
+  #
+  # The gh-auth probe is meant to catch "user is about to do real work,
+  # let's make sure their gh credential is healthy first." If real work
+  # is ALREADY HAPPENING in this scope (live monitor → live bearer →
+  # live gh API calls), the running monitor's own health is the
+  # authoritative signal, not an out-of-band probe.
+  #
+  # The downstream "monitor is already running" message at the canonical
+  # detection point (post-arg-parse, lines ~440 below) is what the user
+  # actually wants. Hoist that detection here; on a hit, return 0 with
+  # the same message, before any preflight noise can fire.
+  local _early_pidfile="$AIRC_WRITE_DIR/airc.pid"
+  if [ -f "$_early_pidfile" ]; then
+    local _early_pids _early_alive=0 _p
+    _early_pids=$(cat "$_early_pidfile" 2>/dev/null | tr '\n' ' ')
+    for _p in $_early_pids; do
+      kill -0 "$_p" 2>/dev/null && _early_alive=1
+    done
+    if [ "$_early_alive" = "1" ]; then
+      echo "  airc connect: this scope's monitor is already running (PIDs: $_early_pids)."
+      echo "    To stop it:        airc teardown"
+      echo "    To restart it:     airc teardown && airc connect"
+      echo "    To check it:       airc status"
+      return 0
+    fi
+    # Stale pidfile (no live PIDs) — leave for the canonical cleanup
+    # block below to remove + proceed normally with the connect flow.
+  fi
+
   # Pre-flight: gh auth check. The gh keyring can silently invalidate
   # (token revoked / 2FA flow expired / brew upgrade replaced gh
   # without re-auth) and EVERY downstream gh API call then fails
@@ -250,6 +285,9 @@ cmd_connect() {
   # The CI clean-install smoke test specifically exercises that
   # offline path with no gh auth — pre-#338 the unconditional check
   # killed it before the host loop could start (PR #338 regression).
+  #
+  # Skipped entirely if a live monitor exists in this scope (handled
+  # by the trust-existing-monitor short-circuit above).
   if [ "$use_room" = "1" ] && command -v gh >/dev/null 2>&1; then
     if ! gh auth status >/dev/null 2>&1; then
       # `gh auth status` probes /user, which returns 403 during a GitHub
