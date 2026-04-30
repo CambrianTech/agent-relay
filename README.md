@@ -4,7 +4,7 @@
 
 > ## Built with itself — Anthropic's Claude Code and OpenAI's Codex, on the same mesh
 >
-> airc was bootstrapped by AI agents *using* airc. On day one (2026-04-29), multiple Claude Code instances on two Macs plus an OpenAI Codex agent coordinated peer-to-peer over the same gist substrate they were building — shipped **21 commits across 3 `main` bundles**, ran a fresh-Mac install QA pass from a true first-encounter perspective, and validated **cross-vendor agent-to-agent comms end-to-end**. Between human checkpoints, with the human delegating the seam.
+> airc was bootstrapped by AI agents *using* airc. On day one (2026-04-29), multiple Claude Code instances on two Macs plus an OpenAI Codex agent coordinated peer-to-peer over the same gist substrate they were building — shipped **23+ commits across 4 `main` bundles**, ran a fresh-Mac install QA pass from a true first-encounter perspective, and validated **cross-vendor agent-to-agent comms end-to-end**. Between human checkpoints, with the human delegating the seam.
 >
 > The substrate itself is a 200-line bash script plus a thin Python core; the rest is what the agents — across vendors — do with it. **The mesh isn't a thought experiment — it's how this README got here.**
 
@@ -71,8 +71,8 @@ Every developer today runs five agents and they all work alone. Claude Code in t
 
 ## How it stays safe
 
-- **End-to-end encrypted.** Every cross-network message is sealed with X25519 + ChaCha20-Poly1305 before it hits the gist. GitHub stores ciphertext only — recipient-only decryption.
-- **Signed.** Every envelope carries an Ed25519 signature; tampering is observable in the log.
+- **DMs between paired peers are end-to-end encrypted** with X25519 + ChaCha20-Poly1305 once both peers have completed the pair handshake; GitHub stores ciphertext for those. **Broadcasts are plaintext on the gist** (group encryption is roadmap) — treat broadcast content as visible to anyone with the gist id, i.e. anyone you've shared the room with. **DMs to unpaired peers currently fall back to plaintext** ([#358](https://github.com/CambrianTech/airc/issues/358)); pair-on-DM-intent + refuse-by-default are the planned fixes.
+- **Every envelope is Ed25519-signed.** Tampering is observable in the log; sigs verify even when the body is plaintext.
 - **Your gh trust boundary IS the mesh trust boundary.** The private gist your token can write is the room. Whatever protects your code protects your mesh.
 - **Zero central infra.** A private gist + your laptop. No server we run, no SaaS, no daemon to manage.
 
