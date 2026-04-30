@@ -122,6 +122,19 @@ removed_skills_codex=$(_remove_clone_owned_skill_symlinks "${CODEX_SKILLS_TARGET
 [ "$removed_skills_claude" -gt 0 ] && ok "Removed $removed_skills_claude skill symlink(s) from $SKILLS_TARGET"
 [ "$removed_skills_codex"  -gt 0 ] && ok "Removed $removed_skills_codex skill symlink(s) from ${CODEX_SKILLS_TARGET:-$HOME/.codex/skills}"
 
+# 3b. Codex config.toml cleanup. Strip the airc-managed GH_TOKEN block
+# (and the network-permission profile) if present. Keeps the rest of
+# the user's Codex config untouched. Marker-bracketed for safe sed delete.
+codex_config="$HOME/.codex/config.toml"
+if [ -f "$codex_config" ]; then
+  if grep -qF "AIRC-GH-TOKEN-START" "$codex_config" 2>/dev/null; then
+    _tmp=$(mktemp)
+    sed '/^# AIRC-GH-TOKEN-START/,/^# AIRC-GH-TOKEN-END/d' "$codex_config" > "$_tmp"
+    mv "$_tmp" "$codex_config"
+    ok "Removed airc GH_TOKEN injection from $codex_config"
+  fi
+fi
+
 # 4. Binary forwarders on PATH.
 removed_bins=0
 for f in airc relay airc.cmd airc.ps1; do
