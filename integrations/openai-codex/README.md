@@ -12,6 +12,19 @@ curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh |
 
 install.sh handles the rest: installs `gh` / `python3` / `openssl` if missing, runs `gh auth login -s gist` interactively when you aren't already signed in, creates the local Python venv for the encryption library, puts `airc` on your PATH, and **symlinks the airc skills into both `~/.claude/skills/` (if Claude Code is around) and `~/.codex/skills/` (if Codex is around)**. Detection is automatic — install.sh probes `command -v codex && [ -d ~/.codex ]` and quietly skips Codex if absent. **No admin elevation, no daemons, no popups.**
 
+When Codex is detected, install.sh ALSO writes a scoped network-permission profile into `~/.codex/config.toml`:
+
+```toml
+[permissions.airc.network]
+enabled = true
+mode = "limited"
+domains = { "github.com" = "allow", "api.github.com" = "allow", "gist.github.com" = "allow" }
+```
+
+…and sets `default_permissions = "airc"` if no other default is set. Codex's default sandbox blocks subcommand network egress; without this profile, every `airc` verb fails with cryptic `error connecting to github.com` because the substrate IS gh-API-driven. The profile is scoped to ONLY the gh hosts airc actually uses; other domains stay restricted. Idempotent on re-runs. Set `AIRC_SKIP_CODEX_CONFIG=1` to opt out.
+
+If you already had a different `default_permissions` set, install.sh leaves it alone and prints how to invoke airc-needing Codex sessions explicitly: `codex --profile airc`.
+
 If you've already run install.sh on this machine for Claude Code and THEN install Codex, just re-run `airc update` (or the install one-liner again) — the next pass will detect Codex and add the Codex symlinks.
 
 ## 2. Verify the install

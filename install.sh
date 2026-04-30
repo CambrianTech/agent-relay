@@ -593,6 +593,82 @@ if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
   _install_airc_skills_into "${CODEX_SKILLS_TARGET:-$HOME/.codex/skills}" "codex"
 fi
 
+# ── Codex permission profile (network access for gh subcommands) ───────
+# Codex's default sandbox blocks subcommand network egress. airc's substrate
+# IS gh-API-driven, so without elevation, every airc verb fails with
+# 'error connecting to github.com' or 'token invalid' depending on which
+# layer the call lands at. Codex skills can't declare required permissions
+# inline, so the cleanest automation is to write a named permission profile
+# scoped to ONLY github.com / api.github.com / gist.github.com, then set
+# default_permissions = "airc" if no other default is configured. Per
+# Codex docs, named permission profiles round-trip across TUI sessions
+# and are the preferred way to grant scoped network access.
+#
+# Idempotent: only adds [permissions.airc.network] if not already present;
+# only sets default_permissions = "airc" if no default is currently set.
+# A user who has set a different default keeps it + can invoke airc-needing
+# Codex sessions via `codex --profile airc`.
+#
+# Honors AIRC_SKIP_CODEX_CONFIG=1 if a user (or test harness) wants the
+# skill symlinks but NOT the config write.
+
+_install_airc_codex_permission_profile() {
+  local config="$HOME/.codex/config.toml"
+  [ "${AIRC_SKIP_CODEX_CONFIG:-0}" = "1" ] && return 0
+  [ -f "$config" ] || touch "$config"
+
+  local _changed=0
+
+  # Append the named profile if absent. The block goes at the end of the
+  # file (TOML allows section order to be arbitrary; downstream sections
+  # don't capture this one because [permissions.airc.network] is its own
+  # explicit header).
+  if ! grep -q '^\[permissions\.airc\.network\]' "$config" 2>/dev/null; then
+    cat >> "$config" <<'TOML'
+
+# airc network permissions — added by airc install.sh so gh subcommands
+# (which the substrate is built on) can reach GitHub from inside Codex's
+# default sandbox. Scoped to ONLY the gh hosts airc actually uses; other
+# domains stay restricted. Remove this block + `default_permissions = "airc"`
+# below to opt out. Re-runs of install.sh detect existing presence and
+# don't duplicate.
+[permissions.airc.network]
+enabled = true
+mode = "limited"
+domains = { "github.com" = "allow", "api.github.com" = "allow", "gist.github.com" = "allow" }
+TOML
+    _changed=1
+  fi
+
+  # Set default_permissions = "airc" at the file's top level, but only if
+  # no default is currently set. A pre-existing default belongs to the
+  # user; we don't overwrite. We prepend to the file so the assignment
+  # lands at the top level and is not captured by any section that
+  # already opens further down.
+  if ! grep -qE '^[[:space:]]*default_permissions[[:space:]]*=' "$config" 2>/dev/null; then
+    local _tmp; _tmp=$(mktemp)
+    {
+      printf '# airc: default permission profile (added by install.sh; remove to opt out)\n'
+      printf 'default_permissions = "airc"\n\n'
+      cat "$config"
+    } > "$_tmp"
+    mv "$_tmp" "$config"
+    _changed=1
+  elif ! grep -qE '^[[:space:]]*default_permissions[[:space:]]*=[[:space:]]*"airc"' "$config" 2>/dev/null; then
+    # Different default already set — don't override, but tell the user
+    # how to use airc explicitly without changing their default.
+    info "  ~/.codex/config.toml already has default_permissions set; invoke airc-needing Codex sessions via:  codex --profile airc"
+  fi
+
+  if [ "$_changed" = "1" ]; then
+    ok "Added airc network profile to ~/.codex/config.toml — restart Codex to activate (gh subcommands work in airc-needing sessions)."
+  fi
+}
+
+if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
+  _install_airc_codex_permission_profile
+fi
+
 
 # ── Done ────────────────────────────────────────────────────────────────
 
