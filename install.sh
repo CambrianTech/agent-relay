@@ -529,10 +529,25 @@ if [ -n "$_airc_venv_pip" ]; then
   fi
 fi
 
-# ── Skills into Claude Code ─────────────────────────────────────────────
+# ── Skills into agent skill dirs (Claude Code + Codex) ─────────────────
+#
+# Both Claude Code and OpenAI Codex use the same on-disk skill format:
+# a directory per skill, with a SKILL.md inside (YAML frontmatter +
+# markdown body). They differ only in WHERE they look:
+#   Claude Code → ~/.claude/skills/<name>/
+#   Codex       → ~/.codex/skills/<name>/
+#
+# We symlink airc's skills into both whenever the corresponding agent
+# is installed on the machine. Each agent picks up the same skill
+# content; airc's skill text is intentionally written to be agent-
+# generic where the operation is shell-callable (which most airc verbs
+# are). Claude-Code-specific nuances like Monitor invocations are
+# additive — Codex agents fall back to direct shell calls.
 
-if [ -d "$CLONE_DIR/skills" ]; then
-  mkdir -p "$SKILLS_TARGET"
+_install_airc_skills_into() {
+  local skills_target="$1" agent_label="$2"
+  [ -d "$CLONE_DIR/skills" ] || return 0
+  mkdir -p "$skills_target"
 
   # Clean up old symlinks from previous installs.
   # Includes the airc-classic skill names (connect/send/rename/disconnect) that
@@ -541,15 +556,17 @@ if [ -d "$CLONE_DIR/skills" ]; then
   # previously listed here when the skill didn't exist; now that we ship a real
   # /uninstall skill, the per-skill symlink loop below recreates it cleanly and
   # this list omits it.)
-  for old in "$SKILLS_TARGET"/relay-* "$SKILLS_TARGET"/monitor "$SKILLS_TARGET"/setup \
-             "$SKILLS_TARGET"/connect "$SKILLS_TARGET"/send "$SKILLS_TARGET"/rename "$SKILLS_TARGET"/disconnect; do
+  local old
+  for old in "$skills_target"/relay-* "$skills_target"/monitor "$skills_target"/setup \
+             "$skills_target"/connect "$skills_target"/send "$skills_target"/rename "$skills_target"/disconnect; do
     [ -L "$old" ] && rm "$old" 2>/dev/null
   done
 
+  local skill_dir skill_name target
   for skill_dir in "$CLONE_DIR"/skills/*/; do
     [ -d "$skill_dir" ] || continue
     skill_name="$(basename "$skill_dir")"
-    target="$SKILLS_TARGET/$skill_name"
+    target="$skills_target/$skill_name"
     # If the target is a real directory (from a pre-rename hand-install
     # or an old copy-based installer), it shadows the new symlink. Nuke it.
     if [ -d "$target" ] && [ ! -L "$target" ]; then
@@ -558,8 +575,233 @@ if [ -d "$CLONE_DIR/skills" ]; then
       rm "$target"
     fi
     ln -sf "$skill_dir" "$target"
-    ok "Skill: /$skill_name"
+    ok "Skill ($agent_label): /$skill_name"
   done
+}
+
+# Claude Code: install whenever the SKILLS_TARGET path exists or is
+# requested via env. The previous behavior was unconditional; preserve.
+_install_airc_skills_into "$SKILLS_TARGET" "claude-code"
+
+# Codex: install only when `codex` is on PATH AND ~/.codex exists (i.e.
+# Codex has been run at least once and created its config dir). Skips
+# silently on machines where Codex isn't installed, so this is a
+# no-op for Claude-Code-only setups. Honors CODEX_SKILLS_TARGET env
+# override for the same reason BIN_DIR / SKILLS_TARGET do (test
+# harnesses + non-default Codex layouts).
+if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
+  _install_airc_skills_into "${CODEX_SKILLS_TARGET:-$HOME/.codex/skills}" "codex"
+fi
+
+# ── Codex permission profile (network access for gh subcommands) ───────
+# Codex's default sandbox blocks subcommand network egress. airc's substrate
+# IS gh-API-driven, so without elevation, every airc verb fails with
+# 'error connecting to github.com' or 'token invalid' depending on which
+# layer the call lands at. Codex skills can't declare required permissions
+# inline, so the cleanest automation is to write a named permission profile
+# scoped to ONLY github.com / api.github.com / gist.github.com, then set
+# default_permissions = "airc" if no other default is configured. Per
+# Codex docs, named permission profiles round-trip across TUI sessions
+# and are the preferred way to grant scoped network access.
+#
+# Idempotent: only adds [permissions.airc.network] if not already present;
+# only sets default_permissions = "airc" if no default is currently set.
+# A user who has set a different default keeps it + can invoke airc-needing
+# Codex sessions via `codex --profile airc`.
+#
+# Honors AIRC_SKIP_CODEX_CONFIG=1 if a user (or test harness) wants the
+# skill symlinks but NOT the config write.
+
+_install_airc_codex_permission_profile() {
+  local config="$HOME/.codex/config.toml"
+  [ "${AIRC_SKIP_CODEX_CONFIG:-0}" = "1" ] && return 0
+  [ -f "$config" ] || touch "$config"
+
+  local _changed=0
+
+  # Append the named profile if absent. The block goes at the end of the
+  # file (TOML allows section order to be arbitrary; downstream sections
+  # don't capture this one because [permissions.airc.network] is its own
+  # explicit header).
+  if ! grep -q '^\[permissions\.airc\.network\]' "$config" 2>/dev/null; then
+    cat >> "$config" <<'TOML'
+
+# airc network permissions — added by airc install.sh so gh subcommands
+# (which the substrate is built on) can reach GitHub from inside Codex's
+# default sandbox. Scoped to ONLY the gh hosts airc actually uses; other
+# domains stay restricted. Remove this block + `default_permissions = "airc"`
+# below to opt out. Re-runs of install.sh detect existing presence and
+# don't duplicate.
+[permissions.airc.network]
+enabled = true
+mode = "limited"
+domains = { "github.com" = "allow", "api.github.com" = "allow", "gist.github.com" = "allow" }
+TOML
+    _changed=1
+  fi
+
+  # Filesystem permissions: NOT WRITTEN. Initially we tried granting writes
+  # to ~/.airc-src/ + ~/.airc/ + ~/.local/bin/airc + a :project_roots
+  # block — Codex's runtime hard-rejected the profile at startup with:
+  #   "permissions profile requests filesystem writes outside the
+  #   workspace root, which is not supported until the runtime enforces
+  #   FileSystemSandboxPolicy directly"
+  # …meaning Codex 0.125 can't honor home-dir-scoped filesystem grants in
+  # named profiles yet. Even the :project_roots-only variant didn't help.
+  # The startup error broke every Codex session on the machine. We removed
+  # the block entirely; living with Codex's "does not define any recognized
+  # filesystem entries" warning is preferable to a hard-fail-on-startup.
+  # When Codex's runtime supports outside-workspace filesystem profiles,
+  # restore the block (history at git log -- install.sh).
+
+  # Cleanup: machines that ran the buggy intermediate (3b20369..c1)
+  # still have the [permissions.airc.filesystem] block in their
+  # config.toml and Codex won't start. Detect and strip it on every
+  # install.sh run so Codex starts cleanly without the user having
+  # to hand-edit their config.
+  if grep -q '^\[permissions\.airc\.filesystem\]' "$config" 2>/dev/null; then
+    info "Removing stale [permissions.airc.filesystem] block from ~/.codex/config.toml (Codex 0.125 doesn't support outside-workspace filesystem profiles; was breaking session startup)..."
+    "${AIRC_PYTHON:-python3}" - "$config" <<'PY'
+import sys, re
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+# Strip from any '# airc filesystem permissions' header (or bare
+# [permissions.airc.filesystem] header) through end of that section
+# and any [permissions.airc.filesystem.<sub>] children. Section ends
+# at the next top-level header that is NOT under [permissions.airc.filesystem].
+lines = text.splitlines(keepends=True)
+out = []
+in_airc_fs = False
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith('# airc filesystem permissions'):
+        # Drop the leading comment block too (cohesive with the section)
+        in_airc_fs = True
+        continue
+    if stripped.startswith('[permissions.airc.filesystem'):
+        in_airc_fs = True
+        continue
+    if in_airc_fs:
+        # Continue dropping comment lines and key=value lines until we
+        # hit a new section header that isn't airc.filesystem.
+        if stripped.startswith('[') and not stripped.startswith('[permissions.airc.filesystem'):
+            in_airc_fs = False
+            out.append(line)
+        # else: drop (comment, blank, or key=value within the section)
+        continue
+    out.append(line)
+# Collapse runs of >2 blank lines that the strip might have left.
+result = ''.join(out)
+result = re.sub(r'\n{3,}', '\n\n', result)
+with open(path, 'w') as f:
+    f.write(result)
+PY
+    _changed=1
+  fi
+
+  # Set default_permissions = "airc" at the file's top level, but only if
+  # no default is currently set. A pre-existing default belongs to the
+  # user; we don't overwrite. We prepend to the file so the assignment
+  # lands at the top level and is not captured by any section that
+  # already opens further down.
+  if ! grep -qE '^[[:space:]]*default_permissions[[:space:]]*=' "$config" 2>/dev/null; then
+    local _tmp; _tmp=$(mktemp)
+    {
+      printf '# airc: default permission profile (added by install.sh; remove to opt out)\n'
+      printf 'default_permissions = "airc"\n\n'
+      cat "$config"
+    } > "$_tmp"
+    mv "$_tmp" "$config"
+    _changed=1
+  elif ! grep -qE '^[[:space:]]*default_permissions[[:space:]]*=[[:space:]]*"airc"' "$config" 2>/dev/null; then
+    # Different default already set — don't override, but tell the user
+    # how to use airc explicitly without changing their default.
+    info "  ~/.codex/config.toml already has default_permissions set; invoke airc-needing Codex sessions via:  codex --profile airc"
+  fi
+
+  if [ "$_changed" = "1" ]; then
+    ok "Added airc network profile to ~/.codex/config.toml — restart Codex to activate (gh subcommands work in airc-needing sessions)."
+  fi
+}
+
+if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
+  _install_airc_codex_permission_profile
+fi
+
+# ── Codex GH_TOKEN env injection ───────────────────────────────────────
+# Codex's sandbox can't reliably reach the macOS Keychain to validate
+# gh's stored token. Result: gh auth status flakes between ✓ and X
+# within a single Codex session, airc join trips on the X path even
+# though the token is real and valid (Joel hit this on the codex
+# first-encounter QA; openai/codex#10695 is the upstream tracking bug
+# with confirmation from a contributor that Codex's shell handlers
+# don't merge dependency env into spawned processes; patch in flight).
+#
+# Workaround per OpenAI's own maintainer guidance ("If echo $GH_TOKEN
+# is defined at app launch it's visible to sandboxed tools"): inject
+# the current gh token into Codex's [shell_environment_policy.set]
+# block. Codex's docs confirm this map is "Explicit environment
+# overrides injected into every subprocess" — exactly what we need.
+#
+# Token plaintext on disk in ~/.codex/config.toml is the security
+# trade-off. Same trust posture as ~/.codex/auth.json (which already
+# holds the user's OpenAI credentials); both are 0600-by-default in
+# the user's home dir. Joel signed off on this trade-off as cleaner
+# than (a) PATH-shadowing codex, (b) shellrc-exporting GH_TOKEN to
+# every shell, or (c) asking the user to type the launch one-liner
+# every time.
+#
+# Idempotent + token-refreshing: every install.sh run (including
+# `airc update`) strips any prior airc-managed block and rewrites
+# with the current `gh auth token` output. Bracket markers make the
+# block detectable + removable cleanly.
+#
+# Honors AIRC_SKIP_CODEX_TOKEN=1 if the user wants the network/
+# permission profile but NOT the token injection (e.g. they prefer
+# to manage GH_TOKEN themselves via shell alias).
+
+_install_airc_codex_gh_token() {
+  local config="$HOME/.codex/config.toml"
+  [ "${AIRC_SKIP_CODEX_TOKEN:-0}" = "1" ] && return 0
+  [ -f "$config" ] || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+
+  # Pull current token. If gh is unauthed or fails for any reason,
+  # silently skip — better to leave existing block alone than write
+  # an empty token that breaks Codex sessions.
+  local token; token=$(gh auth token 2>/dev/null) || return 0
+  [ -z "$token" ] && return 0
+
+  local marker_start='# AIRC-GH-TOKEN-START — managed by install.sh; airc update refreshes the token; remove this section through AIRC-GH-TOKEN-END to opt out'
+  local marker_end='# AIRC-GH-TOKEN-END'
+
+  # Strip any prior airc-managed block (handles token rotation across
+  # install.sh runs). sed range-delete from start marker through end
+  # marker, inclusive.
+  if grep -qF "AIRC-GH-TOKEN-START" "$config" 2>/dev/null; then
+    local _tmp; _tmp=$(mktemp)
+    sed '/^# AIRC-GH-TOKEN-START/,/^# AIRC-GH-TOKEN-END/d' "$config" > "$_tmp"
+    mv "$_tmp" "$config"
+  fi
+
+  # Append fresh block. Uses [shell_environment_policy.set] sub-table
+  # rather than inline `set = { ... }` syntax so it composes with any
+  # user-defined [shell_environment_policy] keys at the parent level
+  # (e.g. inherit, include_only) without conflict.
+  cat >> "$config" <<TOML
+
+$marker_start
+[shell_environment_policy.set]
+GH_TOKEN = "$token"
+$marker_end
+TOML
+
+  ok "Codex GH_TOKEN injection refreshed in ~/.codex/config.toml (gh's current token; restart Codex to apply)"
+}
+
+if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
+  _install_airc_codex_gh_token
 fi
 
 

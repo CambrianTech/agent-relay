@@ -236,6 +236,41 @@ cmd_connect() {
   done
   set -- "${positional[@]+"${positional[@]}"}"
 
+  # Trust-existing-monitor short-circuit. If a live airc process is
+  # already in this scope (per airc.pid with at least one alive PID),
+  # the user's intent ("airc join") is satisfied — there's nothing
+  # to do, and the gh-auth probe below would only generate noise (or
+  # worse, false-positive failures from a flaky gh probe in environments
+  # like Codex's sandbox; #367) on a scope that's already working.
+  #
+  # The gh-auth probe is meant to catch "user is about to do real work,
+  # let's make sure their gh credential is healthy first." If real work
+  # is ALREADY HAPPENING in this scope (live monitor → live bearer →
+  # live gh API calls), the running monitor's own health is the
+  # authoritative signal, not an out-of-band probe.
+  #
+  # The downstream "monitor is already running" message at the canonical
+  # detection point (post-arg-parse, lines ~440 below) is what the user
+  # actually wants. Hoist that detection here; on a hit, return 0 with
+  # the same message, before any preflight noise can fire.
+  local _early_pidfile="$AIRC_WRITE_DIR/airc.pid"
+  if [ -f "$_early_pidfile" ]; then
+    local _early_pids _early_alive=0 _p
+    _early_pids=$(cat "$_early_pidfile" 2>/dev/null | tr '\n' ' ')
+    for _p in $_early_pids; do
+      kill -0 "$_p" 2>/dev/null && _early_alive=1
+    done
+    if [ "$_early_alive" = "1" ]; then
+      echo "  airc connect: this scope's monitor is already running (PIDs: $_early_pids)."
+      echo "    To stop it:        airc teardown"
+      echo "    To restart it:     airc teardown && airc connect"
+      echo "    To check it:       airc status"
+      return 0
+    fi
+    # Stale pidfile (no live PIDs) — leave for the canonical cleanup
+    # block below to remove + proceed normally with the connect flow.
+  fi
+
   # Pre-flight: gh auth check. The gh keyring can silently invalidate
   # (token revoked / 2FA flow expired / brew upgrade replaced gh
   # without re-auth) and EVERY downstream gh API call then fails
@@ -250,6 +285,9 @@ cmd_connect() {
   # The CI clean-install smoke test specifically exercises that
   # offline path with no gh auth — pre-#338 the unconditional check
   # killed it before the host loop could start (PR #338 regression).
+  #
+  # Skipped entirely if a live monitor exists in this scope (handled
+  # by the trust-existing-monitor short-circuit above).
   if [ "$use_room" = "1" ] && command -v gh >/dev/null 2>&1; then
     if ! gh auth status >/dev/null 2>&1; then
       # `gh auth status` probes /user, which returns 403 during a GitHub
@@ -1588,18 +1626,46 @@ JSON
                   --max-lines "${AIRC_LOG_MAX_LINES:-5000}" \
                   --keep-lines "${AIRC_LOG_KEEP_LINES:-2500}" >/dev/null 2>&1 || true
                 # Capture stderr to a state file (per never-swallow-errors
-                # rule). Track consecutive failures: after N in a row,
-                # detect active-host-evicted (#224) and self-heal — kill
-                # the parent so the daemon (or user) respawns into a
-                # fresh discovery + rejoin path.
+                # rule). Try edit-replace first; if that fails with the
+                # multi-file-disambiguation error (basename not yet in
+                # gist after a take-over / fresh-host race — bearer_gh.py
+                # has the same defense for #285), retry as add. Track
+                # consecutive failures: after N in a row, detect
+                # active-host-evicted (#224) and self-heal.
+                _hb_tried_add=0
                 if gh gist edit "$_gist_id" "$_hb_tmp" >/dev/null 2>"$_hb_stderr"; then
                   _consec_fail=0
+                elif grep -qE 'unsure what file to edit|file does not exist|no such file' "$_hb_stderr" 2>/dev/null \
+                     && gh gist edit "$_gist_id" -a "$_hb_tmp" >/dev/null 2>"$_hb_stderr"; then
+                  # Add-as-new succeeded — gist now has the canonical
+                  # heartbeat file; subsequent edits will hit the replace
+                  # path. Treat as success.
+                  _consec_fail=0
+                  _hb_tried_add=1
                 else
                   _consec_fail=$((_consec_fail + 1))
                   if [ "$_consec_fail" -ge "$_max_consec_fail" ]; then
                     local _stderr_tail; _stderr_tail=$(tail -1 "$_hb_stderr" 2>/dev/null | tr -d '\n' | tr '"' "'")
-                    local _evict_marker; _evict_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[HOST EVICTED] heartbeat to gist %s failed %d consecutive times — self-healing. last stderr: %s"}' \
-                      "$_hb_now" "$_hb_room" "$_gist_id" "$_consec_fail" "${_stderr_tail:-<empty>}")
+                    # Classify the gh error into airc-vocabulary so the
+                    # event log doesn't leak gh CLI internals to the
+                    # user. Issue #348.
+                    local _classified
+                    case "$_stderr_tail" in
+                      *'rate limit'*|*'abuse detection'*|*'secondary rate'*|*'API rate limit exceeded'*)
+                        _classified="rate-limit (gh secondary; back off 5-15 min before retry)" ;;
+                      *'unsure what file to edit'*|*'file does not exist'*|*'no such file'*)
+                        _classified="multi-file gist disambiguation (#348 — airc bug, please report)" ;;
+                      *'401'*|*'Unauthorized'*|*'token'*|*'keyring'*|*'auth'*)
+                        _classified="gh auth failure (run 'gh auth login -h github.com')" ;;
+                      *'network'*|*'connection refused'*|*'timeout'*|*'DNS'*|*'temporary failure'*|*'unreachable'*)
+                        _classified="network error" ;;
+                      '')
+                        _classified="unknown (no stderr captured)" ;;
+                      *)
+                        _classified="$_stderr_tail" ;;
+                    esac
+                    local _evict_marker; _evict_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[HOST EVICTED] heartbeat to gist %s failed %d consecutive times — self-healing. cause: %s"}' \
+                      "$_hb_now" "$_hb_room" "$_gist_id" "$_consec_fail" "$_classified")
                     echo "$_evict_marker" >> "$_hb_messages" 2>/dev/null || true
                     # Drop the stale local-state files so the parent's
                     # next discovery re-elects via _mesh_find.

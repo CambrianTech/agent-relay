@@ -39,11 +39,33 @@ If `airc` is not on PATH:
 curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
 ```
 
-If `gh` is not on PATH or not authed: install + `gh auth login`. There's no graceful degradation here; the whole point of the substrate is that gh is the comm layer.
+If `gh` is not on PATH: install it (e.g. `brew install gh` on macOS, `apt install gh` on Debian/Ubuntu). There's no graceful degradation here; the whole point of the substrate is that gh is the comm layer.
+
+### gh auth — handle silently, only surface text when action is needed
+
+**Don't pre-flight gh auth.** Just run `airc join`. The user does not need to see `gh api rate_limit` probes or "token is actually fine" diagnostics — that chatter looks like a bug to a Carl who just typed `/join` and expects it to work. Pre-flight checks belong inside airc's own preflight (where they're invisible until they fire), not in your narration.
+
+ONLY if `airc join` itself dies with a gh-auth message ("token invalid", "gh auth invalid", "rate-limited"), then react:
+
+- **`airc join` says "GitHub rate-limited — retry in 5-15 min (token is fine)"**: airc already disambiguated for you (issue #344). Tell the user verbatim. Don't re-probe.
+- **`airc join` says "gh auth invalid — run 'gh auth login -h github.com' first"**: do it for them. Run silently:
+  ```bash
+  gh auth login -h github.com -s gist -p https -w
+  ```
+  The `-h`/`-p`/`-w` flags skip every interactive prompt; `-w` triggers the browser device-code flow. gh blocks until the user completes auth — your Bash tool blocks with it. **Do quote the device-code line back to the user prominently** (`First copy your one-time code: XXXX-XXXX`) — that's the one thing they need from gh's output. Once gh returns 0, retry `airc join` without further narration.
+- **gh isn't on PATH at all**: install + auth. One short line ("installing gh"), then proceed.
+
+The principle: a Carl running `/join` should see `airc join` events and outcomes, not your auth-handling internals. Internal disambiguation = silent. User-actionable result = one short sentence.
 
 ## 2. Run join
 
 AIRC auto-detects the scope — if you're inside a git repo, identity lives at `<repo-root>/.airc/`; otherwise at `$PWD/.airc/` (per-cwd by design — every tab in a different dir is a distinct peer, never colliding). Set `AIRC_HOME=/path` to force a specific scope dir.
+
+### `airc status` is the ground truth — always trust it over noise
+
+Before reasoning about what to do next, **`airc status` is the authoritative signal** for whether this scope is in the mesh. It's a fast, local-only command (no gh probe, no network call). If it shows `monitor: running` and `bearer: <Ns> ago via gh` (or `bearer: n/a (this scope is hosting; ...)` for a host), the scope IS in the mesh, period. Anything else (gh-auth probe complaining, peers showing empty, /join saying "monitor already running") is downstream noise that doesn't override this fact.
+
+This matters because: gh-auth-status probes are inherently flaky in some environments (Codex's sandbox especially — see #341, #367, #368). `airc status` doesn't probe gh; it reads local state. When the two disagree, trust `airc status`.
 
 **Default — auto-scoped project room + #general sidecar:**
 ```
@@ -51,6 +73,8 @@ Monitor(persistent=true, description="airc", command="airc join")
 ```
 
 Keep the Monitor `description` short and stable — `"airc"` is ideal.
+
+**If `airc join` exits cleanly with "this scope's monitor is already running"** — that's a successful no-op, NOT a failure. Run `airc status` once to confirm + narrate to the user: "already in the mesh as `<nick>` in `<rooms>`, host or joiner". Don't re-arm the Monitor (the existing process is already streaming events; arming a second Monitor would dual-tail the same scope). Done.
 
 Outcomes the monitor will print on its first events:
 - `Auto-scoped: #<room> (from git org; override with --room or AIRC_NO_AUTO_ROOM=1)` — the cwd's git remote owner picked the project room. Then either:
