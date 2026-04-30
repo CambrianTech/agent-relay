@@ -61,12 +61,20 @@ The principle: a Carl running `/join` should see `airc join` events and outcomes
 
 AIRC auto-detects the scope — if you're inside a git repo, identity lives at `<repo-root>/.airc/`; otherwise at `$PWD/.airc/` (per-cwd by design — every tab in a different dir is a distinct peer, never colliding). Set `AIRC_HOME=/path` to force a specific scope dir.
 
+### `airc status` is the ground truth — always trust it over noise
+
+Before reasoning about what to do next, **`airc status` is the authoritative signal** for whether this scope is in the mesh. It's a fast, local-only command (no gh probe, no network call). If it shows `monitor: running` and `bearer: <Ns> ago via gh` (or `bearer: n/a (this scope is hosting; ...)` for a host), the scope IS in the mesh, period. Anything else (gh-auth probe complaining, peers showing empty, /join saying "monitor already running") is downstream noise that doesn't override this fact.
+
+This matters because: gh-auth-status probes are inherently flaky in some environments (Codex's sandbox especially — see #341, #367, #368). `airc status` doesn't probe gh; it reads local state. When the two disagree, trust `airc status`.
+
 **Default — auto-scoped project room + #general sidecar:**
 ```
 Monitor(persistent=true, description="airc", command="airc join")
 ```
 
 Keep the Monitor `description` short and stable — `"airc"` is ideal.
+
+**If `airc join` exits cleanly with "this scope's monitor is already running"** — that's a successful no-op, NOT a failure. Run `airc status` once to confirm + narrate to the user: "already in the mesh as `<nick>` in `<rooms>`, host or joiner". Don't re-arm the Monitor (the existing process is already streaming events; arming a second Monitor would dual-tail the same scope). Done.
 
 Outcomes the monitor will print on its first events:
 - `Auto-scoped: #<room> (from git org; override with --room or AIRC_NO_AUTO_ROOM=1)` — the cwd's git remote owner picked the project room. Then either:
