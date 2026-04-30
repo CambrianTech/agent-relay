@@ -49,10 +49,10 @@ cmd_doctor() {
   _doctor_probe "git"          "$mgr" "VCS for clone/update" || issues=$((issues+1))
   _doctor_probe "gh"           "$mgr" "Gist substrate (room discovery)" || issues=$((issues+1))
   _doctor_probe_gh_auth                                             || issues=$((issues+1))
-  _doctor_probe "openssl"      "$mgr" "Ed25519 sign keys + signing"     || issues=$((issues+1))
   _doctor_probe "ssh"          "$mgr" "OpenSSH client for the wire"     || issues=$((issues+1))
   _doctor_probe "ssh-keygen"   "$mgr" "Identity keypair generation"     || issues=$((issues+1))
   _doctor_probe "python3"      "$mgr" "Monitor formatter + heredocs"    || issues=$((issues+1))
+  _doctor_probe_cryptography                                            || issues=$((issues+1))
   _doctor_probe_sshd                                                    || issues=$((issues+1))
   _doctor_probe_tailscale "$mgr"  # optional, never increments issues
 
@@ -184,6 +184,26 @@ _doctor_probe_gh_auth() {
   fi
   printf "  [MISSING] gh authenticated (gist scope)\n"
   printf "         Fix: gh auth login -s gist\n"
+  return 1
+}
+
+# Probe the venv cryptography package — issue #341 follow-up. airc's
+# Ed25519 identity gen + signing now route through python-cryptography;
+# without it init_identity / sign_message hard-fail. install.sh's venv
+# step pip-installs it, so the failure surface here is "venv setup
+# didn't complete cleanly" or "the system python the resolver picked
+# differs from the venv one". Either way: surface clearly so doctor
+# tells the user to re-run install.sh.
+_doctor_probe_cryptography() {
+  if ! command -v "${AIRC_PYTHON:-python3}" >/dev/null 2>&1; then
+    return 0  # already reported missing by the python3 probe
+  fi
+  if "${AIRC_PYTHON:-python3}" -c "import cryptography.hazmat.primitives.asymmetric.ed25519" >/dev/null 2>&1; then
+    printf "  [ok] cryptography (Ed25519 identity gen + signing)\n"
+    return 0
+  fi
+  printf "  [MISSING] cryptography (Python package, used for Ed25519 identity)\n"
+  printf "         Fix: re-run install.sh (sets up the venv with cryptography)\n"
   return 1
 }
 
@@ -339,10 +359,10 @@ _doctor_connect_preflight() {
 
   # ── Required prereqs (same as default doctor) ──
   _doctor_probe "git"          "$mgr" "VCS for clone/update"           || issues=$((issues+1))
-  _doctor_probe "openssl"      "$mgr" "Ed25519 sign keys + signing"    || issues=$((issues+1))
   _doctor_probe "ssh"          "$mgr" "OpenSSH client for the wire"    || issues=$((issues+1))
   _doctor_probe "ssh-keygen"   "$mgr" "Identity keypair generation"    || issues=$((issues+1))
   _doctor_probe "python3"      "$mgr" "Monitor formatter + heredocs"   || issues=$((issues+1))
+  _doctor_probe_cryptography                                           || issues=$((issues+1))
   _doctor_probe_sshd                                                   || issues=$((issues+1))
 
   # ── gh chain: installed → authed → gist scope → gists API reachable.

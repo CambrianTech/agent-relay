@@ -48,8 +48,11 @@ _to_bash_path() {
 # install via the platform's package manager, then verify. Designed for
 # FIRST-TIME users with nothing pre-installed beyond a shell.
 #
-# Required: git, gh, openssl, ssh-keygen, python3
+# Required: git, gh, ssh-keygen, python3 (+ cryptography via venv pip)
 # Optional: tailscale (only needed for cross-LAN mesh; LAN works without)
+# Deliberately not required: openssl. Issue #341 — identity Ed25519 ops
+# moved to the venv cryptography module so we don't depend on system
+# openssl flavoring (LibreSSL vs OpenSSL etc).
 #
 # AIRC_SKIP_PREREQS=1 short-circuits the whole block (CI, dev installs,
 # users who manage their own packages).
@@ -95,11 +98,6 @@ pkgname_for() {
         pacman) echo "openssh" ;;
         apk)    echo "openssh-client" ;;
         winget) echo "" ;;  # OpenSSH ships with modern Windows; nothing to install
-      esac ;;
-    openssl)
-      case "$mgr" in
-        winget) echo "" ;;  # bundled with Git for Windows; if Git is installed, openssl is there
-        *)      echo "openssl" ;;
       esac ;;
     python3)
       case "$mgr" in
@@ -194,7 +192,7 @@ ensure_prereqs() {
       fi
     else
       warn "Unknown package manager (uname=$(uname -s)). Skipping prereq auto-install."
-      warn "Required prereqs: git, gh, openssl, python3"
+      warn "Required prereqs: git, gh, python3 (cryptography via pip)"
       return 0
     fi
   fi
@@ -204,11 +202,16 @@ ensure_prereqs() {
   # stdlib JSON (lib/airc_core/gistparse.py). Python was already a hard
   # dep since #152 Phase 0; jq was redundant. Drop the dep + the
   # winget step that would install it.
-  for cmd in git gh openssl ssh-keygen python3; do
+  # Issue #341 follow-up: openssl removed from the prereq list. airc
+  # no longer shells out to it for Ed25519 — identity gen + signing
+  # both route through the venv cryptography module (which is already
+  # a hard dep, pip-installed below). LibreSSL on macOS used to make
+  # this an ordeal; now it's a non-issue at the source.
+  for cmd in git gh ssh-keygen python3; do
     # Strict probe: presence on PATH AND a successful --version invocation.
     # Used selectively: python3 needs the strict variant because Windows
     # Store's python3.exe alias is on PATH but exits 49 with a Store-
-    # redirect (continuum-b69f, 2026-04-27). git/gh/openssl all
+    # redirect (continuum-b69f, 2026-04-27). git/gh all
     # support --version cleanly. ssh-keygen does NOT have a version
     # flag at all (different from `ssh -V`); calling `ssh-keygen
     # --version` exits non-zero on every install, so the strict probe
@@ -251,52 +254,16 @@ ensure_prereqs() {
       warn "These prereqs need manual install on $mgr: ${unmappable[*]}"
       case "$mgr" in
         winget)
-          warn "  ssh / ssh-keygen: Settings -> Apps -> Optional Features -> Add OpenSSH Client"
-          warn "  openssl: bundled with Git for Windows -- 'winget install Git.Git' provides it" ;;
+          warn "  ssh / ssh-keygen: Settings -> Apps -> Optional Features -> Add OpenSSH Client" ;;
       esac
     fi
   else
     ok "All required prereqs present"
   fi
-
-  # Capability probe: openssl --version is not enough — macOS ships LibreSSL
-  # as /usr/bin/openssl, which passes --version but does NOT support
-  # `genpkey -algorithm Ed25519` (the airc identity key). The probe loop
-  # above can't catch this because LibreSSL is "openssl" by name. Run an
-  # actual Ed25519 key gen against a tempfile; if it fails on Mac, install
-  # brew openssl@3 (keg-only, doesn't shadow /usr/bin/openssl — airc's
-  # runtime resolver locates it via /opt/homebrew/opt/). Issue #341.
-  if command -v openssl >/dev/null 2>&1 \
-     && ! openssl genpkey -algorithm Ed25519 -out /dev/null >/dev/null 2>&1; then
-    case "$(uname -s 2>/dev/null)" in
-      Darwin)
-        # Already-present keg-only openssl@3 is enough — no install needed.
-        _have_brew_ossl=0
-        for c in /opt/homebrew/opt/openssl@3/bin/openssl /usr/local/opt/openssl@3/bin/openssl; do
-          if [ -x "$c" ] && "$c" genpkey -algorithm Ed25519 -out /dev/null >/dev/null 2>&1; then
-            ok "openssl Ed25519 capability via $c (system openssl is LibreSSL)"
-            _have_brew_ossl=1
-            break
-          fi
-        done
-        if [ "$_have_brew_ossl" = "0" ] && command -v brew >/dev/null 2>&1; then
-          info "System openssl is LibreSSL (no Ed25519). Installing openssl@3 via brew..."
-          if brew install openssl@3 >/dev/null 2>&1; then
-            ok "openssl@3 installed (airc resolves it at runtime; no PATH change needed)"
-          else
-            warn "brew install openssl@3 failed. Run manually:  brew install openssl@3"
-          fi
-        elif [ "$_have_brew_ossl" = "0" ]; then
-          warn "System openssl is LibreSSL (no Ed25519) and brew is unavailable."
-          warn "  Install Homebrew + openssl@3, or set AIRC_OPENSSL=/path/to/openssl manually."
-        fi
-        ;;
-      *)
-        warn "openssl on this machine doesn't support 'genpkey -algorithm Ed25519'."
-        warn "  airc identity creation will fail. Install openssl 1.1.1+ or set AIRC_OPENSSL."
-        ;;
-    esac
-  fi
+  # Issue #341 follow-up: openssl Ed25519-capability probe + brew
+  # install dance removed. Identity gen + signing live in the venv
+  # cryptography module now; the system openssl version (LibreSSL or
+  # otherwise) is irrelevant to airc.
 
   # sshd: airc joiners ssh into the host's airc_home to tail messages.
   # Every airc user who'll host a room (which is most users — first to
