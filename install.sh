@@ -529,10 +529,25 @@ if [ -n "$_airc_venv_pip" ]; then
   fi
 fi
 
-# ── Skills into Claude Code ─────────────────────────────────────────────
+# ── Skills into agent skill dirs (Claude Code + Codex) ─────────────────
+#
+# Both Claude Code and OpenAI Codex use the same on-disk skill format:
+# a directory per skill, with a SKILL.md inside (YAML frontmatter +
+# markdown body). They differ only in WHERE they look:
+#   Claude Code → ~/.claude/skills/<name>/
+#   Codex       → ~/.codex/skills/<name>/
+#
+# We symlink airc's skills into both whenever the corresponding agent
+# is installed on the machine. Each agent picks up the same skill
+# content; airc's skill text is intentionally written to be agent-
+# generic where the operation is shell-callable (which most airc verbs
+# are). Claude-Code-specific nuances like Monitor invocations are
+# additive — Codex agents fall back to direct shell calls.
 
-if [ -d "$CLONE_DIR/skills" ]; then
-  mkdir -p "$SKILLS_TARGET"
+_install_airc_skills_into() {
+  local skills_target="$1" agent_label="$2"
+  [ -d "$CLONE_DIR/skills" ] || return 0
+  mkdir -p "$skills_target"
 
   # Clean up old symlinks from previous installs.
   # Includes the airc-classic skill names (connect/send/rename/disconnect) that
@@ -541,15 +556,17 @@ if [ -d "$CLONE_DIR/skills" ]; then
   # previously listed here when the skill didn't exist; now that we ship a real
   # /uninstall skill, the per-skill symlink loop below recreates it cleanly and
   # this list omits it.)
-  for old in "$SKILLS_TARGET"/relay-* "$SKILLS_TARGET"/monitor "$SKILLS_TARGET"/setup \
-             "$SKILLS_TARGET"/connect "$SKILLS_TARGET"/send "$SKILLS_TARGET"/rename "$SKILLS_TARGET"/disconnect; do
+  local old
+  for old in "$skills_target"/relay-* "$skills_target"/monitor "$skills_target"/setup \
+             "$skills_target"/connect "$skills_target"/send "$skills_target"/rename "$skills_target"/disconnect; do
     [ -L "$old" ] && rm "$old" 2>/dev/null
   done
 
+  local skill_dir skill_name target
   for skill_dir in "$CLONE_DIR"/skills/*/; do
     [ -d "$skill_dir" ] || continue
     skill_name="$(basename "$skill_dir")"
-    target="$SKILLS_TARGET/$skill_name"
+    target="$skills_target/$skill_name"
     # If the target is a real directory (from a pre-rename hand-install
     # or an old copy-based installer), it shadows the new symlink. Nuke it.
     if [ -d "$target" ] && [ ! -L "$target" ]; then
@@ -558,8 +575,22 @@ if [ -d "$CLONE_DIR/skills" ]; then
       rm "$target"
     fi
     ln -sf "$skill_dir" "$target"
-    ok "Skill: /$skill_name"
+    ok "Skill ($agent_label): /$skill_name"
   done
+}
+
+# Claude Code: install whenever the SKILLS_TARGET path exists or is
+# requested via env. The previous behavior was unconditional; preserve.
+_install_airc_skills_into "$SKILLS_TARGET" "claude-code"
+
+# Codex: install only when `codex` is on PATH AND ~/.codex exists (i.e.
+# Codex has been run at least once and created its config dir). Skips
+# silently on machines where Codex isn't installed, so this is a
+# no-op for Claude-Code-only setups. Honors CODEX_SKILLS_TARGET env
+# override for the same reason BIN_DIR / SKILLS_TARGET do (test
+# harnesses + non-default Codex layouts).
+if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
+  _install_airc_skills_into "${CODEX_SKILLS_TARGET:-$HOME/.codex/skills}" "codex"
 fi
 
 
