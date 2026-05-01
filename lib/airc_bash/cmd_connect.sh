@@ -280,35 +280,12 @@ cmd_connect() {
   # Skipped entirely if a live monitor exists in this scope (handled
   # by the trust-existing-monitor short-circuit above).
   if [ "$use_room" = "1" ] && command -v gh >/dev/null 2>&1; then
-    if ! gh auth status >/dev/null 2>&1; then
-      # `gh auth status` probes /user, which returns 403 during a GitHub
-      # secondary rate limit (abuse detection) and which gh then misreports
-      # as "token invalid". The /rate_limit endpoint is reachable during
-      # secondary limits — if it works, the token is fine and the user
-      # just needs to wait, not re-auth. Issue #341.
-      echo "" >&2
-      if gh api rate_limit >/dev/null 2>&1; then
-        echo "  ! GitHub secondary rate limit (abuse detection) triggered." >&2
-        echo "    Your token is fine — wait 5-15 minutes and retry 'airc join'." >&2
-        echo "" >&2
-        echo "    Why this is confusing: 'gh auth status' calls /user which gets 403'd" >&2
-        echo "    during secondary rate limits; gh then prints 'token invalid'. The" >&2
-        echo "    /rate_limit endpoint is reachable, which proves the token works." >&2
-        echo "" >&2
-        echo "    Caused by: too many gh API calls in a short window (polling loops," >&2
-        echo "    rapid-fire PR/issue/comment activity, etc.)." >&2
-        die "GitHub rate-limited — retry in 5-15 min (token is fine)"
-      else
-        echo "  ✗ gh CLI is installed but the GitHub token is invalid." >&2
-        echo "    Detail:" >&2
-        gh auth status 2>&1 | sed 's/^/      /' >&2
-        echo "" >&2
-        echo "    Fix:  gh auth login -h github.com" >&2
-        echo "" >&2
-        echo "    Without gh auth, airc can't talk to the gist substrate at all." >&2
-        die "gh auth invalid — run 'gh auth login -h github.com' first"
-      fi
-    fi
+    # Pre-flight via the centralized state machine (lib_auth.sh).
+    # ok → proceed; rate_limited → wait + retry (token fine);
+    # invalid → airc instigates the browser self-heal in-process;
+    # not_installed → caller's outer guard already handled this.
+    airc_ensure_gh_auth_or_heal "airc join" \
+      || die "gh auth not OK — see message above for next step"
   fi
 
   # Issue #136: --general re-opt-in. Clear parted state on primary
@@ -1721,6 +1698,21 @@ JSON
             echo "    airc connect $_invite_long"
             echo ""
             echo "  (Room gist: $_gist_url — persistent; deleted on 'airc part'.)"
+            # First-time-host daemon hint (#382). The reconnect-loop in the
+            # airc top-level already prints the "(for auto-recovery: airc
+            # daemon install)" tip — but only AFTER the mesh has gone down.
+            # Surface it earlier here, on first host-bootstrap, so the user
+            # can flip auto-restart on while their mesh is still healthy.
+            # Only fires when the daemon isn't already installed (idempotent
+            # re-runs / re-hosts stay silent).
+            _daemon_plist_or_unit=""
+            case "$(uname -s 2>/dev/null)" in
+              Darwin) _daemon_plist_or_unit="$HOME/Library/LaunchAgents/com.cambriantech.airc.plist" ;;
+              Linux)  _daemon_plist_or_unit="$HOME/.config/systemd/user/airc.service" ;;
+            esac
+            if [ -n "$_daemon_plist_or_unit" ] && [ ! -f "$_daemon_plist_or_unit" ]; then
+              echo "  Tip: 'airc daemon install' keeps this mesh alive across machine sleep."
+            fi
           else
             echo "  On the other machine (pick whichever is easiest to share):"
             echo ""
