@@ -893,7 +893,7 @@ else
   airc_daemon_is_installed() { return 1; }
 fi
 
-# Order matters here. Three NON-prompt branches first, ordered so the
+# Order matters here. Four NON-prompt branches first, ordered so the
 # loudest user intent wins:
 #   1. AIRC_INSTALL_NO_DAEMON=1 — explicit opt-out trumps everything.
 #   2. AIRC_INSTALL_YES=1       — explicit auto-install (Copilot #388:

@@ -29,14 +29,15 @@
 # Detection strategy by platform:
 #   darwin    — $HOME/Library/LaunchAgents/com.cambriantech.airc.plist
 #   linux/wsl — $HOME/.config/systemd/user/airc.service
-#   windows   — HKCU\Software\Microsoft\Windows\CurrentVersion\Run\airc-monitor
-#               (matches the entry name cmd_daemon.sh's installer creates)
+#   windows   — HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+#               (Run value name: airc-monitor; matches the entry name
+#               cmd_daemon.sh's installer creates)
 #
 # This MUST stay aligned with cmd_daemon.sh::cmd_daemon_install — if
 # the installer ever changes the path / unit name / entry name, this
 # detector is what tells the install-time + first-host UX whether the
 # offer/tip should fire. Misalignment = re-prompt loop or never-prompt
-# silent miss; both are users-experience bugs Copilot flagged.
+# silent miss; both are user experience bugs Copilot flagged.
 airc_daemon_is_installed() {
   local os; os=$(detect_platform)
   case "$os" in
