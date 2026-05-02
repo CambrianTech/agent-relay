@@ -1310,7 +1310,12 @@ _monitor_multi_channel() {
     local fmt_exit="${PIPESTATUS[1]:-0}"
 
     if [ "$fmt_exit" = "2" ]; then
-      echo "airc: watchdog tripped — restarting multi-channel poll" >&2
+      # STDOUT (not >&2) so the AI's Monitor surfaces this as an event.
+      # Per the global "evidence is for the debugger" rule + the receive-
+      # silence-watchdog beacon below — every restart needs to be loud
+      # enough to wake whoever's watching, not buried in stderr where
+      # only post-mortem log-readers find it.
+      echo "airc: watchdog tripped — restarting multi-channel poll"
       consecutive_timeouts=$((consecutive_timeouts + 1))
     else
       consecutive_timeouts=0
@@ -1422,7 +1427,9 @@ monitor() {
         # Watchdog tripped — formatter saw no input for WATCHDOG_SEC.
         # Bearer-aware probe (gh API) is a follow-up; for now count and
         # escalate after N consecutive cycles.
-        echo "airc: no inbound for watchdog interval — restarting bearer poll" >&2
+        # STDOUT (not >&2) so this surfaces as a Monitor event; same
+        # silent-failure rule as the multi-channel branch above.
+        echo "airc: no inbound for watchdog interval — restarting bearer poll"
         consecutive_timeouts=$((consecutive_timeouts + 1))
       else
         consecutive_timeouts=0
@@ -1743,24 +1750,95 @@ reminder_timer_loop() {
   # "monitor frozen but reminder firing" pattern Joel kept seeing.
   # Capture parent PID at start; exit when it dies.
   local _parent_pid="$PPID"
+  # Receive-side silence threshold: how long to wait between inbound
+  # events before emitting a "haven't HEARD anything in Ns" beacon to
+  # stdout (so the AI's Monitor surfaces it as an event the user can
+  # see). Without this, a silently-broken receive path (formatter
+  # filter dropping legit chat, bearer never escalating, etc.) looks
+  # identical to "no one's talking" — the failure mode b69f filed as
+  # #399 + Joel observed 2026-05-02 ("airc won't alert you to new
+  # convo, you have to send to receive"). Threshold matches the send
+  # reminder default: 300s.
+  local recv_threshold=300
+  local last_recv_warned=0
   while true; do
     sleep 5
     if ! kill -0 "$_parent_pid" 2>/dev/null; then
       return 0
     fi
+    local now; now=$(date +%s)
+
+    # Send-side reminder (existing behavior).
     local reminder_file="$AIRC_WRITE_DIR/reminder"
     local reminded_file="$AIRC_WRITE_DIR/reminded"
-    [ -f "$reminder_file" ] || continue
-    [ -f "$reminded_file" ] && continue
-    local interval; interval=$(cat "$reminder_file" 2>/dev/null)
-    [ -n "$interval" ] && [ "$interval" -gt 0 ] 2>/dev/null || continue
-    local now; now=$(date +%s)
-    local last_sent=0
-    [ -f "$AIRC_WRITE_DIR/last_sent" ] && last_sent=$(cat "$AIRC_WRITE_DIR/last_sent" 2>/dev/null)
-    local silent=$(( now - last_sent ))
-    if [ "$last_sent" -gt 0 ] && [ "$silent" -ge "$interval" ]; then
-      printf '[%s] airc: Reminder: you haven'"'"'t sent a message in %ss. '"'"'airc reminder off'"'"' to disable.\n' "$(timestamp)" "$silent"
-      touch "$reminded_file"
+    if [ -f "$reminder_file" ] && [ ! -f "$reminded_file" ]; then
+      local interval; interval=$(cat "$reminder_file" 2>/dev/null)
+      if [ -n "$interval" ] && [ "$interval" -gt 0 ] 2>/dev/null; then
+        local last_sent=0
+        [ -f "$AIRC_WRITE_DIR/last_sent" ] && last_sent=$(cat "$AIRC_WRITE_DIR/last_sent" 2>/dev/null)
+        local silent=$(( now - last_sent ))
+        if [ "$last_sent" -gt 0 ] && [ "$silent" -ge "$interval" ]; then
+          printf '[%s] airc: Reminder: you haven'"'"'t sent a message in %ss. '"'"'airc reminder off'"'"' to disable.\n' "$(timestamp)" "$silent"
+          touch "$reminded_file"
+        fi
+      fi
+    fi
+
+    # Receive-side silence beacon. If we have ANY bearer_state file at
+    # all and its last_recv_ts is older than recv_threshold (or null
+    # since process start), emit a stdout warning the user's Monitor
+    # will surface. Re-fires every recv_threshold seconds so the user
+    # sees it as a recurring beacon, not a one-shot they might miss.
+    # Read all per-channel state files (bearer_state.<channel>.json)
+    # plus the legacy unscoped one — pick the freshest last_recv_ts as
+    # "we received SOMETHING recently somewhere."
+    local time_since_warn=$(( now - last_recv_warned ))
+    if [ "$time_since_warn" -ge "$recv_threshold" ]; then
+      local freshest_recv=0
+      local has_any_state=0
+      local sf
+      for sf in "$AIRC_WRITE_DIR"/bearer_state*.json; do
+        [ -f "$sf" ] || continue
+        has_any_state=1
+        local ts; ts=$("$AIRC_PYTHON" -c "
+import json, sys, calendar, time
+try:
+    d = json.load(open('$sf'))
+    v = d.get('last_recv_ts')
+    if v is None:
+        print(0)
+    elif isinstance(v, (int, float)):
+        print(int(v))
+    else:
+        # ISO-8601 string — parse to epoch seconds
+        try:
+            t = time.strptime(v.rstrip('Z'), '%Y-%m-%dT%H:%M:%S')
+            print(calendar.timegm(t))
+        except Exception:
+            print(0)
+except Exception:
+    print(0)
+" 2>/dev/null)
+        if [ -n "$ts" ] && [ "$ts" -gt "$freshest_recv" ] 2>/dev/null; then
+          freshest_recv="$ts"
+        fi
+      done
+      if [ "$has_any_state" = "1" ]; then
+        local recv_silent
+        if [ "$freshest_recv" -eq 0 ]; then
+          # Bearer open since process start, never received an event.
+          # Use process start time (airc.pid mtime) as the floor.
+          local pid_mtime=0
+          [ -f "$AIRC_WRITE_DIR/airc.pid" ] && pid_mtime=$(stat -f %m "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null || stat -c %Y "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null || echo 0)
+          recv_silent=$(( now - pid_mtime ))
+        else
+          recv_silent=$(( now - freshest_recv ))
+        fi
+        if [ "$recv_silent" -ge "$recv_threshold" ]; then
+          printf '[%s] airc: Receive silence — no inbound events in %ss across any bearer. Mesh may be partitioned. Try: airc peers; airc logs 20; airc teardown && airc connect\n' "$(timestamp)" "$recv_silent"
+          last_recv_warned="$now"
+        fi
+      fi
     fi
   done
 }
