@@ -240,7 +240,7 @@ REM messages — so 'airc daemon log' showed nothing useful, and
 REM "daemon.log doesn't exist" became a real symptom (b69f
 REM 2026-05-02 in #cambriantech). Stderr → daemon.err keeps the
 REM launcher's restart records separate from the airc event stream.
-"$bash_exe" -c "exec '$airc_bin_unix' connect" 1>> daemon.log 2>> daemon.err
+"$bash_exe" -c "exec '$airc_bin_unix' connect" 1>> "$scope_win\\daemon.log" 2>> "$scope_win\\daemon.err"
 REM Did airc just intentionally re-exec? If marker exists and is recent,
 REM the new airc process from the exec is now the running daemon —
 REM exit the launcher loop instead of racing-respawn it.
@@ -250,12 +250,12 @@ REM date math is too brittle for .bat; "today" is our 60s proxy).
 if exist "$marker_win" (
   forfiles /p "$scope_win" /m airc.reexec-marker /d 0 /c "cmd /c exit 0" >nul 2>&1
   if not errorlevel 1 (
-    echo [%date% %time%] airc re-exec'd into different mode ^(host-takeover or rejoin^); new process is now daemon, launcher exiting. >> daemon.err
+    echo [%date% %time%] airc re-exec'd into different mode ^(host-takeover or rejoin^); new process is now daemon, launcher exiting. >> "$scope_win\\daemon.err"
     del "$marker_win" >nul 2>&1
     exit /b 0
   )
 )
-echo [%date% %time%] airc connect exited. Restarting in 5s. >> daemon.err
+echo [%date% %time%] airc connect exited. Restarting in 5s. >> "$scope_win\\daemon.err"
 timeout /t 5 /nobreak >nul
 goto loop
 EOF
