@@ -452,7 +452,20 @@ def run(my_name: str, peers_dir: str) -> int:
         subs = subscribed_channels()
         if subs is not None and fr not in ("airc", "sys"):
             addressed_to_me = bool(to) and to not in ("", "all") and current_name() in to.split(",")
-            if line_channel and line_channel not in subs and not addressed_to_me:
+            # Channel-name comparison must be tolerant of leading "#"
+            # on either side. Pre-fix: subs read from config might be
+            # ['cambriantech', 'general'] (no #), but envelopes can
+            # carry channel='#cambriantech' (with #) — or vice versa.
+            # The strict `line_channel not in subs` check then misfires
+            # and silently drops legit broadcasts. b69f filed this as
+            # #399: joiner Monitor surfaces substrate events but room
+            # broadcasts disappear into the void. Normalize both sides
+            # by stripping any leading '#' before comparing.
+            def _norm(c):
+                return c.lstrip("#") if isinstance(c, str) else c
+            line_norm = _norm(line_channel)
+            subs_norm = {_norm(c) for c in subs}
+            if line_norm and line_norm not in subs_norm and not addressed_to_me:
                 continue
         try:
             if fr in ("airc", "sys"):
