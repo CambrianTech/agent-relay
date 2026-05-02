@@ -95,21 +95,42 @@ cmd_teardown() {
 
 
   local killed=0
-  # Hosted gist cleanup BEFORE process kill. The cmd_connect EXIT trap
-  # would normally delete our hosted gist on graceful shutdown, but the
-  # kill -9 below skips traps entirely. Without this explicit step,
-  # every `airc teardown` of a host left an orphan gist on the gh
-  # account that joiners couldn't tell apart from a live host until
-  # heartbeat went stale (~90s later). Caught by Joel's other tab
-  # bouncing repeatedly and accumulating fresh #general gists each
-  # cycle.
-  if [ -f "$AIRC_WRITE_DIR/host_gist_id" ] && command -v gh >/dev/null 2>&1; then
+  # Hosted gist preservation (BUS-STABILITY rewrite, 2026-05-02).
+  #
+  # Pre-fix: every `airc teardown` of a host DELETED the hosted gist.
+  # Justification at the time was orphan-gist confusion until heartbeat
+  # went stale (~90s). But this turned EVERY teardown — including
+  # routine "restart for code update" — into a bus rotation. Peers
+  # blackout. Joel had to manually relay the new gist ID each time.
+  #
+  # Joel's directive (2026-05-02): "you can't have a bus if everyone
+  # speaks on a different one." The gist is the BUS, not the host's
+  # property. Hosts come and go (restarts, sleep, crashes); the bus
+  # persists for the channel.
+  #
+  # New behavior: KEEP the gist on plain `airc teardown`. Only delete
+  # when --part is also passed (or via the explicit `airc part`
+  # command which has its own delete logic), signalling "I'm leaving
+  # this channel for good, free the gist."
+  #
+  # Tradeoffs accepted:
+  #   - Joiners may briefly poll a gist whose host is mid-restart;
+  #     they see no new messages until the host re-attaches. Fine —
+  #     better than the bus address rotating under them.
+  #   - Stale gist if the host genuinely never comes back: handled by
+  #     the next peer claiming the gist via heartbeat takeover (see
+  #     _self_heal_stale_host) which already exists.
+  #   - --flush still wipes the local scope but does NOT delete the
+  #     gist; that's a separate concern (local state vs bus identity).
+  if [ "$flush" = "1" ]; then
+    : # don't delete gist on --flush either; bus stays for peers
+  fi
+  if [ -f "$AIRC_WRITE_DIR/host_gist_id" ]; then
     local _td_gist; _td_gist=$(cat "$AIRC_WRITE_DIR/host_gist_id" 2>/dev/null)
     if [ -n "$_td_gist" ]; then
-      if gh gist delete "$_td_gist" --yes >/dev/null 2>&1; then
-        echo "  deleted hosted gist: $_td_gist"
-      fi
-      rm -f "$AIRC_WRITE_DIR/host_gist_id"
+      echo "  preserving hosted gist: $_td_gist (bus stability — use 'airc part' to actually delete the channel)"
+      # Note: we INTENTIONALLY do not rm the host_gist_id file either;
+      # next start finds it + reuses the same gist as the channel ID.
     fi
   fi
 
