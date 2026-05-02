@@ -765,15 +765,38 @@ peer_pick_address() {
     fi
   fi
 
-  # Phase 3c: Tailscale-pick path removed. If localhost + same-LAN
-  # neither match, the joiner falls through to gh-as-bearer routing
-  # (no TCP pair-handshake needed once gh-pair lands; for now, the
-  # peer is unreachable for direct pair and gh-only messaging suffices).
+  # Tailscale: only useful if I'm signed in to Tailscale myself. Pick
+  # the host's tailscale entry when both sides share that scope; the
+  # WireGuard hop is dramatically faster than gh-bearer's polling
+  # cadence. If I have no Tailscale (or the daemon's logged out), the
+  # host's tailscale entry isn't reachable for me and we fall through.
+  # Joel 2026-05-02: "have to think of how that would work with an
+  # outsider, outside our tailscale, with it in this mode" — outsiders
+  # without Tailscale used to land on `pick_addr_first`'s arbitrary
+  # entry, often the host's tailnet IP, which they'd then time out
+  # against. Now they skip cleanly to the gh fallback.
+  if [ "${AIRC_NO_TAILSCALE:-0}" != "1" ] && command -v "$AIRC_PYTHON" >/dev/null 2>&1; then
+    local my_ts_bin; my_ts_bin=$(resolve_tailscale_bin 2>/dev/null || true)
+    if [ -n "$my_ts_bin" ]; then
+      local my_ts_status; my_ts_status=$("$my_ts_bin" status 2>&1) || true
+      case "$my_ts_status" in
+        *"Logged out"*|*"NeedsLogin"*) ;;  # not signed in → skip tailscale pick
+        *)
+          local ts_pick; ts_pick=$(printf '%s' "$addresses_json" \
+            | "$AIRC_PYTHON" -m airc_core.gistparse pick_addr tailscale 2>/dev/null)
+          if [ -n "$ts_pick" ]; then printf '%s' "$ts_pick"; return 0; fi
+          ;;
+      esac
+    fi
+  fi
 
-  # Fallback: first entry of any kind. Useful when neither side has a
-  # clearly matching scope and we just want to try something.
-  printf '%s' "$addresses_json" \
-    | "$AIRC_PYTHON" -m airc_core.gistparse pick_addr_first 2>/dev/null
+  # Nothing reachable from here — neither localhost (different machine),
+  # LAN (different subnet), nor Tailscale (I'm not on the same tailnet
+  # OR I have no Tailscale). Return empty; cmd_connect's caller treats
+  # this as "no direct path; gh-bearer takes over." Pre-fix we returned
+  # `pick_addr_first` which often handed back the host's loopback or
+  # tailnet IP — outsiders then dialed an unreachable address and ate
+  # a TCP timeout for nothing.
 }
 
 # humanhash: hex string → human-readable mnemonic (e.g. "muffin-saturn-pluto-orange").
