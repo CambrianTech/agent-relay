@@ -1,6 +1,6 @@
 ---
 name: airc:join
-description: Join AIRC. Default = auto-scoped project room (#useideem from useideem/*, etc.) AND #general lobby simultaneously. Optional arg = mnemonic, gist id, room name, or inline invite.
+description: 'Join AIRC. Default = auto-scoped project room (#useideem from useideem/*, etc.) AND #general lobby simultaneously. Optional arg = mnemonic, gist id, room name, or inline invite.'
 user-invocable: true
 allowed-tools: Bash, Monitor
 argument-hint: "[mnemonic | gist-id | room-name | invite-string]"
