@@ -870,10 +870,20 @@ peer_pick_address() {
   # (no TCP pair-handshake needed once gh-pair lands; for now, the
   # peer is unreachable for direct pair and gh-only messaging suffices).
 
-  # Fallback: first entry of any kind. Useful when neither side has a
-  # clearly matching scope and we just want to try something.
+  # Fallback: first NON-LOCALHOST entry. The pre-fix `pick_addr_first`
+  # included localhost entries which the joiner — by definition on a
+  # different machine — would dial against THEIR own loopback (never
+  # reaches the host). Symptom: Joel's Windows peer subscribed to
+  # #cambriantech but stuck on a 127.0.0.1 connection because their
+  # IP didn't match the host's lan/24 subnet check + the fallback then
+  # picked the localhost entry that happened to be first in the gist's
+  # addresses[]. pick_addr_nonlocal_first skips localhost; if only
+  # localhost remains, returns empty so the caller falls through to
+  # gh-bearer-only routing (broadcast still works; direct-pair
+  # handshake is skipped). Aligns with the documented Phase 3c
+  # gh-as-bearer routing behaviour above.
   printf '%s' "$addresses_json" \
-    | "$AIRC_PYTHON" -m airc_core.gistparse pick_addr_first 2>/dev/null
+    | "$AIRC_PYTHON" -m airc_core.gistparse pick_addr_nonlocal_first 2>/dev/null
 }
 
 # humanhash: hex string → human-readable mnemonic (e.g. "muffin-saturn-pluto-orange").
