@@ -1814,8 +1814,48 @@ reminder_timer_loop() {
       local freshest_recv=0
       local has_any_state=0
       local sf
+      # Build the set of CURRENTLY subscribed channels — only their
+      # bearer_state files are relevant. Stale files from previously-
+      # subscribed channels (e.g. test rooms left weeks ago) hold
+      # ancient last_recv_ts values that, if included in the MAX, would
+      # silently rot the beacon's calculation. Caught live 2026-05-02:
+      # beacon reported '288919s silent' on a fresh-restart bearer
+      # because bearer_state.useideem.json from 80hrs prior had a
+      # positive last_recv_ts that won the MAX over the freshly-opened
+      # bearer's null. The freshly-opened bearer's correct read should
+      # have been "small recv_silent because the file was just written"
+      # — but the stale-file's older positive ts beat the fresh file's
+      # null and produced false 80hr alarms.
+      local subs_file_glob=""
+      local sub
+      while IFS= read -r sub; do
+        [ -n "$sub" ] || continue
+        # Strip leading '#' if present in config (#401 tolerance pattern).
+        sub="${sub#\#}"
+        local sf_path="$AIRC_WRITE_DIR/bearer_state.${sub}.json"
+        subs_file_glob="${subs_file_glob}${sf_path}|"
+      done < <("$AIRC_PYTHON" -c "
+import json, sys
+try:
+    cfg = json.load(open('$CONFIG'))
+    for c in cfg.get('subscribed_channels') or []:
+        print(c)
+except Exception:
+    pass
+" 2>/dev/null)
+
       for sf in "$AIRC_WRITE_DIR"/bearer_state*.json; do
         [ -f "$sf" ] || continue
+        # Filter: skip stale files whose channel is no longer subscribed.
+        # If subs list is empty (no subscribed_channels in config), fall
+        # back to including all bearer_state files (preserves old behavior
+        # for legacy scopes that haven't populated subscribed_channels).
+        if [ -n "$subs_file_glob" ]; then
+          case "|$subs_file_glob" in
+            *"|$sf|"*) ;;  # in subs list, keep
+            *) continue ;;  # stale, skip
+          esac
+        fi
         has_any_state=1
         local ts; ts=$("$AIRC_PYTHON" -c "
 import json, sys, calendar, time
