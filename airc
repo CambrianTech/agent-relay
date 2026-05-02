@@ -656,6 +656,49 @@ host_machine_id() {
   printf '%s\n' "$id"
 }
 
+# resolve_tailscale_bin: find the tailscale CLI on this machine, even
+# in the awkward MSYS Git Bash + PATHEXT case. Returns the binary path
+# on stdout or non-zero if Tailscale isn't installed. Restored from the
+# pre-Phase-3c codebase (commit 4d41dab) — host_address_set's Tailscale
+# entry needs it back so cross-network peers can dial direct WireGuard
+# instead of paying the gh-bearer 30s polling latency floor.
+resolve_tailscale_bin() {
+  if command -v tailscale >/dev/null 2>&1; then
+    echo "tailscale"
+    return 0
+  fi
+  if command -v tailscale.exe >/dev/null 2>&1; then
+    echo "tailscale.exe"
+    return 0
+  fi
+  local candidate
+  for candidate in \
+    "/c/Program Files/Tailscale/tailscale.exe" \
+    "/c/Program Files (x86)/Tailscale/tailscale.exe" \
+    "/mnt/c/Program Files/Tailscale/tailscale.exe"; do
+    if [ -f "$candidate" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  if [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then
+    echo "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+    return 0
+  fi
+  # where.exe catches winget user-scope installs (%LOCALAPPDATA%\...) the
+  # hard-coded paths miss. Joel 2026-04-28: install.sh's tailscale_present
+  # had the same blind spot.
+  if command -v where.exe >/dev/null 2>&1; then
+    local _wherewin
+    _wherewin=$(where.exe tailscale.exe 2>/dev/null | head -1 | tr -d '\r')
+    if [ -n "$_wherewin" ]; then
+      local _bash; _bash=$(_to_bash_path "$_wherewin" 2>/dev/null)
+      [ -n "$_bash" ] && [ -f "$_bash" ] && { echo "$_bash"; return 0; }
+    fi
+  fi
+  return 1
+}
+
 # host_address_set: enumerate this host's currently-usable addresses,
 # in priority order: localhost first (always present), then any LAN
 # interface with a non-loopback IP, then Tailscale (only if the daemon
@@ -685,11 +728,38 @@ host_address_set() {
     done
   fi
 
-  # Phase 3c: Tailscale entries removed. Cross-network reachability is
-  # served by gh-as-bearer (envelope-encrypted gist messaging), not by
-  # advertising a Tailscale IP for direct SSH. The address set still
-  # advertises localhost + LAN for same-LAN TCP pair handshake; gist
-  # routing handles everything else.
+  # Tailscale: only emit when the binary is present AND the daemon
+  # reports signed-in. AIRC_NO_TAILSCALE=1 forces empty for users who
+  # explicitly opt out (or for tests).
+  #
+  # Phase 3c made gh-as-bearer the universal transport, but a direct
+  # WireGuard hop via Tailscale is still vastly faster than a 30s
+  # gh-poll loop when both peers are on the same tailnet. Restored
+  # 2026-05-02 (Joel: "we need tailscale to work when optionally
+  # installed. this is just a simple matter of IP/address, which we
+  # had supported"). Behavior: if Tailscale is up, the host advertises
+  # its tailnet IP; cross-network peers in the same tailnet pick it
+  # via peer_pick_address fallback; pair-handshake completes over
+  # WireGuard. If Tailscale is absent or logged-out, no entry — gist
+  # bearer takes the path it already takes today.
+  if [ "${AIRC_NO_TAILSCALE:-0}" != "1" ]; then
+    local ts_bin; ts_bin=$(resolve_tailscale_bin 2>/dev/null || true)
+    if [ -n "$ts_bin" ]; then
+      # set -e + non-zero exit on `tailscale status` (logged out) would
+      # abort. `|| true` is fine here — we only use the output.
+      local ts_out; ts_out=$("$ts_bin" status 2>&1) || true
+      case "$ts_out" in
+        *"Logged out"*|*"NeedsLogin"*) ;;  # not signed in → no entry
+        *)
+          local ts_ip; ts_ip=$("$ts_bin" ip -4 2>/dev/null | head -1 | tr -d '\r\n ')
+          if [ -z "$ts_ip" ]; then
+            ts_ip=$(printf '%s' "$ts_out" | awk 'NR==1 && /^100\./{print $1; exit}')
+          fi
+          [ -n "$ts_ip" ] && printf 'tailscale|%s|%s|\n' "$ts_ip" "$port"
+          ;;
+      esac
+    fi
+  fi
 }
 
 # host_addresses_json: assemble host_address_set output into a JSON
