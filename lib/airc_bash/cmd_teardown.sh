@@ -270,6 +270,37 @@ cmd_teardown() {
     # which the if-block handles cleanly.
     _scope_path_pids=$(pgrep -f "$AIRC_WRITE_DIR" 2>/dev/null | sort -un || true)
     if [ -n "$_scope_path_pids" ]; then
+      # The scope-path match catches Python bearer/formatter children
+      # because their argv includes --state-file/--peers-dir paths. Their
+      # bash `airc join|connect` parents usually do NOT have AIRC_HOME in
+      # argv, only in env, so killing children alone can leave the parent
+      # alive to respawn them. Walk upward through airc-looking wrappers
+      # and reap those parents too.
+      local _scope_reap_pids="$_scope_path_pids"
+      local _sp
+      for _sp in $_scope_path_pids; do
+        local _ancestor _depth
+        _ancestor=$(proc_parent "$_sp" || true)
+        _depth=0
+        while [ -n "$_ancestor" ] && [ "$_ancestor" != "1" ] && [ "$_depth" -lt 6 ]; do
+          local _ancestor_cmd
+          _ancestor_cmd=$(proc_cmdline "$_ancestor" || true)
+          if echo "$_ancestor_cmd" | grep -Eq '(^|[[:space:]])/[^[:space:]]*/airc[[:space:]]+(connect|join)([[:space:]]|$)|(^|[[:space:]])airc[[:space:]]+(connect|join)([[:space:]]|$)|eval .*airc[[:space:]]+(connect|join)'; then
+            _scope_reap_pids="$_scope_reap_pids $_ancestor"
+            _ancestor=$(proc_parent "$_ancestor" || true)
+            _depth=$((_depth + 1))
+          else
+            break
+          fi
+        done
+      done
+      local _rp
+      for _rp in $_scope_reap_pids; do
+        local _rp_kids
+        _rp_kids=$(proc_children "$_rp" | tr '\n' ' ' || true)
+        [ -n "$_rp_kids" ] && _scope_reap_pids="$_scope_reap_pids $_rp_kids"
+      done
+      _scope_path_pids=$(echo "$_scope_reap_pids" | tr ' ' '\n' | sort -un || true)
       # Exclude our own pid + parent (this very teardown subshell) so
       # we don't suicide before completing the cleanup.
       local _self_pid="$$"
