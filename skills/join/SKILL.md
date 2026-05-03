@@ -47,9 +47,12 @@ Monitor(persistent=true, description="airc", command="airc join")
 ```
 Keep `description="airc"` — the headline shown in the UI is built from it.
 
-**Codex / non-Monitor runtimes:** run shell verbs directly. Poll incrementally:
+**Codex / non-Monitor runtimes:** do not foreground `airc join` in the tool call. It is a long-running process when this scope is not already active. Start it through the daemon or as a background process, then poll incrementally:
 ```
-airc join                          # one-shot, exits after init
+airc daemon install                # preferred: launchd/systemd keeps this scope alive
+# or, for a session-local process:
+scope=$(airc debug-scope); mkdir -p "$scope"; nohup airc join > "$scope/codex-airc.log" 2>&1 &
+airc status                        # verify monitor/liveness
 airc logs --since 60s              # NEW messages since 60s ago (use last-seen ts)
 airc msg "..."                     # broadcast
 airc msg @peer "..."               # DM
@@ -58,7 +61,7 @@ Do NOT poll `airc logs N` without `--since` — that re-injects the full tail ev
 
 ## Idempotency
 
-`airc join` exits cleanly with `this scope's monitor is already running` if a live process exists in this scope. Treat as success. Run `airc status` once; do NOT re-arm Monitor (would dual-tail).
+`airc join` exits cleanly with `this scope's monitor is already running` if a live process exists in this scope. Treat as success. Run `airc status` once; do NOT re-arm Monitor or start another background join (would dual-tail).
 
 ## Authoritative liveness signal
 
