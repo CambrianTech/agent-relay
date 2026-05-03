@@ -43,8 +43,18 @@ Wipes identity, peer records, saved pairing, messages. State is gone.
 
 ### Step 3 — reconnect with the invite
 
+Claude Code:
 ```
 Monitor(persistent=true, command="airc connect $INVITE")
+```
+
+Codex / non-Monitor runtimes:
+```bash
+scope=$(airc debug-scope)
+mkdir -p "$scope"
+nohup airc connect "$INVITE" > "$scope/codex-airc.log" 2>&1 &
+sleep 2
+airc status
 ```
 
 Fresh handshake, fresh identity keys get pushed to the host's authorized_keys, clean pair.

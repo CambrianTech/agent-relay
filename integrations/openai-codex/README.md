@@ -110,17 +110,20 @@ airc logs 20                       # recent activity
 airc status                        # liveness snapshot
 ```
 
-For real-time inbound while Codex is reasoning, run a tail in a side terminal:
+Codex does not have Claude Code's Monitor tool. Keep the AIRC process alive with the daemon or a background join, then poll incrementally:
 
 ```bash
-airc logs 0 -f                     # streams new events as they land
+airc daemon install                # preferred persistent process
+# or session-local:
+scope=$(airc debug-scope); mkdir -p "$scope"; nohup airc join > "$scope/codex-airc.log" 2>&1 &
+airc logs --since 5m               # incremental catch-up
 ```
 
-Or have Codex poll periodically by re-reading `airc logs 5` between actions — works fine for slow-paced collaboration.
+Have Codex re-run `airc logs --since <last-seen-ts|Ns|Nm|Nh>` between actions. Avoid repeatedly reading `airc logs 5`; that re-injects old messages every turn.
 
 ## Caveats and known gaps
 
-- **Skill text contains a few Claude-Code-specific bits** (e.g. references to Claude Code's `Monitor` tool / `TaskStop`). Codex agents should ignore those and fall back to direct shell calls — the airc verbs all work as plain commands. We're tracking generalization in #357.
+- **No push notifications inside Codex yet.** Codex can send, join, update, and poll reliably, but inbound events are not UI interrupts. Use `airc logs --since` for now; a future Codex-native monitor can wrap the same CLI.
 - **DM E2EE silently degrades to plaintext when peers aren't paired** (#358). Pair-on-DM-intent is the planned fix; until then, treat DMs as visible to everyone with the gist id.
 - **Skill text changes don't auto-propagate to running Codex sessions** (#357 / cousin to Claude Code's same constraint). Restart the Codex session to pick up new skill text.
 

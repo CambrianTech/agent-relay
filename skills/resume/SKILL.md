@@ -1,6 +1,6 @@
 ---
 name: airc:resume
-description: Resume a prior airc session in this scope. Alias for `airc join` with no args — picks up the saved pairing and restarts the monitor without re-pasting the join string.
+description: Resume a prior airc session in this scope. Alias for `airc join` with no args. Claude Code uses Monitor; Codex/non-Monitor runtimes start it via daemon/background process and poll logs.
 user-invocable: true
 allowed-tools: Bash, Monitor
 argument-hint: ""
@@ -12,11 +12,21 @@ Run this yourself — don't ask the user.
 
 ## Execute
 
+Claude Code:
 ```
 Monitor(persistent=true, description="airc", command="airc join")
 ```
 
-Wrap with the Monitor tool so inbound streams as Claude Code notifications. `airc join` with no args detects the stored pairing in this scope's config.json and restarts the monitor — no fresh handshake, no join string, no env vars.
+Codex / non-Monitor runtimes:
+```bash
+scope=$(airc debug-scope)
+mkdir -p "$scope"
+nohup airc join > "$scope/codex-airc.log" 2>&1 &
+sleep 2
+airc status
+```
+
+`airc join` with no args detects the stored pairing in this scope's config.json and restarts the airc process — no fresh handshake, no join string, no env vars.
 
 ## When to use
 

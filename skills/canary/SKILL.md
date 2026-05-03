@@ -51,11 +51,23 @@ That's it. Branch switch + restart monitor on the new code. Identity, peers, roo
 
 Tell the user:
 
-> "Switched to canary (sha `<short-sha>`). Running monitor still uses old code — `airc teardown && airc connect` to pick up the new binary."
+> "Switched to canary (sha `<short-sha>`). Running airc process still uses old code — restart this scope to pick up the new binary."
 
-Then if they had a paired session you should restart the monitor for them:
+Then if they had a paired session you should restart the current scope for them.
+
+Claude Code:
 ```
 Monitor(persistent=true, command="airc connect")
+```
+
+Codex / non-Monitor runtimes:
+```bash
+airc teardown
+scope=$(airc debug-scope)
+mkdir -p "$scope"
+nohup airc join > "$scope/codex-airc.log" 2>&1 &
+sleep 2
+airc status
 ```
 
 ## When to use this skill
