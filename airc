@@ -513,15 +513,36 @@ _monitor_alive_with_bearer_fallback() {
   local scope_dir
   scope_dir=$(dirname "$pidfile")
 
-  # Phase 1: kill -0 (works in non-sandboxed shells; blind in Codex).
+  # Phase 1: kill -0 + cmdline verify (works in non-sandboxed shells; blind in Codex).
+  #
+  # PID-reuse trap: bare `kill -0 $pid` returns true for ANY live process at
+  # that PID, including processes the OS has REUSED the PID for after sleep+wake
+  # (or container restart, or any session that spawned through the same PID
+  # range). Joel hit this 2026-05-03: laptop slept, airc Monitor died, OS
+  # later reused the PIDs for unrelated bash/python procs, `airc status`
+  # then said "monitor running" pointing at zombie PIDs that weren't ours.
+  # Mesh effectively partitioned with no diagnosis path.
+  #
+  # Fix: a PID is only "ours" if `kill -0` says alive AND its cmdline shapes
+  # like an airc connect/join wrapper. Same regex shape as cmd_teardown's
+  # parent-chain reaper (#446) — keeps the two paths in lockstep on what
+  # "an airc process" means. PID reuse → cmdline doesn't match → treat as
+  # dead, fall through to Phase 2 (bearer-state freshness).
   if [ -f "$pidfile" ]; then
     local p raw
     raw=$(cat "$pidfile" 2>/dev/null)
     for p in $raw; do
       case "$p" in ''|*[!0-9]*) continue ;; esac
       if kill -0 "$p" 2>/dev/null; then
-        echo "yes"
-        return 0
+        local _cmd
+        _cmd=$(proc_cmdline "$p" 2>/dev/null || true)
+        if echo "$_cmd" | grep -Eq '(^|[[:space:]])/[^[:space:]]*/airc[[:space:]]+(connect|join)([[:space:]]|$)|(^|[[:space:]])airc[[:space:]]+(connect|join)([[:space:]]|$)|eval .*airc[[:space:]]+(connect|join)'; then
+          echo "yes"
+          return 0
+        fi
+        # PID alive but not airc-shaped — OS reused this PID after our
+        # monitor died (sleep/wake, container restart, etc.). Skip; let
+        # Phase 2 bearer-state freshness be the truth.
       fi
     done
   else
