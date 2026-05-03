@@ -484,21 +484,38 @@ cmd_connect() {
   # multi-tab sanity-checking destructive. Post-fix: detect liveness,
   # print a one-liner pointing to the right tools, exit 0 cleanly.
   # Stale pidfile (no live PIDs) still gets cleaned up + we proceed.
+  #
+  # 2026-05-03 (#97 self-heal): bare `kill -0 $pid` returns true for ANY
+  # live process at that PID, including processes the OS has REUSED the
+  # PID for after sleep/wake. Joel hit this — slept laptop, airc died,
+  # OS reused PIDs, this block then saw "alive" against zombie PIDs and
+  # refused to self-heal. Verify cmdline shapes like airc before treating
+  # the PID as ours. Same regex shape as cmd_teardown's parent-chain
+  # reaper (#446) and the helper in airc::_monitor_alive_with_bearer_fallback.
   local stale_pidfile="$AIRC_WRITE_DIR/airc.pid"
   if [ -f "$stale_pidfile" ]; then
     local stale_pids; stale_pids=$(cat "$stale_pidfile" 2>/dev/null | tr '\n' ' ')
     local any_alive=0
+    local alive_pids=""
     for p in $stale_pids; do
-      kill -0 "$p" 2>/dev/null && any_alive=1
+      if kill -0 "$p" 2>/dev/null; then
+        local _cmd
+        _cmd=$(proc_cmdline "$p" 2>/dev/null || true)
+        if echo "$_cmd" | grep -Eq '(^|[[:space:]])/[^[:space:]]*/airc[[:space:]]+(connect|join)([[:space:]]|$)|(^|[[:space:]])airc[[:space:]]+(connect|join)([[:space:]]|$)|eval .*airc[[:space:]]+(connect|join)'; then
+          any_alive=1
+          alive_pids="$alive_pids $p"
+        fi
+      fi
     done
     if [ "$any_alive" = "1" ]; then
-      echo "  airc connect: this scope's monitor is already running (PIDs: $stale_pids)."
+      echo "  airc connect: this scope's monitor is already running (PIDs:$alive_pids)."
       echo "    To stop it:        airc teardown"
       echo "    To restart it:     airc teardown && airc connect"
       echo "    To check it:       airc status"
       return 0
     fi
-    # Stale pidfile (no live processes) — safe to clean.
+    # Stale pidfile (no live airc processes — either dead, or PIDs were
+    # reused by the OS for unrelated procs). Safe to clean.
     rm -f "$stale_pidfile"
   fi
 
