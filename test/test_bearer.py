@@ -618,7 +618,9 @@ class BearerCliRecvLockTests(unittest.TestCase):
       - Pidfile present, PID alive but for a DIFFERENT gist → stale
         (host-gist-rotation case); claim succeeds.
       - Pidfile present, PID alive AND for SAME gist → claim fails;
-        return None so caller exits cleanly.
+        return _LOCK_HELD so caller exits cleanly.
+      - Pidfile cannot be written → return _LOCK_DISABLED so caller
+        continues without the duplicate-emission guarantee.
       - Release removes pidfile only when it still contains our pid
         (don't stomp a successor that took the lock after we ran).
     """
@@ -655,7 +657,7 @@ class BearerCliRecvLockTests(unittest.TestCase):
         # take a lock — preserves backwards compat for callers that don't
         # have a writable scope dir to put the pidfile in.
         result = bearer_cli._claim_recv_lock(self._args(state_file=None))
-        self.assertIsNone(result)
+        self.assertEqual(result, bearer_cli._LOCK_DISABLED)
 
     def test_claim_writes_pidfile_when_absent(self):
         import os
@@ -712,12 +714,31 @@ class BearerCliRecvLockTests(unittest.TestCase):
         with mock.patch.object(bearer_cli, "_pid_alive", return_value=True), \
              mock.patch.object(bearer_cli, "_is_our_bearer", return_value=True):
             result = bearer_cli._claim_recv_lock(self._args(room_gist_id="abc123"))
-        self.assertIsNone(result, "live bearer for same gist must block claim")
+        self.assertEqual(result, bearer_cli._LOCK_HELD,
+                         "live bearer for same gist must block claim")
         # Pidfile contents must be UNCHANGED — we didn't take over.
         with open(self._pidfile) as f:
             content = f.read().strip()
         self.assertTrue(content.startswith(f"{my_other_pid}\t"),
                         "pidfile must NOT be overwritten when we lose the claim race")
+
+    def test_lock_write_failure_does_not_make_recv_exit_as_lock_held(self):
+        # If the pidfile cannot be created, _claim_recv_lock must report
+        # "disabled" rather than "held". cmd_recv should continue without
+        # the dedup guarantee; exiting would make AIRC silently stop
+        # receiving whenever the scope dir has a filesystem hiccup.
+        with mock.patch.object(bearer_cli.os, "open", side_effect=OSError("nope")):
+            result = bearer_cli._claim_recv_lock(self._args())
+        self.assertEqual(result, bearer_cli._LOCK_DISABLED)
+
+    def test_claim_uses_exclusive_create_for_absent_pidfile(self):
+        import os
+        with mock.patch.object(bearer_cli.os, "open", wraps=os.open) as mock_open:
+            result = bearer_cli._claim_recv_lock(self._args())
+        self.assertIsNotNone(result)
+        _path, flags, _mode = mock_open.call_args.args
+        self.assertTrue(flags & os.O_EXCL,
+                        "pidfile claim must use O_EXCL to avoid absent-file races")
 
     def test_release_removes_pidfile_only_when_we_own_it(self):
         # Claim, then release.

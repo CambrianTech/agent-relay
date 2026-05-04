@@ -46,7 +46,7 @@ import signal
 import subprocess
 import sys
 from dataclasses import asdict
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 from .bearer_resolver import resolve
 
@@ -66,6 +66,10 @@ from .bearer_resolver import resolve
 #
 # Pattern matches cmd_connect's #97 self-heal: pidfile + cmdline-shape
 # verification (kill -0 alone is unsafe — OS reuses PIDs after wake).
+
+_LOCK_DISABLED = "disabled"
+_LOCK_HELD = "held"
+RecvLockResult = Union[Tuple[str, int], str]
 
 
 def _pid_alive(pid: int) -> bool:
@@ -114,12 +118,29 @@ def _is_our_bearer(pid: int, expected_gist: str) -> bool:
     return True
 
 
-def _claim_recv_lock(args) -> Optional[Tuple[str, int]]:
+def _read_lock_owner(pidfile: str) -> Tuple[int, str]:
+    try:
+        with open(pidfile, "r") as f:
+            data = f.read().strip()
+    except OSError:
+        return (0, "")
+    parts = data.split("\t", 1)
+    try:
+        pid = int(parts[0]) if parts and parts[0] else 0
+    except ValueError:
+        pid = 0
+    gist = parts[1] if len(parts) > 1 else ""
+    return (pid, gist)
+
+
+def _claim_recv_lock(args) -> RecvLockResult:
     """Per-(scope, channel, gist) bearer-recv lock.
 
     Returns (pidfile_path, my_pid) on successful claim — caller registers
-    atexit cleanup. Returns None if another live bearer already serves
-    this stream — caller should exit 0 cleanly.
+    atexit cleanup. Returns _LOCK_HELD if another live bearer already
+    serves this stream — caller should exit 0 cleanly. Returns
+    _LOCK_DISABLED when no lock can/should be used, and caller should
+    continue without the duplicate-emission guarantee.
 
     Pidfile path is derived from --state-file by replacing the .json
     suffix with .pid (e.g. bearer_state.general.json → bearer.general.pid).
@@ -136,7 +157,7 @@ def _claim_recv_lock(args) -> Optional[Tuple[str, int]]:
     """
     state_file = getattr(args, "state_file", None)
     if not state_file:
-        return None
+        return _LOCK_DISABLED
     if state_file.endswith(".json"):
         pidfile = state_file[: -len(".json")] + ".pid"
     else:
@@ -145,57 +166,58 @@ def _claim_recv_lock(args) -> Optional[Tuple[str, int]]:
     my_gist = getattr(args, "room_gist_id", None) or ""
     my_pid = os.getpid()
 
-    if os.path.exists(pidfile):
+    lock_payload = f"{my_pid}\t{my_gist}\n".encode("utf-8")
+    for _ in range(3):
         try:
-            with open(pidfile, "r") as f:
-                data = f.read().strip()
-        except OSError:
-            data = ""
-        # Format: "<pid>\t<gist_id>". gist_id may be empty for non-gh bearers.
-        parts = data.split("\t", 1)
-        try:
-            other_pid = int(parts[0]) if parts and parts[0] else 0
-        except ValueError:
-            other_pid = 0
-        if other_pid > 0 and other_pid != my_pid \
-                and _pid_alive(other_pid) and _is_our_bearer(other_pid, my_gist):
+            fd = os.open(pidfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            try:
+                os.write(fd, lock_payload)
+            finally:
+                os.close(fd)
+            return (pidfile, my_pid)
+        except FileExistsError:
+            # Format: "<pid>\t<gist_id>". gist_id may be empty for non-gh bearers.
+            other_pid, _other_gist = _read_lock_owner(pidfile)
+            if other_pid > 0 and other_pid != my_pid \
+                    and _pid_alive(other_pid) and _is_our_bearer(other_pid, my_gist):
+                print(
+                    f"bearer_cli recv: another bearer for gist {my_gist or '(none)'} "
+                    f"already running (PID {other_pid}); exiting cleanly to avoid "
+                    f"duplicate emission",
+                    file=sys.stderr, flush=True,
+                )
+                return _LOCK_HELD
+            # else: stale (dead pid, OS-reused, or old gist) → remove then
+            # retry O_EXCL claim. If another process wins the race, the next
+            # loop sees its pidfile and exits or retries accordingly.
+            try:
+                os.unlink(pidfile)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                print(
+                    f"bearer_cli recv: could not remove stale pidfile {pidfile}: {e}; "
+                    f"proceeding without lock (duplicate emission possible)",
+                    file=sys.stderr, flush=True,
+                )
+                return _LOCK_DISABLED
+        except OSError as e:
+            # Loud, not silent — we'd rather know we couldn't lock than
+            # silently disable the dedup guarantee.
             print(
-                f"bearer_cli recv: another bearer for gist {my_gist or '(none)'} "
-                f"already running (PID {other_pid}); exiting cleanly to avoid "
-                f"duplicate emission",
+                f"bearer_cli recv: could not write pidfile {pidfile}: {e}; "
+                f"proceeding without lock (duplicate emission possible)",
                 file=sys.stderr, flush=True,
             )
-            return None
-        # else: stale (dead pid, OS-reused, or old gist) → take over
+            return _LOCK_DISABLED
 
-    try:
-        with open(pidfile, "w") as f:
-            f.write(f"{my_pid}\t{my_gist}\n")
-    except OSError as e:
-        # Loud, not silent — we'd rather know we couldn't lock than
-        # silently disable the dedup guarantee.
-        print(
-            f"bearer_cli recv: could not write pidfile {pidfile}: {e}; "
-            f"proceeding without lock (duplicate emission possible)",
-            file=sys.stderr, flush=True,
-        )
-        return None
-    return (pidfile, my_pid)
+    return _LOCK_DISABLED
 
 
 def _release_lock(pidfile: str, my_pid: int) -> None:
     """Remove the pidfile only if it still has OUR pid (don't stomp a
     pidfile that some other bearer rewrote after we ran)."""
-    try:
-        with open(pidfile, "r") as f:
-            data = f.read().strip()
-    except OSError:
-        return
-    parts = data.split("\t", 1)
-    try:
-        owner = int(parts[0]) if parts and parts[0] else 0
-    except ValueError:
-        owner = 0
+    owner, _gist = _read_lock_owner(pidfile)
     if owner == my_pid:
         try:
             os.unlink(pidfile)
@@ -260,11 +282,11 @@ def cmd_recv(args) -> int:
     # 2026-05-04 dup-message diagnosis). Without --state-file, no lock
     # is taken — legacy / test invocations are unaffected.
     lock = _claim_recv_lock(args)
-    if lock is None and getattr(args, "state_file", None):
+    if lock == _LOCK_HELD:
         # Another live bearer is already serving this stream.
         # Exit cleanly so the parent monitor's watchdog doesn't escalate.
         return 0
-    if lock is not None:
+    if isinstance(lock, tuple):
         atexit.register(_release_lock, lock[0], lock[1])
 
     peer_meta = {
