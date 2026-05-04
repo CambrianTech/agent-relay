@@ -2091,6 +2091,78 @@ PY
   cleanup_all
 }
 
+# ── Scenario: gh_secondary_rate_limit_degraded_startup (#479) ──────────
+# GitHub secondary throttling must not prevent monitor startup. On
+# 2026-05-04 Windows/WSL hit this shape: `gh auth status` tripped the
+# secondary limiter, `gh api rate_limit` still worked, and `airc join`
+# died before the monitor could start or any local/cached transport could
+# recover. Rate limiting is degraded transport, not invalid auth.
+scenario_gh_secondary_rate_limit_degraded_startup() {
+  section "gh_secondary_rate_limit_degraded_startup: join starts degraded under gh secondary throttle"
+  cleanup_all
+
+  local root=/tmp/airc-it-gh-secondary
+  local fakebin="$root/bin"
+  local home="$root/state"
+  mkdir -p "$fakebin" "$home" "$root/tmp"
+
+  cat > "$fakebin/gh" <<'SH'
+#!/bin/sh
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  echo "github.com: token invalid" >&2
+  echo "gh: API rate limit exceeded for user ID 1" >&2
+  exit 1
+fi
+if [ "$1" = "api" ] && [ "$2" = "rate_limit" ]; then
+  echo '{"resources":{"core":{"remaining":4999}}}'
+  exit 0
+fi
+if [ "$1" = "api" ]; then
+  echo "gh: API rate limit exceeded for user ID 1" >&2
+  exit 1
+fi
+if [ "$1" = "gist" ]; then
+  echo "gh: API rate limit exceeded for user ID 1" >&2
+  exit 1
+fi
+echo "fake gh: unsupported $*" >&2
+exit 1
+SH
+  chmod +x "$fakebin/gh"
+
+  (
+    cd "$root" || exit 1
+    PATH="$fakebin:$PATH" \
+      AIRC_HOME="$home" \
+      AIRC_NAME=gh-secondary-test \
+      AIRC_NO_DISCOVERY=1 \
+      AIRC_NO_GENERAL=1 \
+      AIRC_AUTH_CACHE_SEC=0 \
+      AIRC_RATE_LIMIT_WAIT_SEC=1 \
+      TMPDIR="$root/tmp" \
+      "$AIRC" connect --room gh-secondary-test > "$root/out.log" 2>&1
+  ) &
+  local pid=$!
+  sleep 6
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+
+  local out
+  out=$(cat "$root/out.log" 2>/dev/null)
+  echo "$out" | grep -q 'Continuing in degraded mode' \
+    && pass "join treats gh secondary throttle as degraded, not fatal" \
+    || fail "join did not enter degraded mode under gh secondary throttle ($out)"
+  echo "$out" | grep -q 'gh auth not OK' \
+    && fail "join still hard-failed gh auth under secondary throttle ($out)" \
+    || pass "join did not print fatal gh-auth failure under secondary throttle"
+  echo "$out" | grep -q 'Hosting #gh-secondary-test' \
+    && pass "join proceeded far enough to start the room monitor path" \
+    || fail "join did not proceed to room startup after degraded auth ($out)"
+
+  rm -rf "$root"
+  cleanup_all
+}
+
 # ── Scenario: solo_mesh_warns (transport health != collaboration) ───────
 # A self-healed host can have fresh local transport/bearer state while no
 # peers are actually paired to the mesh. `airc status` / `doctor --health`
@@ -4277,6 +4349,7 @@ case "$MODE" in
   auto_scope)   scenario_auto_scope ;;
   send_dead_monitor_dies) scenario_send_dead_monitor_dies ;;
   monitor_liveness_process_evidence) scenario_monitor_liveness_process_evidence ;;
+  gh_secondary_rate_limit_degraded_startup) scenario_gh_secondary_rate_limit_degraded_startup ;;
   solo_mesh_warns) scenario_solo_mesh_warns ;;
   connect_after_kill_recovers) scenario_connect_after_kill_recovers ;;
   general_sidecar_default) scenario_general_sidecar_default ;;
@@ -4312,6 +4385,7 @@ case "$MODE" in
     scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat
     scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope
     scenario_send_dead_monitor_dies; scenario_monitor_liveness_process_evidence
+    scenario_gh_secondary_rate_limit_degraded_startup
     scenario_solo_mesh_warns
     scenario_connect_after_kill_recovers
     scenario_general_sidecar_default; scenario_away
@@ -4324,7 +4398,7 @@ case "$MODE" in
     scenario_custom_room_creates_gist
     scenario_invite_human
     ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|monitor_liveness_process_evidence|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|monitor_liveness_process_evidence|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
 esac
 
 echo

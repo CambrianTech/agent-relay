@@ -210,7 +210,10 @@ airc_self_heal_gh_auth() {
 #
 # Behaviour by detected state:
 #   ok                → return 0; caller proceeds
-#   rate_limited      → emit explanation; return 1 (token is fine, wait)
+#   rate_limited      → emit explanation; return 1 by default (token is
+#                       fine, wait). If AIRC_GH_RATE_LIMIT_NONFATAL=1,
+#                       return 0 after warning so monitor startup can
+#                       continue in degraded/cached transport mode.
 #   invalid           → trigger self-heal browser flow; on success re-detect
 #                       to confirm + return 0; on failure emit fallback +
 #                       return 1 (caller dies with its own message)
@@ -254,6 +257,13 @@ airc_ensure_gh_auth_or_heal() {
       echo "    Your token is fine — wait 5-15 minutes and retry." >&2
       echo "    Context: $context" >&2
       echo "" >&2
+      if [ "${AIRC_GH_RATE_LIMIT_NONFATAL:-0}" = "1" ]; then
+        echo "    Continuing in degraded mode: monitor will start; GH-backed" >&2
+        echo "    discovery/publish operations may queue or fail until the" >&2
+        echo "    secondary throttle clears." >&2
+        echo "" >&2
+        return 0
+      fi
       if [ "${AIRC_BACKGROUND_OK:-0}" = "1" ]; then
         local _wait_secs="${AIRC_RATE_LIMIT_WAIT_SEC:-600}"
         echo "    [daemon mode] sleeping ${_wait_secs}s in-process (avoids respawn cascade)..." >&2

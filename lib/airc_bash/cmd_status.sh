@@ -330,15 +330,25 @@ else:
   # The substrate is gh-as-bearer; when gh's keyring goes invalid,
   # everything stops working but nothing surfaces unless they look here.
   if command -v gh >/dev/null 2>&1; then
-    if gh auth status >/dev/null 2>&1; then
-      echo "  gh auth:     ok"
-    elif gh api rate_limit >/dev/null 2>&1; then
-      # Token works (rate_limit reachable); /user got 403'd by secondary
-      # rate limit and gh misreports it as 'token invalid'. Issue #341.
-      echo "  gh auth:     RATE-LIMITED (secondary; token is fine — wait 5-15 min)"
-    else
-      echo "  gh auth:     ✗ INVALID — run 'gh auth login -h github.com' to fix"
-    fi
+    # Use the centralized auth detector instead of raw `gh auth status`
+    # so status reads the OK cache and does not turn frequent health
+    # checks into /user traffic that trips GitHub's secondary limiter.
+    local _gh_state
+    _gh_state="$(airc_detect_gh_auth_state 2>/dev/null || echo invalid)"
+    case "$_gh_state" in
+      ok)
+        echo "  gh auth:     ok"
+        ;;
+      rate_limited)
+        echo "  gh auth:     RATE-LIMITED (secondary; token is fine — wait 5-15 min)"
+        ;;
+      env_token_invalid)
+        echo "  gh auth:     ✗ INVALID GH_TOKEN — unset/fix GH_TOKEN, then retry"
+        ;;
+      *)
+        echo "  gh auth:     ✗ INVALID — run 'gh auth login -h github.com' to fix"
+        ;;
+    esac
   else
     echo "  gh auth:     gh CLI not installed"
   fi
