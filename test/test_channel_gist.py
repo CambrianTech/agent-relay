@@ -6,6 +6,7 @@ Run: cd test && python3 test_channel_gist.py
 from __future__ import annotations
 
 import sys
+import json
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -89,6 +90,20 @@ class FindExistingConvergenceTests(unittest.TestCase):
     def test_returns_none_when_no_match(self):
         with mock.patch.object(channel_gist, "_gh_list_user_gists", return_value=[]):
             self.assertIsNone(channel_gist.find_existing("nonexistent"))
+
+    def test_require_invite_skips_seed_only_channel_gist(self):
+        """Connect discovery needs a host envelope, not just a routing
+        seed. Seed-only channel gists are valid for cmd_send routing but
+        cannot be joined because they have no invite/host data."""
+        seed_only = self._gist("seed-only", "cambriantech", "2026-05-04T17:27:38Z")
+        host = self._gist("host", "cambriantech", "2026-05-04T17:28:38Z")
+        env = json.loads(host["files"]["airc-room-cambriantech.json"]["content"])
+        env["invite"] = "host@example"
+        host["files"]["airc-room-cambriantech.json"]["content"] = json.dumps(env)
+        with mock.patch.object(channel_gist, "_gh_list_user_gists",
+                               return_value=[seed_only, host]):
+            self.assertEqual(channel_gist.find_existing("cambriantech"), "seed-only")
+            self.assertEqual(channel_gist.find_existing("cambriantech", require_invite=True), "host")
 
     def test_returns_oldest_legacy_when_no_canonical(self):
         """If only legacy mesh gists exist (none canonical), still

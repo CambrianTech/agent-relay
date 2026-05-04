@@ -543,9 +543,9 @@ _doctor_health() {
     peer_count=$(find "$PEERS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | wc -l | tr -d ' ')
   fi
   if [ "${peer_count:-0}" -eq 0 ] 2>/dev/null; then
-    printf "  [WARN] collaboration mesh has 0 peer records — local transport may be healthy but nobody is known to be connected\n"
+    printf "  [BLOCKED] collaboration mesh has 0 peer records — local transport may be alive, but this is a solo island\n"
     printf "         Check: airc peers; ask peers to run 'airc update --channel canary && airc connect <current invite>'\n"
-    warns=$((warns+1))
+    issues=$((issues+1))
   else
     printf "  [ok] collaboration mesh has %s peer record(s)\n" "$peer_count"
   fi

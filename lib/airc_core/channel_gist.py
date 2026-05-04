@@ -96,7 +96,7 @@ def _gh_list_user_gists() -> list[dict]:
     return out
 
 
-def _gist_describes_channel(gist: dict, channel: str) -> bool:
+def _gist_describes_channel(gist: dict, channel: str, require_invite: bool = False) -> bool:
     """Decide whether a gist envelope is THIS channel's room gist.
 
     A gist is the channel's room iff:
@@ -132,6 +132,8 @@ def _gist_describes_channel(gist: dict, channel: str) -> bool:
                 continue
             if not isinstance(env, dict):
                 continue
+            if require_invite and not env.get("invite"):
+                continue
             channels = env.get("channels")
             if isinstance(channels, list) and channel in channels:
                 return True
@@ -160,7 +162,7 @@ def _gh_api_get_gist(gist_id: str) -> Optional[dict]:
         return None
 
 
-def _is_single_channel_match(gist: dict, channel: str) -> bool:
+def _is_single_channel_match(gist: dict, channel: str, require_invite: bool = False) -> bool:
     """A gist is the canonical post-3c per-channel gist for `channel`
     iff its envelope has channels=[<exactly channel>]. Single-element
     list, exact match. The post-3c shape created by create_new()."""
@@ -175,13 +177,15 @@ def _is_single_channel_match(gist: dict, channel: str) -> bool:
             continue
         if not isinstance(env, dict):
             continue
+        if require_invite and not env.get("invite"):
+            continue
         channels = env.get("channels")
         if isinstance(channels, list) and len(channels) == 1 and channels[0] == channel:
             return True
     return False
 
 
-def find_existing(channel: str) -> Optional[str]:
+def find_existing(channel: str, require_invite: bool = False) -> Optional[str]:
     """Look for an existing gist on this gh account hosting `channel`.
     Returns the gist id, or None if no match.
 
@@ -226,7 +230,7 @@ def find_existing(channel: str) -> Optional[str]:
         return matches[0].get("id")
 
     # Pass 1: canonical single-channel match (cheap, listing-response).
-    canonical_matches = [g for g in candidates if _is_single_channel_match(g, channel)]
+    canonical_matches = [g for g in candidates if _is_single_channel_match(g, channel, require_invite=require_invite)]
     chosen = _oldest(canonical_matches)
     if chosen:
         return chosen
@@ -241,7 +245,7 @@ def find_existing(channel: str) -> Optional[str]:
         full = _gh_api_get_gist(gid)
         if full is None:
             continue
-        if _is_single_channel_match(full, channel):
+        if _is_single_channel_match(full, channel, require_invite=require_invite):
             # Carry created_at from the listing so _oldest can sort.
             full.setdefault("created_at", g.get("created_at", ""))
             deep_canonical.append(full)
@@ -250,7 +254,7 @@ def find_existing(channel: str) -> Optional[str]:
         return chosen
 
     # Pass 2: legacy multi-channel fallback. Only if no canonical exists.
-    legacy_matches = [g for g in candidates if _gist_describes_channel(g, channel)]
+    legacy_matches = [g for g in candidates if _gist_describes_channel(g, channel, require_invite=require_invite)]
     chosen = _oldest(legacy_matches)
     if chosen:
         return chosen
@@ -263,7 +267,7 @@ def find_existing(channel: str) -> Optional[str]:
         full = _gh_api_get_gist(gid)
         if full is None:
             continue
-        if _gist_describes_channel(full, channel):
+        if _gist_describes_channel(full, channel, require_invite=require_invite):
             full.setdefault("created_at", g.get("created_at", ""))
             deep_legacy.append(full)
     return _oldest(deep_legacy)
@@ -318,7 +322,7 @@ def create_new(channel: str) -> Optional[str]:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def resolve(channel: str, create_if_missing: bool = False) -> Optional[str]:
+def resolve(channel: str, create_if_missing: bool = False, require_invite: bool = False) -> Optional[str]:
     """Resolve a channel name to its gist id on this gh account.
 
     Returns the gist id on success (existing or newly-created), None
@@ -345,12 +349,12 @@ def resolve(channel: str, create_if_missing: bool = False) -> Optional[str]:
     no_retry = _os.environ.get("AIRC_RESOLVE_NO_RETRY") == "1"
     attempts = 1 if no_retry else 3
     for attempt in range(attempts):
-        existing = find_existing(channel)
+        existing = find_existing(channel, require_invite=require_invite)
         if existing:
             return existing
         if attempt < attempts - 1:
             _t.sleep(1.5 * (attempt + 1))  # 1.5s, then 3s
-    if create_if_missing:
+    if create_if_missing and not require_invite:
         return create_new(channel)
     return None
 
@@ -365,20 +369,22 @@ def _cli() -> int:
     r = sub.add_parser("resolve", help="Print gist id for a channel; empty stdout if absent")
     r.add_argument("--channel", required=True)
     r.add_argument("--create-if-missing", action="store_true")
+    r.add_argument("--require-invite", action="store_true")
 
     f = sub.add_parser("find", help="Find existing only (no create)")
     f.add_argument("--channel", required=True)
+    f.add_argument("--require-invite", action="store_true")
 
     args = parser.parse_args()
 
     if args.cmd == "resolve":
-        gid = resolve(args.channel, create_if_missing=args.create_if_missing)
+        gid = resolve(args.channel, create_if_missing=args.create_if_missing, require_invite=args.require_invite)
         if gid:
             print(gid)
             return 0
         return 1
     if args.cmd == "find":
-        gid = find_existing(args.channel)
+        gid = find_existing(args.channel, require_invite=args.require_invite)
         if gid:
             print(gid)
             return 0

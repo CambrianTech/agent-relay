@@ -54,7 +54,7 @@ _mesh_find() {
     channel=$("$AIRC_PYTHON" -m airc_core.config default_channel --config "$CONFIG" 2>/dev/null || true)
   fi
   [ -z "$channel" ] && channel="general"
-  "$AIRC_PYTHON" -m airc_core.channel_gist find --channel "$channel" 2>/dev/null || true
+  "$AIRC_PYTHON" -m airc_core.channel_gist find --channel "$channel" --require-invite 2>/dev/null || true
 }
 
 # Publish a new mesh gist. Echoes the new gist id, or empty on failure.
