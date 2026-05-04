@@ -495,7 +495,7 @@ cmd_send() {
       else
         echo "    pidfile:  absent (monitor never started in this scope)" >&2
       fi
-      echo "  Fix: run 'airc connect' to start (or resume) this scope's monitor, then retry." >&2
+      echo "  Fix: run 'airc join' to start (or resume) this scope's monitor, then retry." >&2
       echo "       OR cd into the scope you actually meant to send from." >&2
       die "monitor down — refusing to silently broadcast into a void"
     fi

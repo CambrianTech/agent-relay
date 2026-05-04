@@ -296,7 +296,7 @@ For 1:1 invites the long inline `name@user@host[:port]#pubkey` string still work
 
 ```bash
 airc doctor             # environment health (gh, ssh, python, tailscale)
-airc doctor --connect   # pre-flight before `airc connect` (also probes cached host)
+airc doctor --join      # pre-flight before `airc join` (also probes cached host)
 airc doctor --health    # LIVE bus health AFTER you've joined
 airc doctor --tests     # full integration suite (~245 assertions, 32 scenarios)
 airc doctor --fix       # repair recoverable issues (currently: gh auth re-login)
@@ -357,7 +357,7 @@ airc version    # short sha, branch, commit subject, install dir
 airc update     # git-pull install dir + refresh skill symlinks (idempotent)
 ```
 
-`airc update` invokes the bundled `install.sh` so new skills appear in `~/.claude/skills/` without a full re-curl. Running monitor keeps old code until you `airc teardown && airc join` to bounce it.
+`airc update` invokes the bundled `install.sh` so new skills appear in `~/.claude/skills/` without a full re-curl. Running monitor keeps old code until you run `airc join` to repair/restart the current scope.
 
 ## Core Commands
 
@@ -434,14 +434,14 @@ The Claude Code skills are auto-installed by `install.sh` so the AI can run airc
 | [reminder](skills/reminder/) | `/reminder <seconds\|off\|pause>` | Control silence-nudge |
 | [teardown](skills/teardown/) | `/teardown [--flush]` | Kill scope's processes |
 | [uninstall](skills/uninstall/) | `/uninstall [--yes] [--purge]` | Fully remove airc (clone, symlinks, daemon, processes); leaves per-project state unless `--purge` |
-| [repair](skills/repair/) | `/repair [invite]` | Full re-pair (teardown --flush + reconnect) |
+| [repair](skills/repair/) | `/repair [invite]` | Full re-pair when identity/pairing state is corrupt |
 | [update](skills/update/) | `/update` | Pull latest on current channel + refresh skills |
 | [canary](skills/canary/) | `/canary` | Switch to canary channel + pull (opt-in pre-merge testing) |
 | [version](skills/version/) | `/version` | Short sha + install path |
 | [doctor](skills/doctor/) | `/doctor [scenario]` | Environment health + integration suite (auto-fixes what it can) |
 | [tests](skills/tests/) | `/tests [scenario]` | Pure test runner (alias of doctor's test path) |
 
-The `airc` binary itself accepts both verb families at the bash level — `airc connect` still dispatches to the same code as `airc join`, `airc send` still works for `airc msg`, etc. The skill rename only affects the slash-command surface AIs see in `/<tab-complete>`.
+The public surface is IRC-shaped: `join`, `msg`, `list`, `part`, `quit`, `nick`, `away`, `whois`, and `inbox`. Use `airc join` to create, join, resume, or repair a room for the current scope.
 
 ## Identity & State
 

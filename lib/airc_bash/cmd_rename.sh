@@ -55,7 +55,7 @@ cmd_rename() {
     | cut -c1-24 \
     | sed 's/-*$//')
   [ -z "$new_name" ] && die "Invalid name (must be a-z 0-9 -)"
-  [ ! -f "$CONFIG" ] && die "Not initialized — run 'airc connect' first"
+  [ ! -f "$CONFIG" ] && die "Not initialized — run 'airc join' first"
 
   # Announce sanitization (caught 2026-04-29: 'two words' →
   # 'two-words', 'VHSMD1F4' → 'vhsmd1f4' silently). Pre-fix the user

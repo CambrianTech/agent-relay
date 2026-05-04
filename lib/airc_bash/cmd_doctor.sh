@@ -12,12 +12,12 @@ cmd_doctor() {
   #                            manager this platform uses, so any AI
   #                            reading the output can `proactively fix
   #                            recoverable issues` (per /doctor SKILL.md).
-  #   airc doctor --connect -- pre-flight before `airc connect`. Runs
-  #                            the default health probes PLUS connect-
+  #   airc doctor --join    -- pre-flight before `airc join`. Runs
+  #                            the default health probes PLUS join-
   #                            specific checks (tailscale UP not just
   #                            installed, gist API reachable, port free,
   #                            cached host_target reachable). Issue #80.
-  #                            Use case: airc doctor --connect && airc connect
+  #                            Use case: airc doctor --join && airc join
   #   airc doctor --tests   -- run the integration test suite (the
   #   airc doctor tests        prior default behavior; aliased on the
   #                            dispatch via `tests|test`).
@@ -27,14 +27,14 @@ cmd_doctor() {
       echo "  airc doctor              environment health check (default)"
       echo "  airc doctor --fix        attempt to repair recoverable issues"
       echo "                           (currently: gh auth re-login if invalid)"
-      echo "  airc doctor --connect    pre-flight checks for 'airc connect'"
+      echo "  airc doctor --join       pre-flight checks for 'airc join'"
       echo "  airc doctor --health     LIVE bus health (after join — daemon, gh"
       echo "                           rate-limit headroom, channel last-recv age)"
       echo "  airc doctor --tests      run the integration test suite"
       echo "                           (aliases: tests, test, run, suite)"
       return 0 ;;
     --tests|-t|tests|test|run|suite) shift; _doctor_run_tests "$@"; return ;;
-    --connect|-c|connect)            shift; _doctor_connect_preflight "$@"; return ;;
+    --join|-j|join|--connect|-c|connect) shift; _doctor_connect_preflight "$@"; return ;;
     --health|-H|health)              shift; _doctor_health "$@"; return ;;
     --fix|fix)                       shift; _doctor_fix "$@"; return ;;
   esac
@@ -261,17 +261,17 @@ _doctor_probe_tailscale() {
 }
 
 _doctor_connect_preflight() {
-  # Pre-flight check before `airc connect`. Issue #80. Runs the default
-  # prereq probes PLUS connect-specific checks. Output is a checklist
+  # Pre-flight check before `airc join`. Issue #80. Runs the default
+  # prereq probes PLUS join-specific checks. Output is a checklist
   # with fix commands; exit non-zero if any blocking issue. Use case:
   #
-  #   airc doctor --connect && airc connect
+  #   airc doctor --join && airc join
   #
   # Catches the silent-fail classes that produced #78 / #85 / #79
   # cascades for first-time users and surfaced as detective-work bugs.
   echo ""
-  echo "  airc doctor --connect -- pre-flight checks"
-  echo "  ------------------------------------------"
+  echo "  airc doctor --join -- pre-flight checks"
+  echo "  ---------------------------------------"
   echo ""
   local issues=0
   local mgr; mgr=$(_doctor_detect_pkgmgr)
@@ -330,7 +330,7 @@ _doctor_connect_preflight() {
     fi
   fi
 
-  # ── Connect-specific: tailscale state. The default doctor only marks
+  # ── Join-specific: tailscale state. The default doctor only marks
   # tailscale as "info" since it's optional for LAN-only mesh. In
   # --connect mode, if there's a saved host_target in tailnet CGNAT
   # range, Tailscale being UP is a HARD requirement.
@@ -362,7 +362,7 @@ _doctor_connect_preflight() {
     _doctor_probe_tailscale "$mgr"  # optional, info-only
   fi
 
-  # ── Connect-specific: AIRC_PORT free or auto-shift available ──
+  # ── Join-specific: AIRC_PORT free or auto-shift available ──
   local target_port="${AIRC_PORT:-7547}"
   if [ -n "$(port_listeners "$target_port")" ]; then
     printf "  [info] port %s busy -- airc will auto-shift to next free port\n" "$target_port"
@@ -370,7 +370,7 @@ _doctor_connect_preflight() {
     printf "  [ok] port %s available for hosting\n" "$target_port"
   fi
 
-  # ── Connect-specific: cached host_target reachable (resume scenario) ──
+  # ── Join-specific: cached host_target reachable (resume scenario) ──
   if [ -n "$prior_host_target" ]; then
     local probe_key="$IDENTITY_DIR/ssh_key"
     if [ -f "$probe_key" ]; then
@@ -388,10 +388,10 @@ _doctor_connect_preflight() {
 
   echo ""
   if [ "$issues" -eq 0 ]; then
-    echo "  ✓ READY -- airc connect should work."
+    echo "  ✓ READY -- airc join should work."
     return 0
   else
-    echo "  ✗ BLOCKED on $issues issue(s) -- fix the items above before 'airc connect'."
+    echo "  ✗ BLOCKED on $issues issue(s) -- fix the items above before 'airc join'."
     return 1
   fi
 }
@@ -497,7 +497,7 @@ _doctor_health() {
       printf "  [ok] daemon loaded for this scope\n"
     else
       printf "  [BLOCKED] daemon installed for this scope but NOT loaded/running\n"
-      printf "           Fix: airc daemon restart  (or airc daemon install if restart fails)\n"
+      printf "           Fix: airc join  (repairs this scope's daemon/monitor)\n"
       issues=$((issues+1))
     fi
   else
@@ -566,7 +566,7 @@ _doctor_health() {
           warns=$((warns+1))
         else
           printf "  [BLOCKED] #%s — last bearer recv %ds ago (>30min — bearer is wedged)\n" "$channel" "$age"
-          printf "           Fix: airc teardown && airc join  (re-establishes bearer poll loop)\n"
+          printf "           Fix: airc join  (repairs this scope's monitor)\n"
           issues=$((issues+1))
         fi
       fi

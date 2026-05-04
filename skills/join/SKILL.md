@@ -137,7 +137,7 @@ Monitor subprocess dies on machine sleep. Recommend ONE option to the user:
 | `GitHub rate-limited — retry in 5-15 min (token is fine)` | Tell user verbatim. Do NOT re-probe. |
 | `permission denied` on gist read | Token missing `gist` scope: `gh auth refresh -s gist` |
 | `Resume aborted — re-pair required` | `airc teardown --flush && airc join <invite>` (error reconstructs the invite) |
-| `awaiting first event` >2min after first peer joined | `airc teardown && airc join` (gh poll loop stalled) |
+| `awaiting first event` >2min after first peer joined | `airc join` (repairs this scope's monitor) |
 | Broadcast lands locally but peers don't see it | `gh api gists/<gist-id> --jq '.files["messages.jsonl"].content'` — if absent, check `airc logs --since 5m` for `[QUEUED]` markers |
 | Port collision on host | `AIRC_PORT=7548 airc join` (rare; TCP pair-handshake only) |
 

@@ -73,9 +73,33 @@ ensure_channel_subscribed_with_gist() {
   # scope already knows the channel→gist mapping, trust that first: a
   # daemon restart must not block on GitHub discovery just to re-subscribe
   # to a room that is already in config.
-  local _gid
-  _gid=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
-         --config "$CONFIG" --channel "$channel" 2>/dev/null || true)
+  local _gid=""
+  # For the primary hosted room, the room marker is stronger local truth
+  # than channel_gists. A poisoned/stale channel_gists entry used to make
+  # a bounce create a third duplicate even though room_gist_id still
+  # pointed at the prior successful room. Prefer the durable room marker
+  # first; then fall back to channel_gists; then finally ask GitHub.
+  if [ -f "$AIRC_WRITE_DIR/room_name" ] && [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
+    local _marker_room _marker_gid
+    _marker_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null || true)
+    _marker_gid=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
+    if [ "$_marker_room" = "$channel" ] && printf '%s' "$_marker_gid" | grep -qE '^[0-9a-f]{32}$'; then
+      _gid="$_marker_gid"
+    fi
+  fi
+  if [ -z "$_gid" ]; then
+    _gid=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
+           --config "$CONFIG" --channel "$channel" 2>/dev/null || true)
+  fi
+  if [ -n "$_gid" ] && [ "${AIRC_NO_DISCOVERY:-0}" = "1" ] && [ ! -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
+    # AIRC_NO_DISCOVERY is a host-election guard, not permission to
+    # believe poisoned routing state. If this scope has no durable
+    # room marker left and only channel_gists claims a target, re-run
+    # the canonical resolver before hosting. Otherwise a stale/bogus
+    # channel_gists entry creates a fresh duplicate room on every
+    # bounce, which is exactly the split-brain failure join must heal.
+    _gid=""
+  fi
   if [ -z "$_gid" ]; then
     _gid=$("$AIRC_PYTHON" -m airc_core.channel_gist resolve \
            --channel "$channel" --create-if-missing 2>"$_err")
@@ -136,7 +160,7 @@ cmd_connect() {
   # AIRC_ROOM_INTENT: re-exec env var preserving the user's --room
   # across a stale-host-takeover exec. Pre-fix this was lost on every
   # self-heal: user typed `airc join --room qa-foo`, we exec'd back
-  # into `airc connect` with NO ARGS, auto-scope decided based on cwd
+  # into `airc join` with NO ARGS, auto-scope decided based on cwd
   # instead. Treat the env var as if --room was passed (since it was,
   # one process ago).
   if [ -n "${AIRC_ROOM_INTENT:-}" ] && [ "$room_explicit" = "0" ]; then
@@ -181,11 +205,11 @@ cmd_connect() {
   while [ $# -gt 0 ]; do
     case "$1" in
       -h|--help)
-        echo "Usage: airc connect [target] [flags]"
-        echo "  airc connect                   auto-discover mesh on your gh account"
-        echo "  airc connect <gist-id>         join via shared gist id (cross-account)"
-        echo "  airc connect <mnemonic>        join via humanhash phrase (same account)"
-        echo "  airc connect <invite-string>   join via inline invite (legacy)"
+        echo "Usage: airc join [target] [flags]"
+        echo "  airc join                      join or create the room for this scope"
+        echo "  airc join <gist-id>            join via shared gist id"
+        echo "  airc join <mnemonic>           join via humanhash phrase"
+        echo "  airc join <invite-string>      join via inline invite"
         echo ""
         echo "Flags:"
         echo "  --room <name>                  set channel intent (auto-scoped from cwd if absent)"
@@ -279,7 +303,7 @@ cmd_connect() {
       fi
     fi
     if [ "$_add_subscription" = "1" ]; then
-      echo "  airc connect: monitor already running; subscribing to additional room #${room_name}..."
+      echo "  airc join: monitor already running; subscribing to additional room #${room_name}..."
       # Add #room_name to subscribed_channels + resolve its gist
       # (create if missing). The bearer for this channel will be
       # picked up on the next _monitor_multi_channel cycle (which
@@ -304,7 +328,7 @@ cmd_connect() {
     # A live monitor is not automatically a correct monitor. If this
     # scope is still mapped to a non-canonical duplicate gist, the
     # short-circuit would strand the tab on a solo island forever:
-    # `airc connect` says "already running" even though discovery would
+    # `airc join` says "already running" even though discovery would
     # now converge on the durable room gist. Repair that locally by
     # stopping only this scope's recorded monitor PIDs, updating the
     # stale channel_gists entries, and falling through to normal
@@ -321,7 +345,7 @@ cmd_connect() {
         [ -z "$_gid" ] && continue
         _canonical_gid=$(_mesh_find_any "$_ch")
         if [ -n "$_canonical_gid" ] && [ "$_canonical_gid" != "$_gid" ]; then
-          echo "  airc connect: running monitor is on stale #${_ch} gist $_gid; canonical is $_canonical_gid."
+          echo "  airc join: running monitor is on stale #${_ch} gist $_gid; canonical is $_canonical_gid."
           "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
             --config "$CONFIG" --channel "$_ch" --gist-id "$_canonical_gid" 2>/dev/null || true
           _repair_running_monitor=1
@@ -330,7 +354,7 @@ cmd_connect() {
     fi
     if [ "$_repair_running_monitor" = "1" ]; then
       local _repair_pids; _repair_pids=$(cat "$_early_pidfile" 2>/dev/null | tr '\n' ' ')
-      echo "  airc connect: restarting this scope's monitor to leave the solo island."
+      echo "  airc join: restarting this scope's monitor to leave the solo island."
       for _p in $_repair_pids; do
         kill "$_p" 2>/dev/null || true
         for _c in $(proc_children "$_p" 2>/dev/null); do
@@ -341,16 +365,37 @@ cmd_connect() {
       sleep 1
     else
     local _early_pids; _early_pids=$(cat "$_early_pidfile" 2>/dev/null | tr '\n' ' ')
-    echo "  airc connect: this scope's monitor is already running (PIDs: $_early_pids)."
-    echo "    To stop it:        airc teardown"
-    echo "    To restart it:     airc daemon restart   # or rerun airc connect if no daemon"
-    echo "    To check it:       airc status"
-    echo "    To catch up:       airc inbox"
+    echo "  airc join: already joined in this scope (monitor PIDs: $_early_pids)."
+    echo "    Status: airc status"
+    echo "    Inbox:  airc inbox"
     return 0
     fi
   fi
   # Stale or absent pidfile — leave for the canonical cleanup block
   # below to remove + proceed normally with the connect flow.
+
+  # User-facing recovery rule: `airc join` is the one command. If this
+  # scope has an installed daemon but no live monitor, bounce the daemon
+  # here and verify process evidence. Do not make the user remember
+  # `airc daemon restart`, and do not do this from inside the daemon
+  # process itself (AIRC_BACKGROUND_OK=1), or the daemon would restart
+  # itself before it has a chance to write pidfiles.
+  if [ -z "${AIRC_BACKGROUND_OK:-}" ] \
+     && command -v airc_daemon_is_installed_for_scope >/dev/null 2>&1 \
+     && airc_daemon_is_installed_for_scope "$AIRC_WRITE_DIR" 2>/dev/null; then
+    echo "  airc join: monitor is not running; repairing this scope's daemon..."
+    AIRC_HOME="$AIRC_WRITE_DIR" cmd_daemon restart >/dev/null 2>&1 || true
+    local _join_repair_i
+    for _join_repair_i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+      sleep 2
+      if [ "$(_monitor_alive_with_bearer_fallback "$_early_pidfile")" = "yes" ]; then
+        echo "  ✓ airc join repaired the daemon for this scope."
+        echo "    Check: airc status"
+        return 0
+      fi
+    done
+    echo "  ⚠ airc join could not verify daemon recovery; continuing in foreground." >&2
+  fi
 
   # Pre-flight: gh auth check. The gh keyring can silently invalidate
   # (token revoked / 2FA flow expired / brew upgrade replaced gh
@@ -489,7 +534,7 @@ cmd_connect() {
   trap '
     {
       echo ""
-      echo "❌ airc connect: stdout pipe closed — no notification consumer."
+      echo "❌ airc join: stdout pipe closed — no notification consumer."
       echo ""
       echo "   Inbound peer messages would have been silently lost. Most"
       echo "   common cause: airc was launched as a one-shot bash exec,"
@@ -499,9 +544,9 @@ cmd_connect() {
       echo "   silent failure — looks fine, is broken."
       echo ""
       echo "   Right launchers:"
-      echo "     • Claude Code skill:   /airc:connect <invite>"
-      echo "     • Monitor tool:        Monitor(persistent=true, command=\"airc connect <invite>\")"
-      echo "     • Interactive shell:   just type \`airc connect <invite>\` at a TTY"
+      echo "     • Claude Code skill:   /airc:join <invite>"
+      echo "     • Monitor tool:        Monitor(persistent=true, command=\"airc join <invite>\")"
+      echo "     • Interactive shell:   just type \`airc join <invite>\` at a TTY"
       echo ""
       echo "   Bypass for legitimate background use (systemd + log tail,"
       echo "   tests): export AIRC_BACKGROUND_OK=1"
@@ -530,14 +575,14 @@ cmd_connect() {
   fi
 
   # Auto-teardown any stale airc process in this scope before starting fresh.
-  # Previously users had to run `airc teardown` manually before `airc connect`
+  # Previously users had to run `airc teardown` manually before `airc join`
   # if a prior monitor was still around — easy to forget, often resulted in
-  # duplicate monitors or port collisions. Now a single `airc connect` or
+  # duplicate monitors or port collisions. Now a single `airc join` or
   # `airc resume` does the right thing.
   # #292 fix: refuse to stomp a live monitor. Pre-fix this block
   # auto-killed any PIDs in airc.pid before continuing — which silently
   # destroyed a live monitor in a sibling shell when the user ran
-  # `airc connect` from a second terminal to verify state. That made
+  # `airc join` from a second terminal to verify state. That made
   # multi-tab sanity-checking destructive. Post-fix: detect liveness,
   # print a one-liner pointing to the right tools, exit 0 cleanly.
   # Stale pidfile (no live PIDs) still gets cleaned up + we proceed.
@@ -565,9 +610,9 @@ cmd_connect() {
       fi
     done
     if [ "$any_alive" = "1" ]; then
-      echo "  airc connect: this scope's monitor is already running (PIDs:$alive_pids)."
+      echo "  airc join: this scope's monitor is already running (PIDs:$alive_pids)."
       echo "    To stop it:        airc teardown"
-      echo "    To restart it:     airc teardown && airc connect"
+      echo "    To restart it:     airc join"
       echo "    To check it:       airc status"
       return 0
     fi
@@ -682,8 +727,8 @@ cmd_connect() {
           printf '    %s   %s\n      mnemonic: %s\n' "$_id" "$_desc" "$_hh"
         done
         echo ""
-        echo "  Pick one to join:  airc connect <id>"
-        echo "  Host a new mesh:   AIRC_NO_DISCOVERY=1 airc connect --no-general"
+        echo "  Pick one to join:  airc join <id>"
+        echo "  Host a new mesh:   AIRC_NO_DISCOVERY=1 airc join --no-general"
         exit 0
       fi
     fi
@@ -691,7 +736,7 @@ cmd_connect() {
 
   # ── Mnemonic resolver (humanhash → gist id, same gh account) ─────
   # Joel's UX target: a friend (or your own other tab) can type
-  #   airc connect oregon-uncle-bravo-eleven
+  #   airc join oregon-uncle-bravo-eleven
   # instead of pasting a 32-char hex gist id. Humanhash is one-way
   # (XOR-fold of the gist id bytes), so we can't reverse it directly —
   # but we CAN walk gh's gist list, hash each id, and pick the match.
@@ -708,7 +753,7 @@ cmd_connect() {
   # accounts differ.
   if [ -n "$target" ] && echo "$target" | grep -qE '^[a-z]+(-[a-z]+){2,}$'; then
     if ! command -v gh >/dev/null 2>&1; then
-      die "Mnemonic '$target' lookup needs the 'gh' CLI. Install gh + 'gh auth login', or use the gist id directly: airc connect <id>"
+      die "Mnemonic '$target' lookup needs the 'gh' CLI. Install gh + 'gh auth login', or use the gist id directly: airc join <id>"
     fi
     local _matched_gist_id=""
     while IFS=$'\t' read -r _gid _; do
@@ -723,7 +768,7 @@ cmd_connect() {
       echo "  Resolved mnemonic '$target' → gist $_matched_gist_id"
       target="$_matched_gist_id"
     else
-      die "Mnemonic '$target' didn't match any airc gist on this gh account. If your friend's gist is on a different gh, paste the gist id directly: airc connect <id>"
+      die "Mnemonic '$target' didn't match any airc gist on this gh account. If your friend's gist is on a different gh, paste the gist id directly: airc join <id>"
     fi
   fi
 
@@ -993,7 +1038,7 @@ cmd_connect() {
       ssh_target="${ssh_target%:*}"
     fi
 
-    [ -z "$peer_name" ] || [ -z "$ssh_target" ] && die "Format: airc connect name@user@host"
+    [ -z "$peer_name" ] || [ -z "$ssh_target" ] && die "Format: airc join name@user@host"
 
     # Multi-address override: if the gist envelope carried host.addresses[]
     # and host.machine_id, use peer_pick_address to choose the cheapest
@@ -1205,7 +1250,7 @@ except Exception:
         printf '%s\n' "$response" | sed 's/^/    /' >&2
         echo "" >&2
       fi
-      die "Can't reach $peer_host_only:$peer_port. Is the host running 'airc connect'?"
+      die "Can't reach $peer_host_only:$peer_port. Is the host running 'airc join'?"
     fi
 
     # Authorize host's SSH pubkey (for the joiner->host auth direction).
@@ -1407,7 +1452,7 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
     local _printed_long=0
     if [ "$use_gist" != "1" ]; then
       echo "  On the other machine:"
-      echo "    airc connect $_invite_long"
+      echo "    airc join $_invite_long"
       _printed_long=1
     fi
 
@@ -1463,6 +1508,16 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
         # gist regardless of what was already there. With find-first,
         # all hosts on the gh account converge on the oldest canonical.
         local _existing_room_gid="${AIRC_ADOPT_GIST:-}"
+        if [ -z "$_existing_room_gid" ] \
+           && [ -f "$AIRC_WRITE_DIR/room_name" ] \
+           && [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
+          local _marker_room _marker_gid
+          _marker_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null || true)
+          _marker_gid=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null || true)
+          if [ "$_marker_room" = "$room_name" ] && printf '%s' "$_marker_gid" | grep -qE '^[0-9a-f]{32}$'; then
+            _existing_room_gid="$_marker_gid"
+          fi
+        fi
         if [ "$use_room" = "1" ]; then
           # Use full retry so gh's gist-listing eventual consistency
           # (a just-created gist may not appear in `gh gist list` for
@@ -1482,6 +1537,15 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
           # would block on it. When AIRC_NO_DISCOVERY=1, skip the
           # resolve and go straight to create_new — same as the
           # early mesh-find gate at line ~568.
+          if [ -z "$_existing_room_gid" ] && [ "${AIRC_NO_DISCOVERY:-0}" = "1" ]; then
+            local _configured_gid
+            _configured_gid=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
+                              --config "$CONFIG" --channel "$room_name" 2>/dev/null || true)
+            if [ -n "$_configured_gid" ] && [ ! -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
+              _existing_room_gid=$("$AIRC_PYTHON" -m airc_core.channel_gist find \
+                                   --channel "$room_name" 2>/dev/null || true)
+            fi
+          fi
           if [ -z "$_existing_room_gid" ] && [ "${AIRC_NO_DISCOVERY:-0}" != "1" ]; then
             local _host_preflight_rc=0
             _existing_room_gid=$("$AIRC_PYTHON" -m airc_core.channel_gist host-preflight \
@@ -1606,10 +1670,16 @@ JSON
         else
           _gist_url=$(gh gist create -d "$_gist_desc" "$_gist_tmp" 2>/dev/null | tail -1)
         fi
-        rm -rf "$_gist_tmpdir"
         if [ -n "$_gist_url" ]; then
           local _gist_id="${_gist_url##*/}"
           local _hh; _hh=$(humanhash "$_gist_id" 2>/dev/null)
+          if [ "$use_room" = "1" ]; then
+            "$AIRC_PYTHON" -m airc_core.channel_gist remember-created \
+              --channel "$room_name" \
+              --gist-id "$_gist_id" \
+              --description "$_gist_desc" \
+              --payload-file "$_gist_tmp" 2>/dev/null || true
+          fi
           # Persist the gist id locally so cmd_part can manage the
           # mesh gist on graceful host exit (mesh/room mode only —
           # invite mode is one-shot and the joiner-pair flow already
@@ -1846,11 +1916,11 @@ JSON
             esac
 
             echo "  Hosting #${room_name} (gh-account substrate)."
-            echo "  Other agents on your gh account auto-join via:  airc connect"
+            echo "  Other agents on your gh account auto-join via:  airc join"
             echo "  Cross-account share (rare):"
-            echo "    airc connect $_gist_id"
+            echo "    airc join $_gist_id"
             [ -n "$_hh" ] && echo "      # mnemonic: $_hh"
-            echo "    airc connect $_invite_long"
+            echo "    airc join $_invite_long"
             echo ""
             echo "  (Room gist: $_gist_url — persistent; deleted on 'airc part'.)"
             # First-time-host daemon hint (#382). The reconnect-loop in the
@@ -1871,9 +1941,9 @@ JSON
           else
             echo "  On the other machine (pick whichever is easiest to share):"
             echo ""
-            echo "    airc connect $_gist_id"
+            echo "    airc join $_gist_id"
             [ -n "$_hh" ] && echo "      # mnemonic: $_hh"
-            echo "    airc connect $_invite_long"
+            echo "    airc join $_invite_long"
             echo ""
             echo "  (Gist: $_gist_url — secret, single-use; delete after pairing.)"
           fi
@@ -1881,9 +1951,10 @@ JSON
           echo ""
           echo "  ⚠  Gist push failed (gh auth?). Falling back to long invite:"
           if [ "$_printed_long" = "0" ]; then
-            echo "    airc connect $_invite_long"
+            echo "    airc join $_invite_long"
           fi
         fi
+        rm -rf "$_gist_tmpdir"
       fi
     fi
     echo ""

@@ -68,8 +68,8 @@ Don't bury this in a wall of text; it's the one thing that genuinely still requi
 
 - `No git checkout at <path>` — binary was installed without git (zip download, etc). Tell the user to reinstall via the curl | bash path.
 - `git pull failed` — uncommitted changes or diverged branch in the install dir. User needs to resolve the checkout manually.
-- `airc teardown` errors during the bounce — surface verbatim; the bounce is half-done. User can manually `airc teardown && airc join`.
-- New `airc join` fails to rejoin — surface verbatim; the user is now disconnected. Fall back to: `airc teardown && airc join` (Claude Monitor) or the Codex background form above.
+- `airc join` errors during the bounce — surface verbatim; the scope may need `airc doctor --health`.
+- New `airc join` fails to rejoin — surface verbatim; the user is now disconnected. Fall back to `/repair <invite>` only if identity/pairing state is corrupt.
 
 ## When to use
 
@@ -80,5 +80,5 @@ Don't bury this in a wall of text; it's the one thing that genuinely still requi
 ## Notes
 
 - Alias: `airc upgrade`, `airc pull` both dispatch to the same code.
-- The bounce in step 2 only restarts the CURRENT scope's monitor. Other tabs running airc in different scopes/repos still need their own `/update` (or a `airc teardown && airc join` from their own working dir). They are not interrupted by this update.
+- The bounce in step 2 only restarts the CURRENT scope's monitor. Other tabs running airc in different scopes/repos still need their own `/update` (or `airc join` from their own working dir). They are not interrupted by this update.
 - `AIRC_UPDATE_NO_BOUNCE=1` in env skips steps 1-3 (degenerate to old "tell the user to bounce" behavior). Useful for scripted batch updates where the caller will handle restart timing.

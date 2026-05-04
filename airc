@@ -5,8 +5,8 @@
 # IP routing through Tailscale's WireGuard tunnel. See
 # project_airc_transport_architecture memory for the rationale.
 #
-# airc connect              → host, wait for peers
-# airc connect name@host    → join a host
+# airc join                 → join or create the room
+# airc join name@host       → join an invite
 # airc send peer "message"  → send a message
 
 set -euo pipefail
@@ -358,7 +358,7 @@ unset _gh_resolved
 
 AIRC_WRITE_DIR="$(detect_scope)"
 
-# Re-exec airc connect into a different mode (rejoin into another tab's
+# Re-exec airc join into a different mode (rejoin into another tab's
 # gist or take over as host). Centralizes (a) the sentinel marker for
 # the Windows daemon launcher (#203/#204 — distinguishes intentional
 # re-exec from "actual crash"), (b) AIRC_NAME preservation across the
@@ -385,12 +385,12 @@ _reexec_into() {
     exec env AIRC_NO_DISCOVERY=1 \
       ${_name:+AIRC_NAME="$_name"} \
       ${_intent:+AIRC_ROOM_INTENT="$_intent"} \
-      "$0" connect "$@"
+      "$0" join "$@"
   else
     exec env \
       ${_name:+AIRC_NAME="$_name"} \
       ${_intent:+AIRC_ROOM_INTENT="$_intent"} \
-      "$0" connect "$@"
+      "$0" join "$@"
   fi
 }
 
@@ -584,7 +584,7 @@ _validate_peer_name() {
 
 ensure_init() {
   [ -f "$CONFIG" ] && return 0
-  die "Not initialized ($AIRC_WRITE_DIR). Run: airc connect"
+  die "Not initialized ($AIRC_WRITE_DIR). Run: airc join"
 }
 
 # config CRUD via airc_core.config — proper argparse --flags so paths
@@ -1133,7 +1133,7 @@ _read_parted_rooms()  { [ -f "$1/config.json" ] && "$AIRC_PYTHON" -m airc_core.c
 _record_parted_room() { [ -f "$1/config.json" ] && "$AIRC_PYTHON" -m airc_core.config record_parted --config "$1/config.json" --room "$2" 2>/dev/null || true; }
 _clear_parted_room()  { [ -f "$1/config.json" ] && "$AIRC_PYTHON" -m airc_core.config clear_parted --config "$1/config.json" --room "$2" 2>/dev/null || true; }
 
-# Spawn the #general sidecar (issue #121) — a parallel `airc connect`
+# Spawn the #general sidecar (issue #121) — a parallel `airc join`
 # in a sibling scope (.general suffix) so the primary tab is in BOTH
 # its project room AND the lobby. Identity NICK is shared via AIRC_NAME;
 # ssh_key + peer records are per-scope. Each subscription gets its own
@@ -1578,11 +1578,11 @@ monitor() {
         echo ""
         if [ "$_daemon_present" = "1" ]; then
           echo "airc: mesh disconnected — #${saved_room:-?} dead $consecutive_timeouts cycles; daemon restart will self-heal"
-          echo "  ⚠  Exiting airc connect — daemon restart will trigger self-heal" >&2
+          echo "  ⚠  Exiting airc join — daemon restart will trigger self-heal" >&2
         else
           echo "airc: mesh disconnected — #${saved_room:-?} dead $consecutive_timeouts cycles; NO DAEMON running, restart with: airc join"
           echo "airc:   (for auto-recovery: airc daemon restart || airc daemon install)"
-          echo "  ⚠  Exiting airc connect — NO DAEMON running; rerun 'airc join' to reconnect" >&2
+          echo "  ⚠  Exiting airc join — NO DAEMON running; rerun 'airc join' to reconnect" >&2
         fi
         exit 99
       fi
@@ -2051,7 +2051,7 @@ except Exception:
           recv_silent=$(( now - freshest_recv ))
         fi
         if [ "$recv_silent" -ge "$recv_threshold" ]; then
-          printf '[%s] airc: Receive silence — no inbound events in %ss across any bearer. Mesh may be partitioned. Try: airc peers; airc logs 20; airc teardown && airc connect\n' "$(timestamp)" "$recv_silent"
+          printf '[%s] airc: Receive silence — no inbound events in %ss across any bearer. Mesh may be partitioned. Try: airc peers; airc logs 20; airc join\n' "$(timestamp)" "$recv_silent"
           last_recv_warned="$now"
         fi
       fi
@@ -2354,7 +2354,7 @@ case "${1:-help}" in
     "$AIRC_PYTHON" -c "import airc_core; print(f'airc_core import ok: v{airc_core.__version__}')" 2>&1 ;;
   help|--help|-h)
     echo "AIRC — Agentic Internet Relay Chat for AI peers"
-    echo "(IRC verbs work as primary; airc-classic names also accepted)"
+    echo "(IRC verbs are the public interface)"
     echo ""
     echo "  airc join                       Auto-#general: enter the room on your gh account, or host it"
     echo "  airc join --room <name>         Enter (or host) a named channel instead of #general"

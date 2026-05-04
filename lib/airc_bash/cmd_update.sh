@@ -152,7 +152,7 @@ cmd_update() {
       echo "  ⚠  A running airc monitor (PID ${_pid}) is still on the OLD code."
       echo "     Restart to pick up ${after}:"
       echo ""
-      echo "       airc teardown && airc connect"
+      echo "       airc join"
       echo ""
     fi
   fi

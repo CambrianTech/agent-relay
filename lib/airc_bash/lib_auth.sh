@@ -219,7 +219,7 @@ airc_self_heal_gh_auth() {
   # would just hang the process forever.
   if [ ! -t 0 ] || [ ! -t 1 ]; then
     echo "  ✗ Auth broken but stdin/stdout not a TTY — can't run interactive re-auth here." >&2
-    echo "    Re-run an airc CLI command (airc status / airc connect / airc send …)" >&2
+    echo "    Re-run an airc CLI command (airc status / airc join / airc send …)" >&2
     echo "    in your terminal; it will detect the broken auth + trigger the browser." >&2
     return 1
   fi

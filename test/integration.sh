@@ -3718,9 +3718,9 @@ except Exception:
   printf '%s\n' "$block" | grep -q "curl -fsSL" \
     && pass "paste-block contains install one-liner" \
     || fail "paste-block missing install one-liner"
-  printf '%s\n' "$block" | grep -q "airc connect" \
-    && pass "paste-block contains 'airc connect'" \
-    || fail "paste-block missing 'airc connect'"
+  printf '%s\n' "$block" | grep -q "airc join" \
+    && pass "paste-block contains 'airc join'" \
+    || fail "paste-block missing 'airc join'"
   printf '%s\n' "$block" | grep -q "airc msg" \
     && pass "paste-block contains 'airc msg' (first-message hint)" \
     || fail "paste-block missing 'airc msg' (recipient won't know how to be heard)"
@@ -3728,11 +3728,11 @@ except Exception:
     && pass "paste-block contains 'airc part' (clean-exit hint)" \
     || fail "paste-block missing 'airc part'"
 
-  # The connect must reference the actual gist-id (cross-account-safe),
+  # The join must reference the actual gist-id (cross-account-safe),
   # NOT the mnemonic (which only resolves on the same gh account).
-  printf '%s\n' "$block" | grep -qE "airc connect $host_gid" \
+  printf '%s\n' "$block" | grep -qE "airc join $host_gid" \
     && pass "paste-block uses raw gist-id (cross-account safe)" \
-    || fail "paste-block missing the actual gist-id ($host_gid) on the connect line"
+    || fail "paste-block missing the actual gist-id ($host_gid) on the join line"
 
   # $(whoami) must be LITERAL in the printed block — it expands at
   # paste-time on the receiver's shell, not at generation-time on
@@ -3745,7 +3745,7 @@ except Exception:
   # The gist-id in the paste-block must be the host's ACTUAL room gist
   # (extracted to confirm — not a mistake like a stale ID or the long
   # invite string).
-  local connect_gid; connect_gid=$(printf '%s\n' "$block" | grep -oE "airc connect [a-f0-9]{32}" | head -1 | awk '{print $3}')
+  local connect_gid; connect_gid=$(printf '%s\n' "$block" | grep -oE "airc join [a-f0-9]{32}" | head -1 | awk '{print $3}')
   if [ "$connect_gid" = "$host_gid" ]; then
     pass "paste-block gist-id matches host's published room gist"
   else

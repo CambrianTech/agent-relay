@@ -21,7 +21,7 @@ cmd_kick() {
   # remove the peer file. The kicked peer's tail loop dies on the closed
   # pipe AND any future auth attempts fail because their key is gone from
   # authorized_keys — they can't silently keep operating after a kick.
-  # They can re-pair via airc connect (no ban yet) — for that, see future
+  # They can re-pair via airc join (no ban yet) — for that, see future
   # `airc ban`.
   ensure_init
   local target="${1:-}"
@@ -89,5 +89,5 @@ except Exception:
   else
     echo "  Kicked $target ($reason). Peer file gone, but no SSH key recorded for this peer — they were paired before #34's handshake update; their authorized_keys entry survived. Run airc peers to confirm."
   fi
-  echo "  They can re-pair via airc connect; for permanent ban, see future 'airc ban'."
+  echo "  They can re-pair via airc join; for permanent ban, see future 'airc ban'."
 }

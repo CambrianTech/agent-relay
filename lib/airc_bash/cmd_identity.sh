@@ -131,7 +131,7 @@ import json, os
 try:
     c = json.load(open(os.environ["CONFIG"]))
 except Exception:
-    print("  (no config — run airc connect)"); raise SystemExit(0)
+    print("  (no config — run airc join)"); raise SystemExit(0)
 ident = c.get("identity", {}) or {}
 # Render-time truncation. Peer records from before the write-side
 # length caps (#328) may have multi-KB bios that would clutter
