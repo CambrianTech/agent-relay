@@ -60,6 +60,8 @@ _GH_BIN = "gh"
 _MESSAGES_FILE = "messages.jsonl"
 _DEFAULT_POLL_INTERVAL = 15.0  # seconds; tuned for gh rate limit headroom
 _GH_API_TIMEOUT = 10.0          # per-call seconds; total wall time bounded by retry policy
+_LOCAL_BUS_ROOT_ENV = "AIRC_LOCAL_BUS_DIR"
+_DISABLE_LOCAL_BUS_ENV = "AIRC_DISABLE_LOCAL_BUS"
 
 # Rotation thresholds (gh hard limit on a gist file is 1MB; we trim
 # proactively well before that so the next append always has headroom).
@@ -72,6 +74,55 @@ _GH_API_TIMEOUT = 10.0          # per-call seconds; total wall time bounded by r
 # AIRC_GIST_KEEP_LINES) for tests + power users.
 _GIST_MAX_BYTES = 600_000   # rotate at 600KB (40% headroom under 1MB hard limit)
 _GIST_KEEP_LINES = 1000     # keep last 1000 lines after rotation
+
+
+def _safe_gist_id(gist_id: str) -> str:
+    return "".join(c if c.isalnum() else "_" for c in str(gist_id))
+
+
+def _local_bus_enabled(peer_meta: Optional[dict] = None) -> bool:
+    if os.environ.get(_DISABLE_LOCAL_BUS_ENV) == "1":
+        return False
+    if peer_meta and peer_meta.get("disable_local_bus"):
+        return False
+    return True
+
+
+def _local_bus_path(gist_id: str, peer_meta: Optional[dict] = None) -> Optional[str]:
+    if not gist_id or not _local_bus_enabled(peer_meta):
+        return None
+    root = os.environ.get(_LOCAL_BUS_ROOT_ENV)
+    if not root:
+        root = os.path.join(os.path.expanduser("~"), ".airc", "bus", "gh")
+    return os.path.join(root, _safe_gist_id(gist_id), _MESSAGES_FILE)
+
+
+def _local_bus_append(gist_id: str, line: str, peer_meta: Optional[dict] = None) -> tuple[bool, str]:
+    path = _local_bus_path(gist_id, peer_meta)
+    if not path:
+        return (False, "local bus disabled")
+    framed = line if line.endswith("\n") else line + "\n"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, framed.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except OSError as e:
+        return (False, f"local bus append failed: {e}")
+    return (True, "")
+
+
+def _local_bus_read_lines(gist_id: str, peer_meta: Optional[dict] = None) -> list[str]:
+    path = _local_bus_path(gist_id, peer_meta)
+    if not path:
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().splitlines()
+    except OSError:
+        return []
 
 
 def _resolve_gh_bin() -> str:
@@ -551,6 +602,8 @@ class GhBearer(Bearer):
         # Tracks how many lines of messages.jsonl we've already yielded.
         # Resumed from offset_file on first poll if available.
         self._consumed_lines: int = 0
+        self._local_consumed_lines: int = 0
+        self._seen_payloads: set[str] = set()
         # Polling cadence; can be overridden via peer_meta for tests.
         self._poll_interval: float = float(
             peer_meta.get("poll_interval", _DEFAULT_POLL_INTERVAL)
@@ -571,6 +624,7 @@ class GhBearer(Bearer):
         # doesn't reset to disk state mid-stream.
         offset_file = self._peer_meta.get("offset_file")
         self._consumed_lines = self._read_offset(offset_file)
+        self._local_consumed_lines = self._read_offset(self._local_offset_file(offset_file))
 
     def send(self, peer_id: str, channel: str, payload: bytes) -> SendOutcome:
         """Append `payload` to the room gist's messages.jsonl file with
@@ -618,6 +672,7 @@ class GhBearer(Bearer):
                 kind="transient_failure",
                 detail="payload is not utf-8; gh-bearer requires text envelopes",
             )
+        local_ok, local_detail = _local_bus_append(gist_id, framed_str, self._peer_meta)
 
         # Concurrency strategy: retry on BOTH explicit 409 conflicts
         # AND silent-clobber detected via verify-after-write. continuum-
@@ -642,6 +697,11 @@ class GhBearer(Bearer):
         for attempt in range(RETRIES):
             gist, get_kind = _gh_api_get_classified(gist_id)
             if gist is None:
+                if local_ok and get_kind in ("secondary_rate_limit", "transient_failure", "auth_failure"):
+                    return SendOutcome(
+                        kind="delivered",
+                        detail=f"delivered via local bus; gh publish deferred ({get_kind})",
+                    )
                 # GET failed — distinguish permanent (gone) / wait (rate)
                 # / re-auth (auth) / retry (transient). Old code coalesced
                 # all into transient_failure; new path propagates the
@@ -670,6 +730,11 @@ class GhBearer(Bearer):
                 if patch_kind == "conflict":
                     _time.sleep(_jittered_backoff(attempt))
                     continue
+                if local_ok and patch_kind in ("secondary_rate_limit", "transient_failure", "auth_failure"):
+                    return SendOutcome(
+                        kind="delivered",
+                        detail=f"delivered via local bus; gh publish deferred ({patch_kind})",
+                    )
                 # gone / secondary_rate_limit / auth_failure /
                 # transient_failure all propagate as-is.
                 return SendOutcome(kind=patch_kind, detail=detail)
@@ -690,9 +755,14 @@ class GhBearer(Bearer):
             last_detail = "verify-after-write: line not in gist post-PATCH (silent clobber)"
             _time.sleep(_jittered_backoff(attempt))
 
+        if local_ok:
+            return SendOutcome(
+                kind="delivered",
+                detail=f"delivered via local bus; gh conflict after {RETRIES} retries; last: {last_detail}",
+            )
         return SendOutcome(
             kind="transient_failure",
-            detail=f"concurrent-write conflict after {RETRIES} retries; last: {last_detail}",
+            detail=f"concurrent-write conflict after {RETRIES} retries; last: {last_detail}; local bus: {local_detail}",
         )
 
     def recv_stream(self) -> Iterator[ReceivedMessage]:
@@ -720,6 +790,10 @@ class GhBearer(Bearer):
         offset_file = self._peer_meta.get("offset_file")
 
         while not self._closed:
+            for msg in self._drain_local_bus(gist_id, offset_file):
+                yield msg
+                if self._closed:
+                    return
             gist = _gh_api_get(gist_id)
             if gist is None:
                 # Transient gh API failure. Sleep + retry. Caller's
@@ -745,9 +819,13 @@ class GhBearer(Bearer):
                 self._consumed_lines = len(lines)
                 self._on_line_received(self._consumed_lines, offset_file)
             for idx in range(self._consumed_lines, len(lines)):
-                raw = lines[idx].encode("utf-8")
+                line = lines[idx]
+                raw = line.encode("utf-8")
                 self._consumed_lines = idx + 1
                 self._on_line_received(self._consumed_lines, offset_file)
+                if line in self._seen_payloads:
+                    continue
+                self._seen_payloads.add(line)
                 msg = self._parse_envelope(raw)
                 if msg is None:
                     continue
@@ -757,6 +835,31 @@ class GhBearer(Bearer):
             if self._closed:
                 return
             self._sleep_or_break(self._poll_interval)
+
+    @staticmethod
+    def _local_offset_file(offset_file: Optional[str]) -> Optional[str]:
+        if not offset_file:
+            return None
+        return f"{offset_file}.local"
+
+    def _drain_local_bus(self, gist_id: str, offset_file: Optional[str]) -> Iterator[ReceivedMessage]:
+        lines = _local_bus_read_lines(gist_id, self._peer_meta)
+        local_offset = self._local_offset_file(offset_file)
+        if self._local_consumed_lines > len(lines):
+            self._local_consumed_lines = len(lines)
+            self._write_offset(local_offset, self._local_consumed_lines)
+        for idx in range(self._local_consumed_lines, len(lines)):
+            line = lines[idx]
+            self._local_consumed_lines = idx + 1
+            self._write_offset(local_offset, self._local_consumed_lines)
+            if line in self._seen_payloads:
+                continue
+            self._seen_payloads.add(line)
+            msg = self._parse_envelope(line.encode("utf-8"))
+            if msg is None:
+                continue
+            self._last_recv_ts = _time.time()
+            yield msg
 
     @staticmethod
     def _read_offset(offset_file: Optional[str]) -> int:
@@ -775,10 +878,8 @@ class GhBearer(Bearer):
         except ValueError:
             return 0
 
-    def _on_line_received(self, line_count: int, offset_file: Optional[str]) -> None:
-        """Bump last_recv_ts (for liveness) and persist offset (for resume).
-        Persistence failures are swallowed — the bearer keeps streaming."""
-        self._last_recv_ts = _time.time()
+    @staticmethod
+    def _write_offset(offset_file: Optional[str], line_count: int) -> None:
         if offset_file is None:
             return
         try:
@@ -786,6 +887,12 @@ class GhBearer(Bearer):
                 f.write(str(line_count))
         except OSError:
             pass
+
+    def _on_line_received(self, line_count: int, offset_file: Optional[str]) -> None:
+        """Bump last_recv_ts (for liveness) and persist offset (for resume).
+        Persistence failures are swallowed — the bearer keeps streaming."""
+        self._last_recv_ts = _time.time()
+        self._write_offset(offset_file, line_count)
 
     @staticmethod
     def _parse_envelope(raw_line: bytes) -> Optional[ReceivedMessage]:
