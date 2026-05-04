@@ -294,12 +294,53 @@ cmd_connect() {
       fi
       return 0
     fi
+
+    # A live monitor is not automatically a correct monitor. If this
+    # scope is still mapped to a non-canonical duplicate gist, the
+    # short-circuit would strand the tab on a solo island forever:
+    # `airc connect` says "already running" even though discovery would
+    # now converge on the durable room gist. Repair that locally by
+    # stopping only this scope's recorded monitor PIDs, updating the
+    # stale channel_gists entries, and falling through to normal
+    # discovery. This is intentionally narrower than `airc teardown`:
+    # no gist deletion, no identity/peer/message wipe, no cross-scope
+    # process matching.
+    local _repair_running_monitor=0
+    if [ -f "$CONFIG" ] && command -v gh >/dev/null 2>&1; then
+      local _map_lines _line _ch _gid _canonical_gid
+      _map_lines=$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
+        --config "$CONFIG" 2>/dev/null || true)
+      while IFS=$'\t' read -r _ch _gid; do
+        [ -z "$_ch" ] && continue
+        [ -z "$_gid" ] && continue
+        _canonical_gid=$(_mesh_find_any "$_ch")
+        if [ -n "$_canonical_gid" ] && [ "$_canonical_gid" != "$_gid" ]; then
+          echo "  airc connect: running monitor is on stale #${_ch} gist $_gid; canonical is $_canonical_gid."
+          "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
+            --config "$CONFIG" --channel "$_ch" --gist-id "$_canonical_gid" 2>/dev/null || true
+          _repair_running_monitor=1
+        fi
+      done <<< "$_map_lines"
+    fi
+    if [ "$_repair_running_monitor" = "1" ]; then
+      local _repair_pids; _repair_pids=$(cat "$_early_pidfile" 2>/dev/null | tr '\n' ' ')
+      echo "  airc connect: restarting this scope's monitor to leave the solo island."
+      for _p in $_repair_pids; do
+        kill "$_p" 2>/dev/null || true
+        for _c in $(proc_children "$_p" 2>/dev/null); do
+          kill "$_c" 2>/dev/null || true
+        done
+      done
+      rm -f "$_early_pidfile" 2>/dev/null || true
+      sleep 1
+    else
     local _early_pids; _early_pids=$(cat "$_early_pidfile" 2>/dev/null | tr '\n' ' ')
     echo "  airc connect: this scope's monitor is already running (PIDs: $_early_pids)."
     echo "    To stop it:        airc teardown"
-    echo "    To restart it:     airc teardown && airc connect"
+    echo "    To restart it:     airc daemon restart   # or rerun airc connect if no daemon"
     echo "    To check it:       airc status"
     return 0
+    fi
   fi
   # Stale or absent pidfile — leave for the canonical cleanup block
   # below to remove + proceed normally with the connect flow.
