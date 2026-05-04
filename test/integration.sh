@@ -2123,6 +2123,24 @@ JSON
     && pass "doctor summary is degraded, not clean healthy" \
     || fail "doctor summary still looked clean ($doctor_out)"
 
+  printf '{"from":"remote-agent","to":"all","ts":"%s","channel":"general","msg":"recent remote proof"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$home/messages.jsonl"
+
+  status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
+  echo "$status_out" | grep -q 'collaboration: DEGRADED (0 peer records; last remote message' \
+    && pass "status reports DEGRADED, not SOLO, when recent remote traffic exists" \
+    || fail "status did not distinguish recent remote traffic from solo island ($status_out)"
+
+  doctor_out=$(AIRC_HOME="$home" "$AIRC" doctor --health 2>&1)
+  echo "$doctor_out" | grep -q 'remote traffic arrived' \
+    && pass "doctor --health reports peer metadata degraded when traffic proves bus is not solo" \
+    || fail "doctor --health still treated recent remote traffic as solo ($doctor_out)"
+
+  peers_out=$(AIRC_HOME="$home" "$AIRC" peers 2>&1)
+  echo "$peers_out" | grep -q 'remote-agent → (broadcast-only)' \
+    && pass "airc peers falls back to recent broadcast-only traffic" \
+    || fail "airc peers hid recent remote traffic when peer records were empty ($peers_out)"
+
   rm -rf /tmp/airc-it-solo
   cleanup_all
 }
