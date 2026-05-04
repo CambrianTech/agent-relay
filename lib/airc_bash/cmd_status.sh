@@ -334,3 +334,75 @@ for line in sys.stdin:
         pass
 "
 }
+
+cmd_inbox() {
+  ensure_init
+
+  local cursor_file="$AIRC_WRITE_DIR/inbox_cursor"
+  local since=""
+  local count="500"
+  local peek=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --since)
+        [ -n "${2:-}" ] || die "--since requires an argument (ISO timestamp or relative like 60s/5m/1h)"
+        since="$2"; shift 2 ;;
+      --since=*)
+        since="${1#--since=}"; shift ;;
+      --count|-n)
+        [ -n "${2:-}" ] || die "--count requires a positive integer"
+        count="$2"; shift 2 ;;
+      --count=*)
+        count="${1#--count=}"; shift ;;
+      --peek)
+        peek=1; shift ;;
+      --reset)
+        mkdir -p "$AIRC_WRITE_DIR"
+        date -u '+%Y-%m-%dT%H:%M:%SZ' > "$cursor_file"
+        echo "airc inbox cursor reset."
+        return 0 ;;
+      -h|--help)
+        echo "Usage: airc inbox [--peek] [--reset] [--since <ts|Ns|Nm|Nh>] [--count N]"
+        echo "  Shows unread messages since this scope's last inbox check."
+        echo "  Advances a per-scope cursor unless --peek is set."
+        echo "  Alias: airc poll, airc codex-poll"
+        return 0 ;;
+      *) die "Unknown inbox option: $1" ;;
+    esac
+  done
+
+  case "$count" in
+    ''|*[!0-9]*) die "inbox --count must be a positive integer (got '$count')" ;;
+    0)           die "inbox --count must be ≥ 1 (got '$count')" ;;
+  esac
+
+  if [ -z "$since" ]; then
+    if [ -f "$cursor_file" ]; then
+      since=$(cat "$cursor_file" 2>/dev/null || true)
+    fi
+    since="${since:-5m}"
+  fi
+
+  local read_started
+  read_started=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+  local out
+  if ! out=$(cmd_logs "$count" --since "$since" 2>&1); then
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out"
+  else
+    echo "No new airc messages since $since"
+  fi
+
+  if [ "$peek" -eq 0 ]; then
+    mkdir -p "$AIRC_WRITE_DIR"
+    local latest
+    latest=$(printf '%s\n' "$out" | sed -n 's/^\[\([^]]*\)\].*/\1/p' | tail -1)
+    printf '%s\n' "${latest:-$read_started}" > "$cursor_file"
+  fi
+}

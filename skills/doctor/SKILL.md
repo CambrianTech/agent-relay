@@ -28,7 +28,7 @@ When something feels wrong, in this order:
 
 1. **`airc doctor --health`** — live bus state. Fast. Catches silent-blackout (rate-limited, daemon crashed, bearer wedged). Green → bus is fine, issue is upstream.
 2. **`airc doctor`** — env regression check. Gh missing, sshd down, python broken.
-3. **`airc logs --since 5m`** — most-recent message context.
+3. **`airc inbox --peek`** — most-recent unread context without advancing the cursor.
 4. **`airc doctor --tests`** — only if 1-3 are green and the bug is reproducible.
 
 ## --health output classes

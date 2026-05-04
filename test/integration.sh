@@ -2956,6 +2956,48 @@ scenario_gh_send_creates_messages_jsonl() {
   cleanup_all
 }
 
+scenario_inbox() {
+  section "inbox cursor tracks unread messages"
+  local root=/tmp/airc-it-inbox
+  local home="$root/state"
+  rm -rf "$root"
+  mkdir -p "$home"
+  echo '{}' > "$home/config.json"
+  {
+    printf '%s\n' '{"ts":"2026-05-04T10:00:00Z","from":"alpha","msg":"first unread"}'
+    printf '%s\n' '{"ts":"2026-05-04T10:01:00Z","from":"beta","msg":"second unread"}'
+  } > "$home/messages.jsonl"
+
+  local out
+  out=$(AIRC_HOME="$home" "$AIRC" inbox --peek --since 2026-05-04T09:59:00Z 2>&1)
+  printf '%s' "$out" | grep -q 'first unread' \
+    && printf '%s' "$out" | grep -q 'second unread' \
+    && pass "inbox --peek shows unread messages" \
+    || fail "inbox --peek missing expected messages: $out"
+  [ ! -f "$home/inbox_cursor" ] \
+    && pass "inbox --peek does not advance cursor" \
+    || fail "inbox --peek unexpectedly wrote cursor"
+
+  out=$(AIRC_HOME="$home" "$AIRC" inbox --since 2026-05-04T09:59:00Z 2>&1)
+  local cursor; cursor=$(cat "$home/inbox_cursor" 2>/dev/null || true)
+  [ "$cursor" = "2026-05-04T10:01:00Z" ] \
+    && pass "inbox advances cursor to newest printed message" \
+    || fail "inbox cursor = '$cursor' (expected newest message ts); output: $out"
+
+  out=$(AIRC_HOME="$home" "$AIRC" inbox 2>&1)
+  printf '%s' "$out" | grep -q 'No new airc messages' \
+    && pass "inbox uses saved cursor on next check" \
+    || fail "inbox did not respect saved cursor: $out"
+
+  printf '%s\n' '{"ts":"2099-05-04T10:02:00Z","from":"gamma","msg":"third unread"}' >> "$home/messages.jsonl"
+  out=$(AIRC_HOME="$home" "$AIRC" poll 2>&1)
+  cursor=$(cat "$home/inbox_cursor" 2>/dev/null || true)
+  printf '%s' "$out" | grep -q 'third unread' \
+    && [ "$cursor" = "2099-05-04T10:02:00Z" ] \
+    && pass "poll alias reads only new messages and advances cursor" \
+    || fail "poll alias failed; cursor='$cursor' output: $out"
+}
+
 scenario_host_msg_publishes_to_gist() {
   requires_gh_auth_or_skip "host_msg_publishes_to_gist" || return
   # End-to-end: full `airc msg` from a host actually publishes to the
@@ -4033,6 +4075,7 @@ case "$MODE" in
   bearer_local) scenario_bearer_local ;;
   bearer_gh) scenario_bearer_gh ;;
   gh_send_creates_messages_jsonl) scenario_gh_send_creates_messages_jsonl ;;
+  inbox) scenario_inbox ;;
   host_msg_publishes_to_gist) scenario_host_msg_publishes_to_gist ;;
   general_has_shared_gist) scenario_general_has_shared_gist ;;
   channel_gist_prefers_single_channel) scenario_channel_gist_prefers_single_channel ;;
@@ -4057,10 +4100,11 @@ case "$MODE" in
     scenario_bearer_ssh_send; scenario_bearer_ssh_recv; scenario_bearer_cli_recv
     scenario_bearer_observability; scenario_bearer_local; scenario_bearer_gh
     scenario_e2e_encryption
+    scenario_inbox
     scenario_custom_room_creates_gist
     scenario_invite_human
     ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|invite_human|all]"; exit 2 ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
 esac
 
 echo
