@@ -384,8 +384,16 @@ _cmd_invite_human() {
   # cross-account-safe form).
   #
   # Output is itself shell-pasteable: comment lines + commands.
-  # Heredoc has a quoted delimiter so $(whoami) doesn't expand at
-  # generation time; it expands at paste time on the receiver's shell.
+  #
+  # The heredoc uses an UNQUOTED delimiter (`<<PASTE`) so we can expand
+  # ${primary_chan} and ${primary_gid} from the host's state. The
+  # `$(whoami)` in the "say hi" line is explicitly ESCAPED as
+  # `\$(whoami)` so it survives host-side expansion and runs on the
+  # receiver's shell at paste time. Don't switch to a quoted delimiter
+  # without also restoring the channel + gist substitutions some other
+  # way — they're load-bearing for the paste-block.
+  # (Copilot's review of #454 flagged the previous comment as
+  # mis-describing this; comment now matches actual behavior.)
   local primary_chan primary_gid
   primary_chan=$("$AIRC_PYTHON" -m airc_core.config default_channel --config "$CONFIG" 2>/dev/null || true)
   if [ -n "$primary_chan" ]; then
