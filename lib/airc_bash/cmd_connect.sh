@@ -569,18 +569,19 @@ cmd_connect() {
      [ "${AIRC_NO_DISCOVERY:-0}" != "1" ] && \
      command -v gh >/dev/null 2>&1; then
 
-    # ── Mesh discovery (singleton per gh account) ────────────────
-    # Architectural shift from the per-room model: ONE gist per gh
-    # account, description literal "airc mesh". Every `airc join` on
-    # the account converges on it. _mesh_find returns the singleton
-    # (oldest-by-created if multiple are present from a race).
+    # ── Mesh discovery (canonical channel gist) ──────────────────
+    # Every `airc join` resolves the requested/default channel through
+    # the same content-based channel_gist rule used by subscribe/send.
+    # Do NOT match only the human description "airc mesh": stale
+    # "airc room:" gists can still carry the live envelope, and using a
+    # different resolver here is exactly how #general split-brained.
     #
     # The --room flag still records the channel(s) this client wants
     # to subscribe to (Phase 2 will route messages by channel), but it
     # no longer drives gist discovery — every subscriber on the account
     # converges on the same host.
     _did_room_discovery=1
-    local _mesh_id; _mesh_id=$(_mesh_find)
+    local _mesh_id; _mesh_id=$(_mesh_find "$room_name")
     if [ -n "$_mesh_id" ]; then
       echo "  Found mesh on your gh account → joining ($_mesh_id)"
       target="$_mesh_id"
