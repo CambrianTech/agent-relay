@@ -38,6 +38,7 @@ quiet-and-empty for malformed input and we preserve that.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import re
 import sys
@@ -99,6 +100,15 @@ def _read_json_text(text: str):
         return json.loads(text)
     except (ValueError, TypeError):
         return None
+
+
+def _heartbeat_epoch(value: object) -> float:
+    if not isinstance(value, str) or not value:
+        return 0.0
+    try:
+        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
 
 
 def _emit(value, default=""):
@@ -268,7 +278,7 @@ def cmd_gist_content(args) -> int:
             env = _read_json_text(content)
             channels = env.get("channels") if isinstance(env, dict) else None
             if isinstance(channels, list) and channel in channels:
-                matches.append((str(env.get("last_heartbeat", "")), name == exact_name, content))
+                matches.append((_heartbeat_epoch(env.get("last_heartbeat")), name == exact_name, content))
         if matches:
             matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
             print(matches[0][2])

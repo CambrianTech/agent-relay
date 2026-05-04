@@ -23,8 +23,21 @@
 airc_daemon_scope_id() {
   local target_scope="${1:-}"
   [ -n "$target_scope" ] || target_scope="${AIRC_HOME:-$HOME/.airc}"
-  python3 -c 'import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:12])' "$target_scope" 2>/dev/null \
-    || printf '%s' "$target_scope" | shasum 2>/dev/null | awk '{print substr($1,1,12)}'
+  local id=""
+  id=$(python3 -c 'import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:12])' "$target_scope" 2>/dev/null || true)
+  if [ -z "$id" ] && command -v sha1sum >/dev/null 2>&1; then
+    id=$(printf '%s' "$target_scope" | sha1sum 2>/dev/null | awk '{print substr($1,1,12)}')
+  fi
+  if [ -z "$id" ] && command -v shasum >/dev/null 2>&1; then
+    id=$(printf '%s' "$target_scope" | shasum 2>/dev/null | awk '{print substr($1,1,12)}')
+  fi
+  if [ -z "$id" ] && command -v openssl >/dev/null 2>&1; then
+    id=$(printf '%s' "$target_scope" | openssl dgst -sha1 2>/dev/null | awk '{print substr($NF,1,12)}')
+  fi
+  if [ -z "$id" ]; then
+    id=$(printf '%s' "$target_scope" | tr -c 'A-Za-z0-9' '_' | tail -c 12)
+  fi
+  printf '%s\n' "${id:-aircdefault0}"
 }
 
 airc_daemon_service_name_for_scope() {

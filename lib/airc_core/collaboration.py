@@ -118,6 +118,7 @@ def recent_remote_speakers(home: str, my_name: str, window_sec: int = RECENT_REM
 
 def cmd_status(args: argparse.Namespace) -> int:
     count = peer_record_count(args.home)
+    speakers = recent_remote_speakers(args.home, args.my_name)
     recent = recent_remote_activity(args.home, args.my_name)
     now = int(time.time())
     if recent is None:
@@ -126,9 +127,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         remote_desc = f"last remote message {max(0, now - recent.ts)}s ago from {recent.name}"
 
     if count == 0:
-        if recent is not None:
-            print(f"  collaboration: DEGRADED (0 peer records; {remote_desc})")
-            print("    DMs/whois/peer targeting may be broken; broadcast traffic is flowing.")
+        if speakers:
+            label = "broadcast peer" if len(speakers) == 1 else "broadcast peers"
+            print(f"  collaboration: ok ({len(speakers)} {label}; 0 direct peer records; {remote_desc})")
+            print("    Presence is derived from recent signed room traffic.")
         else:
             print(f"  collaboration: SOLO (0 peer records; {remote_desc})")
             print("    Sends may only land in this local/self-hosted gist until another agent joins this exact mesh.")
@@ -139,10 +141,19 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     count = peer_record_count(args.home)
+    speakers = recent_remote_speakers(args.home, args.my_name)
     recent = recent_remote_activity(args.home, args.my_name)
     now = int(time.time())
     if count > 0:
         print(f"  [ok] collaboration mesh has {count} peer record(s)")
+        return 0
+    if speakers and recent is not None:
+        label = "broadcast peer" if len(speakers) == 1 else "broadcast peers"
+        print(
+            f"  [ok] collaboration mesh has {len(speakers)} recent {label} "
+            f"from signed room traffic (0 direct peer records)"
+        )
+        print(f"       last remote message {max(0, now - recent.ts)}s ago from {recent.name}")
         return 0
     if recent is not None:
         print(
@@ -159,17 +170,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def cmd_send_warning(args: argparse.Namespace) -> int:
     if peer_record_count(args.home) > 0:
         return 0
-    recent = recent_remote_activity(args.home, args.my_name)
-    now = int(time.time())
-    if recent is not None:
+    if not recent_remote_speakers(args.home, args.my_name):
         print(
-            f"  ⚠ collaboration: 0 peer records, but remote traffic arrived "
-            f"{max(0, now - recent.ts)}s ago from {recent.name}; peer metadata degraded, bus is not solo.",
-            file=sys.stderr,
-        )
-    else:
-        print(
-            "  ⚠ collaboration: 0 peer records in this scope; this may be a solo mesh. "
+            "  WARN: collaboration has no direct peer records or recent broadcast peers. "
             "Run 'airc peers' and verify others joined this gist.",
             file=sys.stderr,
         )
@@ -180,9 +183,24 @@ def cmd_peers_fallback(args: argparse.Namespace) -> int:
     speakers = recent_remote_speakers(args.home, args.my_name)
     if not speakers:
         return 1
-    print("  No peer records yet, but recent remote traffic is visible:")
+    print("  Recent broadcast peers:")
     for who, ts in sorted(speakers.items(), key=lambda kv: kv[1], reverse=True):
-        print(f"  {who} → (broadcast-only)   [(from messages.jsonl)]   last seen {_fmt_age(ts)}")
+        print(f"  {who} → broadcast room   [(from signed messages.jsonl)]   last seen {_fmt_age(ts)}")
+    return 0
+
+
+def cmd_whois_fallback(args: argparse.Namespace) -> int:
+    speakers = recent_remote_speakers(args.home, args.my_name)
+    ts = speakers.get(args.peer_name)
+    if ts is None:
+        return 1
+    print(f"  name:      {args.peer_name}")
+    print("  pronouns:  (unknown)")
+    print("  role:      broadcast peer")
+    print("  bio:       seen in recent signed room traffic")
+    print("  status:    (unknown)")
+    print("  integrations: (none)")
+    print(f"  presence:  broadcast-only, last seen {_fmt_age(ts)}")
     return 0
 
 
@@ -193,6 +211,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         p = sub.add_parser(name)
         p.add_argument("--home", required=True)
         p.add_argument("--my-name", default="")
+    p = sub.add_parser("whois-fallback")
+    p.add_argument("--home", required=True)
+    p.add_argument("--my-name", default="")
+    p.add_argument("--peer-name", required=True)
     args = parser.parse_args(argv)
     if args.cmd == "status":
         return cmd_status(args)
@@ -202,6 +224,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return cmd_send_warning(args)
     if args.cmd == "peers-fallback":
         return cmd_peers_fallback(args)
+    if args.cmd == "whois-fallback":
+        return cmd_whois_fallback(args)
     return 1
 
 

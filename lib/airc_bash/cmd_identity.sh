@@ -300,6 +300,10 @@ cmd_whois() {
   if _whois_in_scope "$AIRC_WRITE_DIR" "$target"; then
     return 0
   fi
+  if "$AIRC_PYTHON" -m airc_core.collaboration whois-fallback \
+      --home "$AIRC_WRITE_DIR" --my-name "$my_name" --peer-name "$target"; then
+    return 0
+  fi
 
   echo "  whois: no record for '$target' (try airc peers to list paired peers)"
   return 1

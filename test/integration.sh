@@ -2130,9 +2130,9 @@ JSON
     "$((now_ts - 3600))" "$now_ts" > "$home/bearer_state.general.json"
 
   status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
-  echo "$status_out" | grep -q 'collaboration: DEGRADED (0 peer records; last remote message' \
-    && pass "status reports DEGRADED, not SOLO, when recent remote traffic exists" \
-    || fail "status did not distinguish recent remote traffic from solo island ($status_out)"
+  echo "$status_out" | grep -q 'collaboration: ok (1 broadcast peer; 0 direct peer records' \
+    && pass "status treats recent signed traffic as broadcast peer presence" \
+    || fail "status did not recognize broadcast peer presence ($status_out)"
 
   doctor_out=$(AIRC_HOME="$home" "$AIRC" doctor --health 2>&1)
   echo "$doctor_out" | grep -q '\[ok\] #general — bearer heartbeat' \
@@ -2141,14 +2141,20 @@ JSON
   echo "$doctor_out" | grep -q '\[BLOCKED\] #general' \
     && fail "doctor falsely blocked a heartbeating idle channel ($doctor_out)" \
     || pass "doctor does not block a heartbeating idle channel"
-  echo "$doctor_out" | grep -q 'remote traffic arrived' \
-    && pass "doctor --health reports peer metadata degraded when traffic proves bus is not solo" \
-    || fail "doctor --health still treated recent remote traffic as solo ($doctor_out)"
+  echo "$doctor_out" | grep -q 'recent broadcast peer' \
+    && pass "doctor --health accepts broadcast peer presence as collaboration" \
+    || fail "doctor --health did not accept broadcast peer presence ($doctor_out)"
 
   peers_out=$(AIRC_HOME="$home" "$AIRC" peers 2>&1)
-  echo "$peers_out" | grep -q 'remote-agent → (broadcast-only)' \
+  echo "$peers_out" | grep -q 'remote-agent → broadcast room' \
     && pass "airc peers falls back to recent broadcast-only traffic" \
     || fail "airc peers hid recent remote traffic when peer records were empty ($peers_out)"
+
+  local whois_out
+  whois_out=$(AIRC_HOME="$home" "$AIRC" whois remote-agent 2>&1)
+  echo "$whois_out" | grep -q 'role: *broadcast peer' \
+    && pass "airc whois returns limited identity for broadcast peer" \
+    || fail "airc whois did not resolve broadcast peer ($whois_out)"
 
   rm -rf /tmp/airc-it-solo
   cleanup_all
@@ -3164,9 +3170,9 @@ scenario_inbox() {
 
   out=$(AIRC_HOME="$home" "$AIRC" inbox --since 2026-05-04T09:59:00Z 2>&1)
   local cursor; cursor=$(cat "$home/inbox_cursor" 2>/dev/null || true)
-  [ "$cursor" = "2026-05-04T10:01:00Z" ] \
-    && pass "inbox advances cursor to newest printed message" \
-    || fail "inbox cursor = '$cursor' (expected newest message ts); output: $out"
+  printf '%s' "$cursor" | grep -q '"offset":[1-9]' \
+    && pass "inbox advances byte cursor after printed messages" \
+    || fail "inbox cursor = '$cursor' (expected byte offset JSON); output: $out"
 
   out=$(AIRC_HOME="$home" "$AIRC" inbox 2>&1)
   printf '%s' "$out" | grep -q 'No new airc messages' \
@@ -3177,7 +3183,7 @@ scenario_inbox() {
   out=$(AIRC_HOME="$home" "$AIRC" poll 2>&1)
   cursor=$(cat "$home/inbox_cursor" 2>/dev/null || true)
   printf '%s' "$out" | grep -q 'third unread' \
-    && [ "$cursor" = "2099-05-04T10:02:00Z" ] \
+    && printf '%s' "$cursor" | grep -q '"offset":[1-9]' \
     && pass "poll alias reads only new messages and advances cursor" \
     || fail "poll alias failed; cursor='$cursor' output: $out"
 }
