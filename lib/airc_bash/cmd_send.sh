@@ -676,7 +676,8 @@ cmd_send() {
       _peer_count=$(find "$PEERS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | wc -l | tr -d ' ')
     fi
     if [ "${_peer_count:-0}" -eq 0 ] 2>/dev/null; then
-      echo "  ⚠ collaboration: 0 peer records in this scope; this may be a solo mesh. Run 'airc peers' and verify others joined this gist." >&2
+      "$AIRC_PYTHON" -m airc_core.collaboration send-warning \
+        --home "$AIRC_WRITE_DIR" --my-name "$(get_name)" 2>/dev/null || true
     fi
   fi
 }

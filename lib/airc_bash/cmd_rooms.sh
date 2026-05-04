@@ -567,12 +567,38 @@ else:
   # is what was missing when "5 peers earlier today, 1 now" looked
   # identical to "5 peers, all silent for 30 min" in the listing —
   # silent records persist on disk regardless of liveness.
+  if ! find "$PEERS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | grep -q .; then
+    "$AIRC_PYTHON" -m airc_core.collaboration peers-fallback \
+      --home "$AIRC_WRITE_DIR" --my-name "$(get_name)" && return
+    echo "  No peers yet."
+    return
+  fi
+
   "$AIRC_PYTHON" -c "
 import json, os, sys, time, calendar
 
 primary_scope = os.path.expanduser('$AIRC_WRITE_DIR')
 peers_dir = os.path.join(primary_scope, 'peers')
 messages_log = os.path.join(primary_scope, 'messages.jsonl')
+
+def _epoch(ts_str):
+    if not ts_str:
+        return None
+    try:
+        t = time.strptime(ts_str.replace('Z',''), '%Y-%m-%dT%H:%M:%S')
+        return calendar.timegm(t)
+    except Exception:
+        return None
+
+now = int(time.time())
+def _fmt_age(ts):
+    if ts is None:
+        return 'never'
+    age = max(0, now - ts)
+    if age < 60:    return f'{age}s ago'
+    if age < 3600:  return f'{age // 60}m ago'
+    if age < 86400: return f'{age // 3600}h ago'
+    return f'{age // 86400}d ago'
 
 if not os.path.isdir(peers_dir):
     print('  No peers yet.')
@@ -604,14 +630,6 @@ if not peers_by_id:
 # default), so the scan cost is bounded and we get the most recent
 # ts naturally as the loop terminates.
 last_seen = {}
-def _epoch(ts_str):
-    if not ts_str:
-        return None
-    try:
-        t = time.strptime(ts_str.replace('Z',''), '%Y-%m-%dT%H:%M:%S')
-        return calendar.timegm(t)
-    except Exception:
-        return None
 try:
     with open(messages_log) as f:
         for line in f:
@@ -628,16 +646,6 @@ try:
                 last_seen[who] = ts
 except OSError:
     pass
-
-now = int(time.time())
-def _fmt_age(ts):
-    if ts is None:
-        return 'never'
-    age = max(0, now - ts)
-    if age < 60:    return f'{age}s ago'
-    if age < 3600:  return f'{age // 60}m ago'
-    if age < 86400: return f'{age // 3600}h ago'
-    return f'{age // 86400}d ago'
 
 # Render. Each peer once, with room annotations + last-seen marker.
 # Silent >1h gets a (silent) flag so the eye catches it immediately.

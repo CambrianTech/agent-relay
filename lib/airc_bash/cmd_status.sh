@@ -176,73 +176,8 @@ _airc_collaboration_health_report() {
   # Local transport health is not the same as collaboration health. A
   # self-healed host can have fresh bearer heartbeats while nobody else is
   # paired to this mesh. Surface that split-brain shape explicitly.
-  AIRC_STATUS_HOME="$AIRC_WRITE_DIR" AIRC_STATUS_MY_NAME="$(get_name)" "$AIRC_PYTHON" - <<'PY'
-import calendar, json, os, sys, time
-
-home = os.environ.get("AIRC_STATUS_HOME", "")
-my_name = os.environ.get("AIRC_STATUS_MY_NAME", "")
-peers_dir = os.path.join(home, "peers")
-messages_log = os.path.join(home, "messages.jsonl")
-now = int(time.time())
-
-peer_records = 0
-if os.path.isdir(peers_dir):
-    for entry in os.listdir(peers_dir):
-        if not entry.endswith(".json"):
-            continue
-        try:
-            json.load(open(os.path.join(peers_dir, entry)))
-        except Exception:
-            continue
-        peer_records += 1
-
-last_remote = None
-last_remote_name = None
-def epoch(ts):
-    if not ts:
-        return None
-    try:
-        return calendar.timegm(time.strptime(ts.replace("Z", ""), "%Y-%m-%dT%H:%M:%S"))
-    except Exception:
-        return None
-
-try:
-    with open(messages_log) as f:
-        for line in f:
-            try:
-                msg = json.loads(line)
-            except Exception:
-                continue
-            sender = msg.get("from")
-            if not sender or sender in (my_name, "airc"):
-                continue
-            ts = epoch(msg.get("ts"))
-            if ts is None:
-                continue
-            if last_remote is None or ts > last_remote:
-                last_remote = ts
-                last_remote_name = sender
-except OSError:
-    pass
-
-if last_remote is None:
-    remote_desc = "no remote messages recorded"
-    remote_recent = False
-else:
-    age = max(0, now - last_remote)
-    remote_desc = f"last remote message {age}s ago from {last_remote_name}"
-    remote_recent = age < 600
-
-if peer_records == 0:
-    if remote_recent:
-        print(f"  collaboration: DEGRADED (0 peer records; {remote_desc})")
-        print("    DMs/whois/peer targeting may be broken; verify everyone is on the same gist with 'airc peers' and 'airc invite'.")
-    else:
-        print(f"  collaboration: SOLO (0 peer records; {remote_desc})")
-        print("    Sends may only land in this local/self-hosted gist until another agent joins this exact mesh.")
-else:
-    print(f"  collaboration: ok ({peer_records} peer record(s); {remote_desc})")
-PY
+  "$AIRC_PYTHON" -m airc_core.collaboration status \
+    --home "$AIRC_WRITE_DIR" --my-name "$(get_name)"
 }
 
 cmd_status() {

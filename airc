@@ -1393,12 +1393,19 @@ _monitor_multi_channel() {
           for entry in "${_pids[@]}"; do
             pid="${entry%%:*}"
             ch="${entry#*:}"
-            if printf '%s\n' "$_current_map" | awk -F '\t' -v c="$ch" '$1 == c {found=1} END {exit found ? 0 : 1}'; then
-              _kept+=("$entry")
-            else
+            local _mapped_gid
+            _mapped_gid=$(printf '%s\n' "$_current_map" | awk -F '\t' -v c="$ch" '$1 == c {print $2; exit}')
+            if [ -z "$_mapped_gid" ]; then
               echo "airc: #${ch} removed from channel_gists; stopping its bearer while other channels continue" >&2
               kill "$pid" 2>/dev/null || true
+              continue
             fi
+            if ! ps -p "$pid" -o command= 2>/dev/null | grep -q -- "--room-gist-id ${_mapped_gid}"; then
+              echo "airc: #${ch} channel_gists changed; rotating bearer to ${_mapped_gid} without full monitor restart" >&2
+              kill "$pid" 2>/dev/null || true
+              continue
+            fi
+            _kept+=("$entry")
           done
           _pids=("${_kept[@]}")
 
