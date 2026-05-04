@@ -44,6 +44,7 @@ _GH_BIN = "gh"
 _GH_API_TIMEOUT = 10.0
 _GIST_LIST_LIMIT = 100   # `airc list` uses 50; we go a bit higher to be safe
 _GIST_ID_CHARS = set("0123456789abcdefABCDEF")
+_LAST_GIST_LIST_UNAVAILABLE = False
 def _cache_path(name: str) -> str:
     uid = str(os.getuid()) if hasattr(os, "getuid") else os.environ.get("USERNAME", "user")
     return os.path.join(tempfile.gettempdir(), f"airc-{name}-{uid}.json")
@@ -100,16 +101,20 @@ def _gh_list_user_gists() -> list[dict]:
     probe fails, stale cache default is 15m so peers can keep using the
     last-known room map instead of creating new islands.
     """
+    global _LAST_GIST_LIST_UNAVAILABLE
+    _LAST_GIST_LIST_UNAVAILABLE = False
     cache_sec = float(os.environ.get("AIRC_GIST_LIST_CACHE_SEC", "60"))
     stale_sec = float(os.environ.get("AIRC_GIST_LIST_STALE_SEC", "900"))
     cached = _load_cached_gist_list(cache_sec)
     if cached is not None:
         return cached
     if gh_backoff.backoff_active():
+        _LAST_GIST_LIST_UNAVAILABLE = True
         return _load_cached_gist_list(stale_sec) or []
 
     gh = _resolve_gh_bin()
     if gh is None:
+        _LAST_GIST_LIST_UNAVAILABLE = True
         return _load_cached_gist_list(stale_sec) or []
     try:
         r = subprocess.run(
@@ -119,8 +124,10 @@ def _gh_list_user_gists() -> list[dict]:
             timeout=_GH_API_TIMEOUT * 3,
         )
     except (subprocess.TimeoutExpired, OSError):
+        _LAST_GIST_LIST_UNAVAILABLE = True
         return _load_cached_gist_list(stale_sec) or []
     if r.returncode != 0:
+        _LAST_GIST_LIST_UNAVAILABLE = True
         gh_backoff.record_backoff((r.stderr or "") + (r.stdout or ""))
         return _load_cached_gist_list(stale_sec) or []
     out: list[dict] = []
@@ -136,6 +143,7 @@ def _gh_list_user_gists() -> list[dict]:
             return loaded
     except (ValueError, TypeError):
         pass
+    _LAST_GIST_LIST_UNAVAILABLE = True
     return out
 
 
@@ -659,7 +667,7 @@ def resolve(channel: str, create_if_missing: bool = False, require_invite: bool 
         if attempt < attempts - 1:
             _t.sleep(1.5 * (attempt + 1))  # 1.5s, then 3s
     if create_if_missing and not require_invite:
-        if gh_backoff.backoff_active():
+        if gh_backoff.backoff_active() or _LAST_GIST_LIST_UNAVAILABLE:
             return None
         return create_new(channel)
     return None

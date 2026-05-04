@@ -274,6 +274,17 @@ class LocalCacheFallbackTests(unittest.TestCase):
             self.assertIsNone(channel_gist.resolve("general", create_if_missing=True))
             create_new.assert_not_called()
 
+    def test_resolve_does_not_create_new_gist_after_untrusted_discovery(self):
+        with mock.patch.object(channel_gist, "find_existing", return_value=None), \
+             mock.patch.object(channel_gist.gh_backoff, "backoff_active", return_value=False), \
+             mock.patch.object(channel_gist, "create_new") as create_new:
+            channel_gist._LAST_GIST_LIST_UNAVAILABLE = True
+            try:
+                self.assertIsNone(channel_gist.resolve("general", create_if_missing=True))
+                create_new.assert_not_called()
+            finally:
+                channel_gist._LAST_GIST_LIST_UNAVAILABLE = False
+
 
 class GistListCacheTests(unittest.TestCase):
     """Gist discovery should not spam GitHub during monitor/status churn."""
