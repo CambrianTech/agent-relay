@@ -265,7 +265,7 @@ def _maybe_emit_drop_warning(subs_norm: set[str]) -> None:
     """Emit one stdout warning per DROP_WARN_INTERVAL_SEC summarizing all
     drops seen in that window. Resets the counter after emit so the
     warning re-fires if drops continue. Stdout (not stderr) so the
-    Monitor surface sees it and the operator can run `airc subscribe`.
+    Monitor surface sees it and the operator can run `airc join --room <channel>`.
 
     Channel names are XML-escaped because they're peer-controlled and
     appear OUTSIDE any sandbox tag. Pre-escape, a peer could send with
@@ -293,7 +293,7 @@ def _maybe_emit_drop_warning(subs_norm: set[str]) -> None:
         # ASCII-only — Windows cp1252 console can't encode unicode marks.
         print(
             f"airc: WARN display-filtered {drops} (subscribed: {subs_str}). "
-            f"To see them: airc subscribe <channel>",
+            f"To see them: airc join --room <channel>",
             flush=True,
         )
     except Exception:
