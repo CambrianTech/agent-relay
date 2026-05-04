@@ -68,6 +68,14 @@ def peer_record_count(home: str) -> int:
 
 
 def recent_remote_activity(home: str, my_name: str, window_sec: int = RECENT_REMOTE_WINDOW_SEC) -> Optional[RemoteActivity]:
+    return _remote_activity(home, my_name, window_sec=window_sec)
+
+
+def any_remote_activity(home: str, my_name: str) -> Optional[RemoteActivity]:
+    return _remote_activity(home, my_name, window_sec=None)
+
+
+def _remote_activity(home: str, my_name: str, window_sec: Optional[int]) -> Optional[RemoteActivity]:
     messages_log = os.path.join(home, "messages.jsonl")
     now = int(time.time())
     last: Optional[RemoteActivity] = None
@@ -84,7 +92,7 @@ def recent_remote_activity(home: str, my_name: str, window_sec: int = RECENT_REM
                 ts = _epoch(msg.get("ts"))
                 if ts is None:
                     continue
-                if now - ts >= window_sec:
+                if window_sec is not None and now - ts >= window_sec:
                     continue
                 if last is None or ts > last.ts:
                     last = RemoteActivity(str(sender), ts)
@@ -120,17 +128,21 @@ def cmd_status(args: argparse.Namespace) -> int:
     count = peer_record_count(args.home)
     speakers = recent_remote_speakers(args.home, args.my_name)
     recent = recent_remote_activity(args.home, args.my_name)
+    any_recent = recent if recent is not None else any_remote_activity(args.home, args.my_name)
     now = int(time.time())
-    if recent is None:
+    if any_recent is None:
         remote_desc = "no remote messages recorded"
     else:
-        remote_desc = f"last remote message {max(0, now - recent.ts)}s ago from {recent.name}"
+        remote_desc = f"last remote message {max(0, now - any_recent.ts)}s ago from {any_recent.name}"
 
     if count == 0:
         if speakers:
             label = "broadcast peer" if len(speakers) == 1 else "broadcast peers"
             print(f"  collaboration: ok ({len(speakers)} {label}; 0 direct peer records; {remote_desc})")
             print("    Presence is derived from recent signed room traffic.")
+        elif any_recent is None:
+            print(f"  collaboration: waiting for peers (0 peer records; {remote_desc})")
+            print("    First agent in a room is expected to be alone until another agent joins this gist.")
         else:
             print(f"  collaboration: SOLO (0 peer records; {remote_desc})")
             print("    Sends may only land in this local/self-hosted gist until another agent joins this exact mesh.")
@@ -143,6 +155,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     count = peer_record_count(args.home)
     speakers = recent_remote_speakers(args.home, args.my_name)
     recent = recent_remote_activity(args.home, args.my_name)
+    any_recent = recent if recent is not None else any_remote_activity(args.home, args.my_name)
     now = int(time.time())
     if count > 0:
         print(f"  [ok] collaboration mesh has {count} peer record(s)")
@@ -162,7 +175,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         )
         print("         Peer metadata is degraded (DMs/whois may fail), but this is NOT a solo island.")
         return 1
-    print("  [BLOCKED] collaboration mesh has 0 peer records — local transport may be alive, but this is a solo island")
+    if any_recent is None:
+        print("  [info] collaboration mesh has 0 peer records and no remote history — waiting for first peer")
+        print("         Share the invite or ask another agent to join this room; first-user startup is OK.")
+        return 0
+    print(
+        f"  [BLOCKED] collaboration mesh has 0 peer records — last remote traffic was "
+        f"{max(0, now - any_recent.ts)}s ago from {any_recent.name}; this may be a solo island"
+    )
     print("         Check: airc peers; ask peers to run 'airc update --channel canary && airc connect <current invite>'")
     return 2
 

@@ -37,14 +37,40 @@ class CollaborationHealthTests(unittest.TestCase):
             "msg": "hello",
         }) + "\n"
 
-    def test_status_solo_without_records_or_remote_traffic(self):
+    def test_status_waiting_without_records_or_remote_traffic(self):
         tmp, home = self._scope()
         with tmp:
             out = io.StringIO()
             with redirect_stdout(out):
                 rc = collaboration.main(["status", "--home", str(home), "--my-name", "me"])
             self.assertEqual(rc, 0)
-            self.assertIn("collaboration: SOLO", out.getvalue())
+            self.assertIn("collaboration: waiting for peers", out.getvalue())
+
+    def test_doctor_info_without_records_or_remote_traffic(self):
+        tmp, home = self._scope()
+        with tmp:
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = collaboration.main(["doctor", "--home", str(home), "--my-name", "me"])
+            self.assertEqual(rc, 0)
+            self.assertIn("waiting for first peer", out.getvalue())
+
+    def test_doctor_blocked_when_remote_history_is_stale(self):
+        tmp, home = self._scope()
+        with tmp:
+            stale_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 7200))
+            (home / "messages.jsonl").write_text(json.dumps({
+                "from": "remote-agent",
+                "to": "all",
+                "ts": stale_ts,
+                "channel": "general",
+                "msg": "old",
+            }) + "\n", encoding="utf-8")
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = collaboration.main(["doctor", "--home", str(home), "--my-name", "me"])
+            self.assertEqual(rc, 2)
+            self.assertIn("may be a solo island", out.getvalue())
 
     def test_status_ok_when_recent_remote_traffic_exists(self):
         tmp, home = self._scope()
