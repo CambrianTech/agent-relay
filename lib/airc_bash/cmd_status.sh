@@ -366,6 +366,8 @@ else:
   else
     echo "  reminder:    off"
   fi
+
+  echo "  inbox:       airc inbox  (catch up unread; use --peek to preview)"
 }
 
 cmd_logs() {

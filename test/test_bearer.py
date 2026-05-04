@@ -1433,6 +1433,23 @@ class GhBearerErrorClassificationTests(unittest.TestCase):
             outcome = self._bearer().send("alice", "general", b'{"x":1}')
         self.assertEqual(outcome.kind, "secondary_rate_limit")
 
+    def test_get_secondary_rate_limit_is_classified_without_stderr_spam(self):
+        """Same-machine local bus can deliver while gh is throttled.
+        The expected 403 must not make a successful send look failed."""
+        import io
+        from contextlib import redirect_stderr
+
+        fake = mock.Mock(returncode=1, stdout="", stderr="gh: API rate limit exceeded (HTTP 403)")
+        with mock.patch.object(bearer_gh, "_resolve_gh_bin", return_value="gh"), \
+             mock.patch.object(bearer_gh.subprocess, "run", return_value=fake):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                gist, kind = bearer_gh._gh_api_get_classified("abc123")
+
+        self.assertIsNone(gist)
+        self.assertEqual(kind, "secondary_rate_limit")
+        self.assertEqual(err.getvalue(), "")
+
     def test_send_returns_gone_when_patch_404s(self):
         """Pre-#381 the PATCH 404 case fell into the auth_failure branch
         (the old `if "404" in detail or "permission" in lower` mash-up).
