@@ -722,7 +722,7 @@ cmd_connect() {
       # gist description as a header line that we'd then have to strip.
       if command -v gh >/dev/null 2>&1; then
         raw_content=$( (gh api "gists/$gist_id" 2>/dev/null \
-                        | "$AIRC_PYTHON" -m airc_core.gistparse gist_content 2>/dev/null) || true )
+                        | "$AIRC_PYTHON" -m airc_core.gistparse gist_content --channel "$room_name" 2>/dev/null) || true )
       fi
       # Fallback path 1: gh raw view (description leak handled by the
       # awk strip below at "head -c 1 | grep '{'" cleanup).
@@ -740,13 +740,13 @@ cmd_connect() {
       if [ -z "$raw_content" ] && command -v git >/dev/null 2>&1; then
         local _gist_tmp; _gist_tmp=$(mktemp -d -t airc-gist-resolve.XXXXXX 2>/dev/null || echo "")
         if [ -n "$_gist_tmp" ] && git clone --depth 1 --quiet "https://gist.github.com/$gist_id.git" "$_gist_tmp" 2>/dev/null; then
-          # Gists typically contain ONE file (airc envelopes always do).
-          # Take the first non-dotfile, non-.git entry. If a future gist
-          # shape ships multiple files we'll add an explicit airc-envelope
-          # filename convention; for now the single-file assumption is
-          # sound across every gist airc has ever published.
+          # Prefer the requested channel's envelope; fall back to the
+          # first non-dotfile for legacy single-file invite gists.
           local _gist_file
-          _gist_file=$(find "$_gist_tmp" -maxdepth 1 -type f ! -name '.git*' 2>/dev/null | head -1 || true)
+          _gist_file="$_gist_tmp/airc-room-${room_name}.json"
+          if [ ! -f "$_gist_file" ]; then
+            _gist_file=$(find "$_gist_tmp" -maxdepth 1 -type f ! -name '.git*' 2>/dev/null | head -1 || true)
+          fi
           if [ -n "$_gist_file" ] && [ -f "$_gist_file" ]; then
             raw_content=$(cat "$_gist_file" 2>/dev/null || true)
           fi
@@ -757,7 +757,7 @@ cmd_connect() {
       # without gh OR git. Last resort. (#188 — was curl + jq.)
       if [ -z "$raw_content" ] && command -v curl >/dev/null 2>&1; then
         raw_content=$( (curl -fsSL "https://api.github.com/gists/$gist_id" 2>/dev/null \
-                        | "$AIRC_PYTHON" -m airc_core.gistparse gist_content 2>/dev/null) || true )
+                        | "$AIRC_PYTHON" -m airc_core.gistparse gist_content --channel "$room_name" 2>/dev/null) || true )
       fi
       # Last-resort cleanup: if raw_content still has the description-header
       # leak from a degraded gh-view path, strip lines before the first '{'

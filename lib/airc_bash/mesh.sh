@@ -94,9 +94,17 @@ _mesh_update() {
 # assume stale" or "assume fresh" depending on policy.
 _mesh_age_secs() {
   local gist_id="${1:-}"
+  local channel="${2:-${room_name:-}}"
   [ -n "$gist_id" ] || return 0
   command -v gh >/dev/null 2>&1 || return 0
-  local content; content=$(gh api "gists/$gist_id" --jq '.files | to_entries[0].value.content' 2>/dev/null || true)
+  local content
+  if [ -n "$channel" ]; then
+    content=$(gh api "gists/$gist_id" 2>/dev/null \
+      | "$AIRC_PYTHON" -m airc_core.gistparse gist_content --channel "$channel" 2>/dev/null || true)
+  else
+    content=$(gh api "gists/$gist_id" 2>/dev/null \
+      | "$AIRC_PYTHON" -m airc_core.gistparse gist_content 2>/dev/null || true)
+  fi
   [ -z "$content" ] && return 0
   local hb; hb=$(printf '%s' "$content" | "$AIRC_PYTHON" -c '
 import sys, json
