@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import sys
 import json
+import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -88,7 +90,8 @@ class FindExistingConvergenceTests(unittest.TestCase):
                          "canonical (single-channel) priority overrides legacy oldest")
 
     def test_returns_none_when_no_match(self):
-        with mock.patch.object(channel_gist, "_gh_list_user_gists", return_value=[]):
+        with mock.patch.object(channel_gist, "_gh_list_user_gists", return_value=[]), \
+             mock.patch.object(channel_gist, "_find_existing_via_local_cache", return_value=None):
             self.assertIsNone(channel_gist.find_existing("nonexistent"))
 
     def test_require_invite_skips_seed_only_channel_gist(self):
@@ -130,6 +133,77 @@ class FindExistingConvergenceTests(unittest.TestCase):
                                return_value=[m_new, m_old]):
             chosen = channel_gist.find_existing("general")
         self.assertEqual(chosen, "mesh-old")
+
+
+class LocalCacheFallbackTests(unittest.TestCase):
+    """REST listing failures must not force a new solo room.
+
+    The fallback starts from locally remembered channel_gists, validates
+    those ids through the gist git endpoint, then chooses the best
+    recoverable room from wire evidence.
+    """
+
+    def _write_cfg(self, root: str, name: str, channel: str, gid: str) -> None:
+        airc = Path(root) / name / ".airc"
+        airc.mkdir(parents=True)
+        (airc / "config.json").write_text(
+            json.dumps({"channel_gists": {channel: gid}}),
+            encoding="utf-8",
+        )
+
+    def _snapshot(self, gid: str, channel: str, channels: list[str], ts: str, desc: str | None = None) -> dict:
+        return {
+            "id": gid,
+            "description": desc or f"airc room: #{channel} (git fallback)",
+            "files": {
+                f"airc-room-{channel}.json": {
+                    "content": json.dumps({
+                        "airc": 1,
+                        "kind": "mesh",
+                        "channels": channels,
+                        "last_heartbeat": ts,
+                    }),
+                    "truncated": False,
+                },
+                "messages.jsonl": {
+                    "content": json.dumps({"ts": ts, "from": "test", "msg": "marker"}) + "\n",
+                    "truncated": False,
+                },
+            },
+        }
+
+    def test_rest_miss_uses_local_git_cache_and_rejects_newer_multi_channel_island(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stale = "aaaaaaaa"
+            current = "bbbbbbbb"
+            island = "cccccccc"
+            self._write_cfg(tmp, "old-worktree", "general", stale)
+            self._write_cfg(tmp, "current-worktree", "general", current)
+            self._write_cfg(tmp, "solo-island", "general", island)
+            snapshots = {
+                stale: self._snapshot(stale, "general", ["general"], "2026-04-30T12:00:00Z"),
+                current: self._snapshot(current, "general", ["general"], "2026-05-04T18:11:00Z"),
+                island: self._snapshot(island, "general", ["general", "cambriantech"], "2026-05-04T18:27:00Z"),
+            }
+            with mock.patch.dict(os.environ, {"AIRC_GIST_CACHE_ROOTS": tmp, "AIRC_DISABLE_LOCAL_GIST_FALLBACK": ""}), \
+                 mock.patch.object(channel_gist, "_gh_list_user_gists", return_value=[]), \
+                 mock.patch.object(channel_gist, "_git_gist_snapshot", side_effect=lambda gid: snapshots.get(gid)):
+                self.assertEqual(channel_gist.find_existing("general"), current)
+
+    def test_local_fallback_picks_recent_matching_multi_channel_when_no_strict_room_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = "dddddddd"
+            current = "eeeeeeee"
+            self._write_cfg(tmp, "old", "cambriantech", old)
+            self._write_cfg(tmp, "current", "cambriantech", current)
+            snapshots = {
+                old: self._snapshot(old, "cambriantech", ["cambriantech", "general"], "2026-05-04T17:40:00Z"),
+                current: self._snapshot(current, "cambriantech", ["cambriantech", "general"], "2026-05-04T18:22:49Z"),
+            }
+            with mock.patch.dict(os.environ, {"AIRC_GIST_CACHE_ROOTS": tmp, "AIRC_DISABLE_LOCAL_GIST_FALLBACK": ""}), \
+                 mock.patch.object(channel_gist, "_gh_list_user_gists", return_value=[]), \
+                 mock.patch.object(channel_gist, "_git_gist_snapshot", side_effect=lambda gid: snapshots.get(gid)):
+                self.assertEqual(channel_gist.find_existing("cambriantech"), current)
 
 
 if __name__ == "__main__":
