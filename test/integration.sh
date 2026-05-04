@@ -2125,6 +2125,9 @@ JSON
 
   printf '{"from":"remote-agent","to":"all","ts":"%s","channel":"general","msg":"recent remote proof"}\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$home/messages.jsonl"
+  local now_ts; now_ts=$(date +%s)
+  printf '{"kind":"gh","peer_id":"self","last_recv_ts":%s,"last_sender":"remote-agent","events_total":1,"diag":"last event from gh poll","last_heartbeat_ts":%s}\n' \
+    "$((now_ts - 3600))" "$now_ts" > "$home/bearer_state.general.json"
 
   status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
   echo "$status_out" | grep -q 'collaboration: DEGRADED (0 peer records; last remote message' \
@@ -2132,6 +2135,12 @@ JSON
     || fail "status did not distinguish recent remote traffic from solo island ($status_out)"
 
   doctor_out=$(AIRC_HOME="$home" "$AIRC" doctor --health 2>&1)
+  echo "$doctor_out" | grep -q '\[ok\] #general — bearer heartbeat' \
+    && pass "doctor treats fresh heartbeat as live even when last message is old" \
+    || fail "doctor did not use heartbeat evidence for bearer health ($doctor_out)"
+  echo "$doctor_out" | grep -q '\[BLOCKED\] #general' \
+    && fail "doctor falsely blocked a heartbeating idle channel ($doctor_out)" \
+    || pass "doctor does not block a heartbeating idle channel"
   echo "$doctor_out" | grep -q 'remote traffic arrived' \
     && pass "doctor --health reports peer metadata degraded when traffic proves bus is not solo" \
     || fail "doctor --health still treated recent remote traffic as solo ($doctor_out)"

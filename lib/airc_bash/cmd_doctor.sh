@@ -511,8 +511,24 @@ _doctor_health() {
         continue
       fi
       found_state=1
-      local last_recv_ts
-      last_recv_ts=$(python3 -c "import sys,json; d=json.load(open('$state_file')); print(int(d.get('last_recv_ts',0)))" 2>/dev/null || echo 0)
+      local state_ts last_recv_ts last_heartbeat_ts heartbeat_age
+      state_ts=$("$AIRC_PYTHON" -m airc_core.bearer_state "$state_file" 2>/dev/null || echo "0 0")
+      last_recv_ts=${state_ts%% *}
+      last_heartbeat_ts=${state_ts#* }
+      [ "$last_recv_ts" = "$state_ts" ] && last_heartbeat_ts=0
+      heartbeat_age=999999
+      if [ "${last_heartbeat_ts:-0}" -gt 0 ] 2>/dev/null; then
+        heartbeat_age=$((now - last_heartbeat_ts))
+      fi
+      if [ "$heartbeat_age" -lt 120 ]; then
+        if [ "$last_recv_ts" = "0" ]; then
+          printf "  [ok] #%s — bearer heartbeat %ds ago (idle; no messages received yet)\n" "$channel" "$heartbeat_age"
+        else
+          local recv_age=$((now - last_recv_ts))
+          printf "  [ok] #%s — bearer heartbeat %ds ago (last message %ds ago)\n" "$channel" "$heartbeat_age" "$recv_age"
+        fi
+        continue
+      fi
       if [ "$last_recv_ts" = "0" ]; then
         printf "  [WARN] #%s — bearer state has no last_recv_ts (never received?)\n" "$channel"
         warns=$((warns+1))
