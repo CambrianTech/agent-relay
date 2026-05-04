@@ -120,9 +120,8 @@ except Exception:
   echo $(( now_epoch - hb_epoch ))
 }
 
-# Race-aware takeover. Inputs: $1 = stale gist id we want to replace.
-# Caller has already PUBLISHED their own replacement (returned id in $2)
-# and is checking whether they actually won the race.
+# Race-aware takeover. Inputs: $1 = stale gist id we want to replace,
+# $2 = caller's newly-published gist id, $3 = channel name.
 #
 # Echoes one of:
 #   "winner"   — caller's gist is the canonical mesh; old stale was
@@ -135,11 +134,10 @@ except Exception:
 #   1. Try to delete the stale gist (idempotent — another tab may have
 #      gotten there first; treat that as success).
 #   2. Light jitter so all racers see the same gh-side state.
-#   3. List all mesh gists. If only ours is left, we won.
-#   4. If multiple, pick the OLDEST by created_at as winner. If that's
-#      ours, we won. Else echo "loser:<winner_id>".
+#   3. Resolve the canonical gist for THIS channel via _mesh_find. If
+#      the resolver says another gist is canonical, yield to it.
 _mesh_take_over() {
-  local stale_id="${1:-}" my_id="${2:-}"
+  local stale_id="${1:-}" my_id="${2:-}" channel="${3:-${room_name:-}}"
   [ -n "$my_id" ] || return 1
   command -v gh >/dev/null 2>&1 || return 1
   if [ -n "$stale_id" ] && [ "$stale_id" != "$my_id" ]; then
@@ -148,26 +146,11 @@ _mesh_take_over() {
   # Jitter: 200..1200ms. Spreads races so all tabs see the same listing.
   local jitter; jitter=$(awk -v r="$RANDOM" 'BEGIN{printf "%.3f", 0.2 + (r%1000)/1000}')
   sleep "$jitter"
-  local desc; desc=$(_mesh_desc)
-  local ids; ids=$(gh gist list --limit 50 2>/dev/null \
-    | awk -F'\t' -v d="$desc" '$2 == d { print $1 }')
-  local count; count=$(printf '%s\n' "$ids" | grep -c . || true)
-  if [ "$count" -le 1 ]; then
+  local winner
+  winner=$(_mesh_find "$channel" 2>/dev/null || true)
+  if [ -z "$winner" ] || [ "$winner" = "$my_id" ]; then
     echo "winner"
     return 0
   fi
-  # Multiple — pick oldest by created_at.
-  local oldest="" oldest_ts=""
-  while IFS= read -r gid; do
-    [ -z "$gid" ] && continue
-    local ts; ts=$(gh api "gists/$gid" --jq '.created_at' 2>/dev/null || echo "")
-    if [ -z "$oldest_ts" ] || [ "$ts" \< "$oldest_ts" ]; then
-      oldest="$gid"; oldest_ts="$ts"
-    fi
-  done <<< "$ids"
-  if [ "$oldest" = "$my_id" ]; then
-    echo "winner"
-  else
-    echo "loser:$oldest"
-  fi
+  echo "loser:$winner"
 }

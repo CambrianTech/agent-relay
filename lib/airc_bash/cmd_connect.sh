@@ -1800,10 +1800,11 @@ JSON
             # empty mesh-gist listing (gh propagation lag) and BOTH
             # publish. Pre-publish recheck doesn't help — neither
             # gist is globally visible yet at this point. _mesh_take_over
-            # waits a jitter, lists all "airc mesh" gists, picks the
-            # OLDEST by created_at as winner, and reports whether we won
-            # or lost. Loser deletes its gist + re-execs as joiner.
-            local _race; _race=$(_mesh_take_over "" "$_gist_id")
+            # waits a jitter, then resolves the canonical gist for this
+            # channel using the same content-based resolver as connect.
+            # Description-only winner election can yield to unrelated
+            # live test gists and split the mesh.
+            local _race; _race=$(_mesh_take_over "" "$_gist_id" "$room_name")
             case "$_race" in
               winner|"")
                 : # we won (or _mesh_take_over couldn't probe — assume winner, heartbeat will sort it)
