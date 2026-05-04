@@ -57,6 +57,20 @@ _mesh_find() {
   "$AIRC_PYTHON" -m airc_core.channel_gist find --channel "$channel" --require-invite 2>/dev/null || true
 }
 
+# Find the canonical channel gist whether or not it currently has a host
+# invite. This is the durable room identity lookup. Zero-arg discovery
+# uses it to decide whether to host/adopt the existing chain instead of
+# being attracted to a newer invite-bearing solo island.
+_mesh_find_any() {
+  command -v gh >/dev/null 2>&1 || return 0
+  local channel="${1:-${room_name:-}}"
+  if [ -z "$channel" ] && [ -n "${CONFIG:-}" ] && [ -f "$CONFIG" ]; then
+    channel=$("$AIRC_PYTHON" -m airc_core.config default_channel --config "$CONFIG" 2>/dev/null || true)
+  fi
+  [ -z "$channel" ] && channel="general"
+  "$AIRC_PYTHON" -m airc_core.channel_gist find --channel "$channel" 2>/dev/null || true
+}
+
 # Publish a new mesh gist. Echoes the new gist id, or empty on failure.
 # Caller writes the JSON envelope to a tempfile and passes the path.
 # Per CLAUDE.md "never swallow errors": gh's stderr (auth lapsed, rate
