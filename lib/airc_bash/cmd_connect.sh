@@ -140,7 +140,6 @@ cmd_connect() {
   fi
   local general_sidecar=1   # default ON (issue #121) — also subscribe to #general
   local _force_general_sidecar=0   # set by --general flag (issue #136 re-opt-in)
-  local allow_takeover="${AIRC_ALLOW_TAKEOVER:-0}"
   # Recursion guard: when WE are the sidecar (spawned by another airc
   # connect), don't spawn our own sidecar. Otherwise: turtles all the way.
   [ "${AIRC_GENERAL_SIDECAR:-0}" = "1" ] && general_sidecar=0
@@ -155,9 +154,8 @@ cmd_connect() {
   local resolved_room_name=""
   # _resolved_gist_id is captured by the gist resolver when discovery resolves
   # a kind:"room" gist. Used by JOIN MODE's self-heal path: if the pair
-  # handshake fails because the host listed in the room gist is unreachable
-  # (sleep/crash/network), the joiner deletes the stale gist and re-execs
-  # itself in host mode — first-agent-back-in becomes the new host.
+  # handshake fails because the host listed in the room gist is unreachable,
+  # the joiner rewrites that same durable gist in host mode.
   local _resolved_gist_id=""
   # Heartbeat freshness vars - parsed by gist resolver in the room
   # case-arm. Must be defaulted here so the JOIN MODE early-takeover
@@ -188,7 +186,6 @@ cmd_connect() {
         echo "  --no-room                      disable substrate entirely (legacy 1:1 invite)"
         echo "  --no-general                   keep project room, skip #general subscription"
         echo "  --general                      re-opt-in to #general after a prior /part"
-        echo "  --takeover                     explicitly replace an unreachable/stale host"
         echo "  --no-gist                      don't publish/discover via gh gist (test mode)"
         echo "  --no-tailscale                 skip Tailscale even if installed"
         return 0 ;;
@@ -220,7 +217,8 @@ cmd_connect() {
         # Symmetric inverse of --no-general.
         _force_general_sidecar=1; shift ;;
       --takeover|-takeover)
-        allow_takeover=1; shift ;;
+        echo "  note: --takeover is no longer needed; stale hosts are recovered in-place." >&2
+        shift ;;
       --room-only|-room-only)
         # Combo: explicit project room + skip general sidecar. For
         # focused work where lobby noise would distract.
@@ -239,6 +237,11 @@ cmd_connect() {
     esac
   done
   set -- "${positional[@]+"${positional[@]}"}"
+
+  # One-shot marker used by child watchdogs to tell the parent "exit
+  # with restart semantics", not "fatal crash". Clear stale markers
+  # before this connect attempt starts.
+  rm -f "$AIRC_WRITE_DIR/airc.restart-request" 2>/dev/null || true
 
   # Trust-existing-monitor short-circuit (#369, sandbox-aware via
   # _monitor_alive_with_bearer_fallback per #372). If a live airc
@@ -694,8 +697,8 @@ cmd_connect() {
   if [ -n "$target" ] && ! echo "$target" | grep -q '@'; then
     local gist_id="${target#gist:}"
     # Capture for self-heal in JOIN MODE: if the host in this gist turns
-    # out to be unreachable, JOIN MODE deletes the gist by this id + takes
-    # over as the new host of the same room.
+    # out to be unreachable, JOIN MODE takes over this same gist as the
+    # new host of the same room.
     _resolved_gist_id="$gist_id"
     # Gist IDs are hex strings, typically 20-32 chars but accept any
     # plausible length so future GH ID schemes don't break us.
@@ -898,11 +901,10 @@ cmd_connect() {
   if [ -n "$target" ] && echo "$target" | grep -q '@'; then
     # ── JOIN MODE ──────────────────────────────────────────────────
 
-    # Stale-heartbeat fast-path. Stale presence is evidence that the host
-    # may be gone, but it is not authority to mutate the shared mesh.
-    # Default join is read-only: preserve the existing gist and fail
-    # loudly. Operators must pass --takeover (or AIRC_ALLOW_TAKEOVER=1)
-    # to intentionally replace a stale host.
+    # Stale-heartbeat fast-path. The gist is the durable room; the host is
+    # replaceable. If the host is stale, take over the SAME gist in place
+    # so every peer polling that room converges instead of getting a new
+    # solo island.
     #
     # Backward compat: pre-heartbeat gists have no last_heartbeat field,
     # _resolved_heartbeat_stale stays 0, this block is a no-op, and the
@@ -911,13 +913,9 @@ cmd_connect() {
     if [ "$_resolved_heartbeat_stale" = "1" ] && [ -n "$resolved_room_name" ] \
        && [ -n "$_resolved_gist_id" ]; then
       echo ""
-      echo "  ⚠  Host of #${resolved_room_name} is stale (last heartbeat ${_resolved_heartbeat_age}s ago)."
+      echo "  ⚠  Host of #${resolved_room_name} is stale (last heartbeat ${_resolved_heartbeat_age}s ago) — taking over existing mesh..."
       echo "     (prior host's gist: $_resolved_gist_id)"
-      if [ "$allow_takeover" = "1" ] && command -v gh >/dev/null 2>&1; then
-        echo "     --takeover requested — replacing stale host explicitly."
-        _self_heal_stale_host "$_resolved_gist_id"
-      fi
-      die "Refusing automatic takeover of #${resolved_room_name}; existing mesh preserved. Re-run with --takeover only if you intentionally want to replace that host."
+      _self_heal_stale_host "$_resolved_gist_id"
     fi
 
     # Parse name@user@host[:port]#pubkey
@@ -1110,18 +1108,15 @@ except Exception:
                   --my-identity-json "$my_identity_json" 2>&1) || _pair_ok=0
 
     if [ "$_pair_ok" = "0" ]; then
-      # Pair failure is read-only by default. An unreachable host is not
-      # proof the shared mesh should be deleted: this peer may lack the
-      # right network path, the host may be reachable to others, or the
-      # failure may be transient. Automatic takeover is the split-brain
-      # bug. Preserve the existing gist and fail loudly unless the
-      # operator explicitly requested --takeover.
+      # Pair failure recovers by taking over the SAME gist in place.
+      # Deleting the old gist and publishing a new one split-brained the
+      # bus; preserving and rewriting the durable room gist makes all
+      # pollers converge.
       if [ -n "$resolved_room_name" ] && [ -n "$_resolved_gist_id" ] \
          && command -v gh >/dev/null 2>&1 \
-         && [ "$_addr_picker_state" != "no_match" ] \
-         && [ "$allow_takeover" = "1" ]; then
+         && [ "$_addr_picker_state" != "no_match" ]; then
         echo ""
-        echo "  ⚠  Host of #${resolved_room_name} unreachable — --takeover requested, replacing host..."
+        echo "  ⚠  Host of #${resolved_room_name} unreachable — taking over existing mesh..."
         echo "     (prior host's gist: $_resolved_gist_id)"
         _self_heal_stale_host "$_resolved_gist_id"
       elif [ "$_addr_picker_state" = "no_match" ]; then
@@ -1136,12 +1131,6 @@ except Exception:
         echo "  ⚠  Host of #${resolved_room_name} published no scope this peer can reach." >&2
         echo "     Skipping self-heal (gist preserved for peers who CAN reach the host)." >&2
         echo "     Direct pair unavailable; gh-bearer broadcasts still work via gist." >&2
-        echo "" >&2
-      elif [ -n "$resolved_room_name" ] && [ -n "$_resolved_gist_id" ]; then
-        echo "" >&2
-        echo "  ⚠  Host of #${resolved_room_name} unreachable; existing mesh preserved." >&2
-        echo "     Not creating a solo replacement mesh. Re-run with --takeover only if" >&2
-        echo "     you intentionally want to replace the current host gist: $_resolved_gist_id" >&2
         echo "" >&2
       fi
       # Either not a room flow, or no gh, or no resolved_room_name → original die.
@@ -1225,8 +1214,8 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
 
     # If we resolved this pair via gist discovery (vs. inline-invite),
     # persist the gist id so resume-time freshness checks can detect a
-    # gist-deletion / replacement before re-pairing against a stale host
-    # (issue #83). Cleared by cmd_part on graceful leave.
+    # host-lease refresh or gist rotation before re-pairing against a
+    # stale host (issue #83). Cleared by cmd_part on graceful leave.
     if [ -n "$_resolved_gist_id" ]; then
       echo "$_resolved_gist_id" > "$AIRC_WRITE_DIR/room_gist_id"
       # #283: also map this channel→gist in channel_gists so the
@@ -1376,7 +1365,11 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
       # so cmd_send + future config-driven consumers see it.
       "$AIRC_PYTHON" -m airc_core.config subscribe \
         --config "$CONFIG" --channel "$room_name" --first 2>/dev/null || true
-      echo "  Hosting #${room_name} — no existing room on your gh account, fresh start."
+      if [ -n "${AIRC_ADOPT_GIST:-}" ]; then
+        echo "  Hosting #${room_name} — recovering existing room gist ${AIRC_ADOPT_GIST}."
+      else
+        echo "  Hosting #${room_name} — creating or adopting the canonical room gist."
+      fi
       echo "  Other agents on your gh account who run 'airc join' will auto-join."
     fi
 
@@ -1410,7 +1403,7 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
         # the same account: every --as-host bootstrap created its own
         # gist regardless of what was already there. With find-first,
         # all hosts on the gh account converge on the oldest canonical.
-        local _existing_room_gid=""
+        local _existing_room_gid="${AIRC_ADOPT_GIST:-}"
         if [ "$use_room" = "1" ]; then
           # Use full retry so gh's gist-listing eventual consistency
           # (a just-created gist may not appear in `gh gist list` for
@@ -1430,9 +1423,9 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
           # would block on it. When AIRC_NO_DISCOVERY=1, skip the
           # resolve and go straight to create_new — same as the
           # early mesh-find gate at line ~568.
-          if [ "${AIRC_NO_DISCOVERY:-0}" != "1" ]; then
+          if [ -z "$_existing_room_gid" ] && [ "${AIRC_NO_DISCOVERY:-0}" != "1" ]; then
             _existing_room_gid=$("$AIRC_PYTHON" -m airc_core.channel_gist resolve \
-                                 --channel "$room_name" --require-invite 2>/dev/null || true)
+                                 --channel "$room_name" 2>/dev/null || true)
           fi
         fi
         if [ -n "$_existing_room_gid" ]; then
@@ -1447,21 +1440,9 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
           echo "$room_name" > "$AIRC_WRITE_DIR/room_name"
           "$AIRC_PYTHON" -m airc_core.config set_channel_gist \
             --config "$CONFIG" --channel "$room_name" --gist-id "$_gist_id" 2>/dev/null || true
-          # Skip the new-gist creation block below since we have one.
-          # Continue to the heartbeat + monitor setup as if we'd just
-          # created it — the gist exists, we own/share it, write to it.
           : >"$AIRC_WRITE_DIR/.using_existing_room_gist"
         fi
 
-        # Skip create-new entirely if we already adopted an existing
-        # canonical gist above (find-first convergence path). Still
-        # need to set the variables downstream heartbeat setup uses
-        # — _now (timestamp) and _machine_id — since the create-new
-        # block populates them and we're skipping it.
-        if [ -n "${_existing_room_gid:-}" ]; then
-          local _now; _now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          local _machine_id; _machine_id=$(host_machine_id)
-        else
         # Bootstrap basename + description match channel_gist.create_new's
         # canonical shape (airc-room-<channel>.json + "airc room: #X").
         # Pre-fix the host path used a random mktemp basename
@@ -1553,9 +1534,16 @@ JSON
         # ID itself is the secret. Same threat model as the long invite:
         # whoever holds the string can pair. Room gists persist; invite
         # gists should be deleted by the host after the first joiner.
-        local _gist_url; _gist_url=$(gh gist create -d "$_gist_desc" "$_gist_tmp" 2>/dev/null | tail -1)
+        local _gist_url=""
+        if [ -n "${_existing_room_gid:-}" ] && [ "$use_room" = "1" ]; then
+          if gh gist edit "$_existing_room_gid" "$_gist_tmp" >/dev/null 2>/dev/null \
+             || gh gist edit "$_existing_room_gid" -a "$_gist_tmp" >/dev/null 2>/dev/null; then
+            _gist_url="https://gist.github.com/$_existing_room_gid"
+          fi
+        else
+          _gist_url=$(gh gist create -d "$_gist_desc" "$_gist_tmp" 2>/dev/null | tail -1)
+        fi
         rm -rf "$_gist_tmpdir"
-        fi  # close: skip create-new when adopted existing canonical
         if [ -n "$_gist_url" ]; then
           local _gist_id="${_gist_url##*/}"
           local _hh; _hh=$(humanhash "$_gist_id" 2>/dev/null)
@@ -1582,10 +1570,10 @@ JSON
             #
             # Loop runs every AIRC_HEARTBEAT_SEC (default 30s) and dies
             # automatically when its parent (the host airc connect bash)
-            # exits — so kill -9 on the host stops heartbeats within one
+            # exits, so kill -9 on the host stops heartbeats within one
             # interval. Joiners treat last_heartbeat older than
             # AIRC_HEARTBEAT_STALE (default 90s = 3 missed beats) as
-            # stale and self-heal as new host.
+            # stale and self-heal in-place as the new host.
             local _heartbeat_sec="${AIRC_HEARTBEAT_SEC:-30}"
             local _hb_parent_pid=$$
             local _hb_invite="$_invite_long"
@@ -1601,8 +1589,8 @@ JSON
             local _hb_state_dir="$AIRC_WRITE_DIR"
             (
               # Detach from job control so a parent SIGINT kills the
-              # whole tree but normal exit lets us race the trap to
-              # delete the gist first.
+              # whole tree. The room gist itself is durable and is not
+              # deleted by normal host exit.
               local _consec_fail=0
               local _max_consec_fail="${AIRC_HB_MAX_FAIL:-3}"
               while sleep "$_heartbeat_sec"; do
@@ -1744,6 +1732,7 @@ JSON
                     # Drop the stale local-state files so the parent's
                     # next discovery re-elects via _mesh_find.
                     rm -f "$_hb_state_dir/host_gist_id" "$_hb_state_dir/room_gist_id" 2>/dev/null
+                    printf 'heartbeat failure: %s\n' "$_classified" > "$_hb_state_dir/airc.restart-request" 2>/dev/null || true
                     # SIGTERM the parent — its EXIT trap will reap
                     # children + clean up. With daemon installed,
                     # launchd/systemd respawns; without daemon, the
@@ -1777,7 +1766,10 @@ JSON
             # channel using the same content-based resolver as connect.
             # Description-only winner election can yield to unrelated
             # live test gists and split the mesh.
-            local _race; _race=$(_mesh_take_over "" "$_gist_id" "$room_name")
+            local _race="winner"
+            if [ -z "${_existing_room_gid:-}" ]; then
+              _race=$(_mesh_take_over "" "$_gist_id" "$room_name")
+            fi
             case "$_race" in
               winner|"")
                 : # we won (or _mesh_take_over couldn't probe — assume winner, heartbeat will sort it)
@@ -1885,9 +1877,9 @@ JSON
     echo "$$ $PAIR_PID $_hb_pid_persisted" > "$AIRC_WRITE_DIR/airc.pid"
     # Clean exit on tab close (SIGTERM/SIGINT from Claude Code's Monitor tool
     # going away, or any other signal): reap the accept loop, its python
-    # listener, the heartbeat loop, AND delete our hosted gist if any —
-    # don't leave orphans holding the port, the SSH session, or a stale
-    # gist pointing at a corpse. Single canonical trap (was previously
+    # listener and the heartbeat loop. The hosted room gist is durable
+    # channel identity; stale host leases are recovered in-place. Single
+    # canonical trap (was previously
     # split between this site + the gist-publish site, but bash traps are
     # last-set-wins per shell so the split lost the gist-cleanup half).
     trap '
@@ -1896,13 +1888,21 @@ JSON
       [ -f "$AIRC_WRITE_DIR/heartbeat.pid" ] && _exit_hb_pid=$(cat "$AIRC_WRITE_DIR/heartbeat.pid" 2>/dev/null)
       [ -f "$AIRC_WRITE_DIR/host_gist_id" ] && _exit_gist_id=$(cat "$AIRC_WRITE_DIR/host_gist_id" 2>/dev/null)
       [ -n "$_exit_hb_pid" ] && kill $_exit_hb_pid 2>/dev/null
-      if [ -n "$_exit_gist_id" ] && command -v gh >/dev/null 2>&1; then
-        gh gist delete "$_exit_gist_id" --yes >/dev/null 2>&1
+      _exit_restart=0
+      if [ -f "$AIRC_WRITE_DIR/airc.restart-request" ]; then
+        _exit_restart=99
+        _exit_reason=$(cat "$AIRC_WRITE_DIR/airc.restart-request" 2>/dev/null | head -1)
+        echo "airc: restart requested (${_exit_reason:-internal transition})" >&2
+        rm -f "$AIRC_WRITE_DIR/airc.restart-request" 2>/dev/null
       fi
+      # Room gists are durable channel identity. Normal host exit must
+      # leave the gist in place so another peer can refresh the host
+      # lease in-place. `airc part` is the explicit deletion path.
       rm -f "$AIRC_WRITE_DIR/airc.pid" "$AIRC_WRITE_DIR/heartbeat.pid" "$AIRC_WRITE_DIR/host_gist_id" 2>/dev/null
       for p in $PAIR_PID $(proc_children $PAIR_PID) $(proc_children $$); do
         kill $p 2>/dev/null
       done
+      [ "$_exit_restart" = "99" ] && exit 99
     ' EXIT INT TERM
 
     spawn_general_sidecar_if_wanted
