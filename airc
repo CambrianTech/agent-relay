@@ -1317,9 +1317,10 @@ _monitor_multi_channel() {
       # the rest + exit subshell. Outer while-true reconnects (full
       # respawn) so all channels are healthy again.
       local _pids=()
-      while IFS=$'\t' read -r ch gid; do
-        [ -z "$ch" ] && continue
-        [ -z "$gid" ] && continue
+      _start_channel_bearer() {
+        local ch="$1" gid="$2"
+        [ -z "$ch" ] && return 0
+        [ -z "$gid" ] && return 0
         # bearer_cli recv stderr → per-channel log file (CLAUDE.md
         # "never swallow errors"). The previous 2>/dev/null hid every
         # transient gh failure, leaving "monitor's fine but no events"
@@ -1331,6 +1332,9 @@ _monitor_multi_channel() {
           --state-file "$AIRC_WRITE_DIR/bearer_state.${ch}.json" \
           2>>"$AIRC_WRITE_DIR/bearer_recv.${ch}.log" &
         _pids+=("$!:$ch")
+      }
+      while IFS=$'\t' read -r ch gid; do
+        _start_channel_bearer "$ch" "$gid"
       done <<< "$channel_map"
 
       # Watch loop: any child death → restart only that channel.
@@ -1377,6 +1381,43 @@ _monitor_multi_channel() {
           fi
         done
         _pids=("${_alive[@]}")
+
+        # Live channel-map refresh. `airc join --room X` can add a
+        # channel while the monitor is already healthy; pre-fix the
+        # monitor only re-read channel_gists on the next outer restart,
+        # so the promised "bearer picks it up within ~30s" was false
+        # unless something else died. Start newly-added channels and
+        # stop removed channels in-place while the formatter pipe stays
+        # alive.
+        local _current_map
+        _current_map=$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
+          --config "$CONFIG" 2>/dev/null || true)
+        if [ -n "$_current_map" ]; then
+          local _kept=()
+          for entry in "${_pids[@]}"; do
+            pid="${entry%%:*}"
+            ch="${entry#*:}"
+            if printf '%s\n' "$_current_map" | awk -F '\t' -v c="$ch" '$1 == c {found=1} END {exit found ? 0 : 1}'; then
+              _kept+=("$entry")
+            else
+              echo "airc: #${ch} removed from channel_gists; stopping its bearer while other channels continue" >&2
+              kill "$pid" 2>/dev/null || true
+            fi
+          done
+          _pids=("${_kept[@]}")
+
+          while IFS=$'\t' read -r ch gid; do
+            [ -z "$ch" ] && continue
+            local _already=0
+            for entry in "${_pids[@]}"; do
+              [ "${entry#*:}" = "$ch" ] && _already=1 && break
+            done
+            if [ "$_already" = "0" ]; then
+              echo "airc: #${ch} added to channel_gists; starting bearer without full monitor restart" >&2
+              _start_channel_bearer "$ch" "$gid"
+            fi
+          done <<< "$_current_map"
+        fi
       done
     } | monitor_formatter "$my_name" || true
     local fmt_exit="${PIPESTATUS[1]:-0}"
