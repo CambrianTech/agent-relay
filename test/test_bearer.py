@@ -724,7 +724,7 @@ class BearerCliRecvLockTests(unittest.TestCase):
         with open(self._pidfile, "w") as f:
             f.write(f"{my_other_pid}\told-gist-id\n")
         with mock.patch.object(bearer_cli, "_pid_alive", return_value=True), \
-             mock.patch.object(bearer_cli, "_is_our_bearer") as mock_is_ours:
+             mock.patch.object(bearer_cli, "_bearer_cmdline_matches") as mock_is_ours:
             # _is_our_bearer should be called with my CURRENT gist; if the
             # cmdline has the old gist it should report False → stale.
             mock_is_ours.return_value = False
@@ -741,7 +741,7 @@ class BearerCliRecvLockTests(unittest.TestCase):
         with open(self._pidfile, "w") as f:
             f.write(f"{my_other_pid}\tabc123\n")
         with mock.patch.object(bearer_cli, "_pid_alive", return_value=True), \
-             mock.patch.object(bearer_cli, "_is_our_bearer", return_value=True):
+             mock.patch.object(bearer_cli, "_bearer_cmdline_matches", return_value=True):
             result = bearer_cli._claim_recv_lock(self._args(room_gist_id="abc123"))
         self.assertEqual(result, bearer_cli._LOCK_HELD,
                          "live bearer for same gist must block claim")
@@ -763,7 +763,7 @@ class BearerCliRecvLockTests(unittest.TestCase):
             room_gist_id="samegist",
         )
         with mock.patch.object(bearer_cli, "_pid_alive", return_value=True), \
-             mock.patch.object(bearer_cli, "_is_our_bearer", return_value=True):
+             mock.patch.object(bearer_cli, "_bearer_cmdline_matches", return_value=True):
             second = bearer_cli._claim_recv_lock(second_args)
         self.assertEqual(second, bearer_cli._LOCK_HELD,
                          "same gist through a second channel must not spawn a duplicate bearer")
@@ -779,6 +779,26 @@ class BearerCliRecvLockTests(unittest.TestCase):
         with mock.patch.object(bearer_cli.os, "open", side_effect=OSError("nope")):
             result = bearer_cli._claim_recv_lock(self._args())
         self.assertEqual(result, bearer_cli._LOCK_DISABLED)
+
+    def test_empty_pidfile_is_treated_as_in_progress_not_reclaimed(self):
+        with open(self._pidfile, "w") as f:
+            f.write("")
+        with mock.patch.object(bearer_cli.time, "sleep", return_value=None):
+            result = bearer_cli._claim_recv_lock(self._args(room_gist_id="abc123"))
+        self.assertEqual(result, bearer_cli._LOCK_HELD)
+        with open(self._pidfile) as f:
+            self.assertEqual(f.read(), "")
+
+    def test_live_same_gist_with_unverifiable_cmdline_holds_lock(self):
+        other_pid = 99999995
+        with open(self._pidfile, "w") as f:
+            f.write(f"{other_pid}\tabc123\n")
+        with mock.patch.object(bearer_cli, "_pid_alive", return_value=True), \
+             mock.patch.object(bearer_cli, "_bearer_cmdline_matches", return_value=None):
+            result = bearer_cli._claim_recv_lock(self._args(room_gist_id="abc123"))
+        self.assertEqual(result, bearer_cli._LOCK_HELD)
+        with open(self._pidfile) as f:
+            self.assertEqual(f.read().strip(), f"{other_pid}\tabc123")
 
     def test_claim_uses_exclusive_create_for_absent_pidfile(self):
         import os

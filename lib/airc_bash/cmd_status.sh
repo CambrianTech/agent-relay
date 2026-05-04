@@ -488,9 +488,8 @@ cmd_inbox() {
       --peek)
         peek=1; shift ;;
       --reset)
-        mkdir -p "$AIRC_WRITE_DIR"
-        date -u '+%Y-%m-%dT%H:%M:%SZ' > "$cursor_file"
-        echo "airc inbox cursor reset."
+        "$AIRC_PYTHON" -m airc_core.inbox reset \
+          --home "$AIRC_WRITE_DIR" --cursor-file "$cursor_file"
         return 0 ;;
       -h|--help)
         echo "Usage: airc inbox [--peek] [--reset] [--since <ts|Ns|Nm|Nh>] [--count N]"
@@ -508,33 +507,18 @@ cmd_inbox() {
   esac
 
   if [ -z "$since" ]; then
-    if [ -f "$cursor_file" ]; then
-      since=$(cat "$cursor_file" 2>/dev/null || true)
-    fi
-    since="${since:-5m}"
+    since=""
   fi
 
-  local read_started
-  read_started=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-
   local out
-  if ! out=$(cmd_logs "$count" --since "$since" 2>&1); then
+  local inbox_args=(read --home "$AIRC_WRITE_DIR" --cursor-file "$cursor_file" --count "$count")
+  [ -n "$since" ] && inbox_args+=(--since "$since")
+  [ "$peek" -eq 1 ] && inbox_args+=(--peek)
+  if ! out=$("$AIRC_PYTHON" -m airc_core.inbox "${inbox_args[@]}" 2>&1); then
     printf '%s\n' "$out" >&2
     return 1
   fi
 
-  if [ -n "$out" ]; then
-    _airc_monitor_health_report degraded-only
-    printf '%s\n' "$out"
-  else
-    _airc_monitor_health_report degraded-only
-    echo "No new airc messages since $since"
-  fi
-
-  if [ "$peek" -eq 0 ]; then
-    mkdir -p "$AIRC_WRITE_DIR"
-    local latest
-    latest=$(printf '%s\n' "$out" | sed -n 's/^\[\([^]]*\)\].*/\1/p' | tail -1)
-    printf '%s\n' "${latest:-$read_started}" > "$cursor_file"
-  fi
+  _airc_monitor_health_report degraded-only
+  printf '%s\n' "$out"
 }

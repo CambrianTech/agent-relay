@@ -75,6 +75,30 @@ class GistContentTests(unittest.TestCase):
         out = _run_gist_content(gist, channel="cambriantech")
         self.assertEqual(json.loads(out)["invite"], "fresh-host@example")
 
+    def test_channel_freshness_uses_timestamp_parse_not_lexicographic_sort(self):
+        malformed = {
+            "airc": 1,
+            "kind": "mesh",
+            "channels": ["general"],
+            "last_heartbeat": "not-a-timestamp-z-wins-lexically",
+            "invite": "malformed-host@example",
+        }
+        fresh = {
+            "airc": 1,
+            "kind": "mesh",
+            "channels": ["general"],
+            "last_heartbeat": "2026-05-04T17:14:09+00:00",
+            "invite": "fresh-host@example",
+        }
+        gist = {
+            "files": {
+                "airc-room-general.json": {"content": json.dumps(malformed)},
+                "airc-room-other.json": {"content": json.dumps(fresh)},
+            },
+        }
+        out = _run_gist_content(gist, channel="general")
+        self.assertEqual(json.loads(out)["invite"], "fresh-host@example")
+
     def test_without_channel_preserves_first_file_fallback(self):
         gist = {
             "files": {
