@@ -1751,6 +1751,26 @@ JSON
                       *)
                         _classified="$_stderr_tail" ;;
                     esac
+                    case "$_classified" in
+                      rate-limit*)
+                        # GitHub explicitly warns that continuing to
+                        # retry while secondary-limited can extend the
+                        # throttle or get the integration banned. This
+                        # is degraded control-plane health, not proof
+                        # that our local host is dead. Do NOT self-
+                        # evict or SIGTERM the parent; that was the
+                        # monitor death spiral Joel hit on canary
+                        # 2026-05-04. Keep the host process alive, let
+                        # local/LAN transport continue, and back off
+                        # heartbeat writes before the next attempt.
+                        local _backoff_sec="${AIRC_GH_SECONDARY_BACKOFF_SEC:-60}"
+                        printf '[%s] airc: HOST HEARTBEAT DEGRADED for #%s on gist %s — gh secondary rate limit; keeping host alive and backing off %ss.\n' \
+                          "$(timestamp)" "$_hb_room" "$_gist_id" "$_backoff_sec" >> "$_hb_messages" 2>/dev/null || true
+                        _consec_fail=0
+                        sleep "$_backoff_sec" || exit 0
+                        continue
+                        ;;
+                    esac
                     local _evict_marker; _evict_marker=$(printf '{"from":"airc","ts":"%s","channel":"%s","msg":"[HOST EVICTED] heartbeat to gist %s failed %d consecutive times — self-healing. cause: %s"}' \
                       "$_hb_now" "$_hb_room" "$_gist_id" "$_consec_fail" "$_classified")
                     echo "$_evict_marker" >> "$_hb_messages" 2>/dev/null || true
