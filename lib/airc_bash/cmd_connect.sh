@@ -372,10 +372,12 @@ cmd_connect() {
   if [ "$use_room" = "1" ] && [ "$_looks_like_invite" = "0" ] \
      && command -v gh >/dev/null 2>&1; then
     # Pre-flight via the centralized state machine (lib_auth.sh).
-    # ok → proceed; rate_limited → wait + retry (token fine);
-    # invalid → airc instigates the browser self-heal in-process;
-    # not_installed → caller's outer guard already handled this.
-    airc_ensure_gh_auth_or_heal "airc join" \
+    # ok → proceed; rate_limited → proceed degraded so the monitor can
+    # start and use cached/local transport while GH's burst throttle
+    # clears; invalid → airc instigates the browser self-heal
+    # in-process; not_installed → caller's outer guard already handled
+    # this.
+    AIRC_GH_RATE_LIMIT_NONFATAL=1 airc_ensure_gh_auth_or_heal "airc join" \
       || die "gh auth not OK — see message above for next step"
   fi
 
