@@ -588,11 +588,20 @@ cmd_connect() {
     # no longer drives gist discovery — every subscriber on the account
     # converges on the same host.
     _did_room_discovery=1
-    local _mesh_id; _mesh_id=$(_mesh_find "$room_name")
+    local _mesh_id; _mesh_id=$(_mesh_find_any "$room_name")
     if [ -n "$_mesh_id" ]; then
-      echo "  Found mesh on your gh account → joining ($_mesh_id)"
-      target="$_mesh_id"
-      # fall through to gist resolver below
+      local _mesh_invite_id; _mesh_invite_id=$(_mesh_find "$room_name")
+      if [ -n "$_mesh_invite_id" ] && [ "$_mesh_invite_id" = "$_mesh_id" ]; then
+        echo "  Found mesh on your gh account → joining ($_mesh_id)"
+        target="$_mesh_id"
+        # fall through to gist resolver below
+      else
+        echo "  Found canonical room gist for #${room_name} → becoming host on that existing gist ($_mesh_id)."
+        export AIRC_ADOPT_GIST="$_mesh_id"
+        # Host branch below will rewrite the same gist with a fresh
+        # invite/host lease. Do not join a newer invite-bearing duplicate:
+        # that is the solo-island trap.
+      fi
     else
       echo "  No mesh found on your gh account → becoming the host."
       # Race against a concurrent host attempt is handled POST-publish
