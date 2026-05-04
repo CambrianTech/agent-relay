@@ -605,6 +605,163 @@ class BearerCliStateFileTests(unittest.TestCase):
         _os.unlink(state_path)
 
 
+class BearerCliRecvLockTests(unittest.TestCase):
+    """Per-(scope, channel, gist) bearer-lock prevents multiple bearer_cli
+    processes from polling the same gist concurrently — the duplicate
+    emission Joel diagnosed 2026-05-04 (scope teardown leaked orphan
+    bearers + host-gist-rotation respawned a second one).
+
+    Test contract for _claim_recv_lock / _release_lock:
+      - No --state-file → no lock taken (legacy / test paths unaffected).
+      - Pidfile absent → claim succeeds; pidfile written with our pid+gist.
+      - Pidfile present, PID dead → stale; claim succeeds (overwrites).
+      - Pidfile present, PID alive but for a DIFFERENT gist → stale
+        (host-gist-rotation case); claim succeeds.
+      - Pidfile present, PID alive AND for SAME gist → claim fails;
+        return _LOCK_HELD so caller exits cleanly.
+      - Pidfile cannot be written → return _LOCK_DISABLED so caller
+        continues without the duplicate-emission guarantee.
+      - Release removes pidfile only when it still contains our pid
+        (don't stomp a successor that took the lock after we ran).
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp(prefix="airc-cli-lock-test-")
+        self._state_file = self._tmpdir + "/bearer_state.general.json"
+        # Pidfile follows the .json → .pid rule baked into _claim_recv_lock.
+        self._pidfile = self._tmpdir + "/bearer_state.general.pid"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    _MISSING = object()
+
+    def _args(self, state_file=_MISSING, room_gist_id="abc123"):
+        # Explicit-None must pass through (test_no_state_file_means_no_lock
+        # exercises the no-lock path). _MISSING sentinel distinguishes
+        # "use the default scope state-file" from "really mean None."
+        return argparse.Namespace(
+            peer_id="self",
+            host_target=None,
+            identity_key=None,
+            remote_home=None,
+            offset_file=None,
+            state_file=self._state_file if state_file is self._MISSING else state_file,
+            room_gist_id=room_gist_id,
+        )
+
+    def test_no_state_file_means_no_lock(self):
+        # Legacy/test invocations that don't pass --state-file must NOT
+        # take a lock — preserves backwards compat for callers that don't
+        # have a writable scope dir to put the pidfile in.
+        result = bearer_cli._claim_recv_lock(self._args(state_file=None))
+        self.assertEqual(result, bearer_cli._LOCK_DISABLED)
+
+    def test_claim_writes_pidfile_when_absent(self):
+        import os
+        result = bearer_cli._claim_recv_lock(self._args())
+        self.assertIsNotNone(result)
+        pidfile_path, my_pid = result
+        self.assertEqual(pidfile_path, self._pidfile)
+        self.assertEqual(my_pid, os.getpid())
+        self.assertTrue(os.path.exists(self._pidfile))
+        with open(self._pidfile) as f:
+            content = f.read().strip()
+        # Format: "<pid>\t<gist_id>"
+        parts = content.split("\t", 1)
+        self.assertEqual(int(parts[0]), os.getpid())
+        self.assertEqual(parts[1], "abc123")
+
+    def test_claim_takes_over_when_pidfile_pid_is_dead(self):
+        # Stale pidfile from a previous bearer that died ungracefully.
+        # New bearer must take over, not exit because of dead-PID.
+        import os
+        with open(self._pidfile, "w") as f:
+            f.write("99999999\tabc123\n")  # PID that virtually can't exist
+        result = bearer_cli._claim_recv_lock(self._args())
+        self.assertIsNotNone(result, "stale (dead-PID) pidfile must not block claim")
+        # And our PID is now in the file.
+        with open(self._pidfile) as f:
+            content = f.read().strip()
+        self.assertEqual(int(content.split("\t", 1)[0]), os.getpid())
+
+    def test_claim_takes_over_when_other_bearer_is_for_different_gist(self):
+        # Host-gist-rotation case: previous bearer is alive but polling
+        # the OLD gist; new bearer for the NEW gist should claim.
+        import os
+        my_other_pid = 99999998  # used as "live but not us" stub
+        with open(self._pidfile, "w") as f:
+            f.write(f"{my_other_pid}\told-gist-id\n")
+        with mock.patch.object(bearer_cli, "_pid_alive", return_value=True), \
+             mock.patch.object(bearer_cli, "_is_our_bearer") as mock_is_ours:
+            # _is_our_bearer should be called with my CURRENT gist; if the
+            # cmdline has the old gist it should report False → stale.
+            mock_is_ours.return_value = False
+            result = bearer_cli._claim_recv_lock(self._args(room_gist_id="new-gist-id"))
+        self.assertIsNotNone(result, "rotated-gist case: stale lock must be reclaimable")
+        with open(self._pidfile) as f:
+            content = f.read().strip()
+        parts = content.split("\t", 1)
+        self.assertEqual(int(parts[0]), os.getpid())
+        self.assertEqual(parts[1], "new-gist-id")
+
+    def test_claim_fails_when_live_bearer_serves_same_gist(self):
+        my_other_pid = 99999997
+        with open(self._pidfile, "w") as f:
+            f.write(f"{my_other_pid}\tabc123\n")
+        with mock.patch.object(bearer_cli, "_pid_alive", return_value=True), \
+             mock.patch.object(bearer_cli, "_is_our_bearer", return_value=True):
+            result = bearer_cli._claim_recv_lock(self._args(room_gist_id="abc123"))
+        self.assertEqual(result, bearer_cli._LOCK_HELD,
+                         "live bearer for same gist must block claim")
+        # Pidfile contents must be UNCHANGED — we didn't take over.
+        with open(self._pidfile) as f:
+            content = f.read().strip()
+        self.assertTrue(content.startswith(f"{my_other_pid}\t"),
+                        "pidfile must NOT be overwritten when we lose the claim race")
+
+    def test_lock_write_failure_does_not_make_recv_exit_as_lock_held(self):
+        # If the pidfile cannot be created, _claim_recv_lock must report
+        # "disabled" rather than "held". cmd_recv should continue without
+        # the dedup guarantee; exiting would make AIRC silently stop
+        # receiving whenever the scope dir has a filesystem hiccup.
+        with mock.patch.object(bearer_cli.os, "open", side_effect=OSError("nope")):
+            result = bearer_cli._claim_recv_lock(self._args())
+        self.assertEqual(result, bearer_cli._LOCK_DISABLED)
+
+    def test_claim_uses_exclusive_create_for_absent_pidfile(self):
+        import os
+        with mock.patch.object(bearer_cli.os, "open", wraps=os.open) as mock_open:
+            result = bearer_cli._claim_recv_lock(self._args())
+        self.assertIsNotNone(result)
+        _path, flags, _mode = mock_open.call_args.args
+        self.assertTrue(flags & os.O_EXCL,
+                        "pidfile claim must use O_EXCL to avoid absent-file races")
+
+    def test_release_removes_pidfile_only_when_we_own_it(self):
+        # Claim, then release.
+        import os
+        result = bearer_cli._claim_recv_lock(self._args())
+        self.assertIsNotNone(result)
+        bearer_cli._release_lock(*result)
+        self.assertFalse(os.path.exists(self._pidfile),
+                         "release must remove our pidfile")
+
+        # Now simulate the case where someone else took the lock after us
+        # (different pid in the file) — release MUST NOT remove it.
+        with open(self._pidfile, "w") as f:
+            f.write("88888888\tother-gist\n")
+        # Try to release with our pid — file should be untouched.
+        bearer_cli._release_lock(self._pidfile, os.getpid())
+        self.assertTrue(os.path.exists(self._pidfile),
+                        "release must NOT stomp a pidfile owned by another bearer")
+        with open(self._pidfile) as f:
+            content = f.read().strip()
+        self.assertEqual(int(content.split("\t", 1)[0]), 88888888)
+
+
 class LocalBearerCanServeTests(unittest.TestCase):
     """Phase 3a: LocalBearer.can_serve must be conservative — only True
     when host_target is a literal loopback alias AND remote_home is a
