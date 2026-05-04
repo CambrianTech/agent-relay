@@ -2169,8 +2169,8 @@ SH
 # ── Scenario: solo_mesh_warns (transport health != collaboration) ───────
 # A self-healed host can have fresh local transport/bearer state while no
 # peers are actually paired to the mesh. `airc status` / `doctor --health`
-# must not report that as simply healthy; the user needs to know they may
-# be talking to a solo gist.
+# must not report stale prior collaboration as simply healthy, but a true
+# first user with no remote history should not be blocked.
 scenario_solo_mesh_warns() {
   section "solo_mesh_warns: status and doctor distinguish local health from collaboration"
   cleanup_all
@@ -2186,20 +2186,25 @@ JSON
 
   local status_out doctor_out
   status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
-  echo "$status_out" | grep -q 'collaboration: SOLO' \
-    && pass "status reports SOLO when peer records are empty" \
-    || fail "status did not report solo collaboration state ($status_out)"
+  echo "$status_out" | grep -q 'collaboration: waiting for peers' \
+    && pass "status reports waiting state for first user with no peers" \
+    || fail "status did not report first-user waiting state ($status_out)"
 
   doctor_out=$(AIRC_HOME="$home" "$AIRC" doctor --health 2>&1)
-  echo "$doctor_out" | grep -q 'collaboration mesh has 0 peer records' \
-    && pass "doctor --health warns about zero-peer collaboration mesh" \
-    || fail "doctor --health did not warn about zero peers ($doctor_out)"
-  echo "$doctor_out" | grep -q 'Bus DEGRADED' \
-    && pass "doctor summary is degraded, not clean healthy" \
-    || fail "doctor summary still looked clean ($doctor_out)"
+  echo "$doctor_out" | grep -q 'waiting for first peer' \
+    && pass "doctor --health treats first-user solo as informational" \
+    || fail "doctor --health did not surface first-user waiting state ($doctor_out)"
 
+  printf '{"from":"remote-agent","to":"all","ts":"%s","channel":"general","msg":"stale remote proof"}\n' \
+    "$(date -u -v-2H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)" >> "$home/messages.jsonl"
+  doctor_out=$(AIRC_HOME="$home" "$AIRC" doctor --health 2>&1 || true)
+  echo "$doctor_out" | grep -q 'may be a solo island' \
+    && pass "doctor --health blocks zero-peer mesh when prior remote traffic went stale" \
+    || fail "doctor --health did not block stale prior remote traffic ($doctor_out)"
+
+  : > "$home/messages.jsonl"
   printf '{"from":"remote-agent","to":"all","ts":"%s","channel":"general","msg":"recent remote proof"}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$home/messages.jsonl"
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$home/messages.jsonl"
   local now_ts; now_ts=$(date +%s)
   printf '{"kind":"gh","peer_id":"self","last_recv_ts":%s,"last_sender":"remote-agent","events_total":1,"diag":"last event from gh poll","last_heartbeat_ts":%s}\n' \
     "$((now_ts - 3600))" "$now_ts" > "$home/bearer_state.general.json"
