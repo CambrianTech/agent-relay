@@ -23,10 +23,10 @@ airc whois         # prints YOUR own identity (self)
 Output is a structured block:
 
 ```
-  name:      vhsm-d1f4
+  name:      build-d1f4
   pronouns:  they
-  role:      vhsm-android-sdk
-  bio:       wallet/merchant bridging cert flow on vhsm-canary
+  role:      build-runner
+  bio:       CI and release coordination for the current project
   status:    in a meeting til 3pm
   integrations: (none)
   host:      joelteply@100.91.51.87

@@ -174,7 +174,7 @@ def cmd_unsubscribe(args) -> int:
 # without re-doing gh-account discovery on every send.
 #
 # Format in config.json:
-#   "channel_gists": {"general": "<id>", "useideem": "<id>", ...}
+#   "channel_gists": {"general": "<id>", "acme": "<id>", ...}
 #
 # Single source of truth for "given a channel name, what gist?" — bash
 # never reads config.json directly for this; it goes through these
@@ -218,7 +218,7 @@ def cmd_set_host_block(args) -> int:
     """Atomically write the post-handshake host_* fields into config.
 
     Replaces a fragile env-var-passed python heredoc that bit on MSYS
-    Git Bash (continuum-b69f's catch 2026-04-27): MSYS translates env
+    Git Bash (caught 2026-04-27): MSYS translates env
     var values that look like Unix paths INTO the Windows-binary
     subprocess, so /Users/... silently became C:/Program Files/Git/...
     Argparse `--flags` are per-arg-predictable (callers can `//`-prefix

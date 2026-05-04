@@ -222,7 +222,7 @@ class HeartbeatSuppressionTests(unittest.TestCase):
 class DisplayFilterLoudDropTests(unittest.TestCase):
     """#399 follow-up to #401: when monitor_formatter's display filter
     drops a peer broadcast (channel name truly differs, e.g.
-    'cambriantech' vs subs=['general'] — #401's '#'-prefix tolerance
+    'acme' vs subs=['general'] — #401's '#'-prefix tolerance
     cannot help), emit a stdout warning so Claude Code's Monitor wakes
     + the operator sees they need `airc join --room <channel>`.
 
@@ -262,14 +262,14 @@ class DisplayFilterLoudDropTests(unittest.TestCase):
         return out.getvalue(), err.getvalue()
 
     def test_cross_channel_drop_emits_stdout_warning(self):
-        msg = {"from": "bob", "to": "all", "channel": "cambriantech",
+        msg = {"from": "bob", "to": "all", "channel": "acme",
                "msg": "should drop", "ts": "2026-05-02T15:00:00Z"}
         out, err = self._run([msg])
         self.assertNotIn("should drop", out,
             "cross-channel msg body must not display when subs filter rejects")
         self.assertIn("WARN display-filtered", out,
             "cross-channel drop must surface to stdout so Monitor wakes")
-        self.assertIn("cambriantech", out,
+        self.assertIn("acme", out,
             "warning must name the dropped channel so operator can subscribe")
         self.assertIn("display-filter drop", err,
             "stderr trace must record evidence for daemon.log debugging")
@@ -284,7 +284,7 @@ class DisplayFilterLoudDropTests(unittest.TestCase):
             "subscribed-channel msg must not trigger drop warning")
 
     def test_addressed_to_me_bypasses_filter(self):
-        msg = {"from": "bob", "to": "alice", "channel": "cambriantech",
+        msg = {"from": "bob", "to": "alice", "channel": "acme",
                "msg": "DM bypasses filter", "ts": "2026-05-02T15:00:00Z"}
         out, err = self._run([msg])
         self.assertIn("DM bypasses filter", out,

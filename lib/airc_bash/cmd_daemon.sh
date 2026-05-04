@@ -102,7 +102,7 @@ _daemon_airc_path() {
 # pointed at $HOME/.airc (empty / wrong room) while the user's actual
 # join state lives at $cwd/.airc. Joel 2026-04-28: "lol obv if it
 # worked you would have a monitor and be online. FAIL" -- caught the
-# scope mismatch on continuum-b69f's box.
+# scope mismatch on a multi-scope machine.
 _daemon_scope() {
   if [ -n "${AIRC_HOME:-}" ]; then
     echo "$AIRC_HOME"
@@ -287,7 +287,7 @@ REM Pre-fix: stdout went to nowhere (start /MIN cmd window had no
 REM redirect), only daemon.err captured the launcher's own restart
 REM messages — so 'airc daemon log' showed nothing useful, and
 REM "daemon.log doesn't exist" became a real symptom (b69f
-REM 2026-05-02 in #cambriantech). Stderr → daemon.err keeps the
+REM 2026-05-02 in a project room). Stderr → daemon.err keeps the
 REM launcher's restart records separate from the airc event stream.
 "$bash_exe" -c "exec '$airc_bin_unix' connect" 1>> "$scope_win\\daemon.log" 2>> "$scope_win\\daemon.err"
 REM Did airc just intentionally re-exec? If marker exists and is recent,

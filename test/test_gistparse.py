@@ -55,24 +55,24 @@ class GistContentTests(unittest.TestCase):
         stale = {
             "airc": 1,
             "kind": "mesh",
-            "channels": ["general", "cambriantech"],
+            "channels": ["general", "acme"],
             "last_heartbeat": "2026-05-04T12:54:15Z",
             "invite": "stale-host@example",
         }
         fresh = {
             "airc": 1,
             "kind": "mesh",
-            "channels": ["cambriantech", "general"],
+            "channels": ["acme", "general"],
             "last_heartbeat": "2026-05-04T17:14:09Z",
             "invite": "fresh-host@example",
         }
         gist = {
             "files": {
-                "airc-room-cambriantech.json": {"content": json.dumps(stale)},
+                "airc-room-acme.json": {"content": json.dumps(stale)},
                 "airc-room-general.json": {"content": json.dumps(fresh)},
             },
         }
-        out = _run_gist_content(gist, channel="cambriantech")
+        out = _run_gist_content(gist, channel="acme")
         self.assertEqual(json.loads(out)["invite"], "fresh-host@example")
 
     def test_channel_freshness_uses_timestamp_parse_not_lexicographic_sort(self):

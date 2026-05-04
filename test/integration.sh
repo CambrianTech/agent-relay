@@ -172,7 +172,7 @@ requires_local_pair_bearer_or_skip() {
 # pks-test-NNNN / etc` entries — confusing during dogfood and slowly
 # filling gist quota. Skipped silently if gh isn't authed (CI without
 # gh) or has no gist scope. Filters by description-prefix to avoid
-# touching real rooms (#general / #useideem / #cambriantech etc).
+# touching real rooms (#general / #acme / #example etc).
 cleanup_test_gists() {
   command -v gh >/dev/null 2>&1 || return 0
   gh auth status >/dev/null 2>&1 || return 0
@@ -180,7 +180,7 @@ cleanup_test_gists() {
   # Test-scope room name prefixes — keep this list in sync with
   # scenarios that publish real gists. Anything not on this list is
   # left alone (real rooms or someone else's tests).
-  local _test_prefix_re='airc room: (sars-test-|pks-test-|pks-debug|debug-room|sidecar-test-|solo-test-|ronly-test-|new-room|myproject|hb-test-|bounce-test-|ttl-test-|test-irc-|useideem-test-|stalepid-)'
+  local _test_prefix_re='airc room: (sars-test-|pks-test-|pks-debug|debug-room|sidecar-test-|solo-test-|ronly-test-|new-room|myproject|hb-test-|bounce-test-|ttl-test-|test-irc-|acme-test-|stalepid-)'
   local _ids
   _ids=$(gh gist list --limit 50 2>/dev/null | awk -F'\t' -v re="$_test_prefix_re" '$2 ~ re { print $1 }')
   if [ -n "$_ids" ]; then
@@ -1840,18 +1840,18 @@ scenario_two_tab_localhost() {
 }
 
 # ── Scenario: auto_scope (default room derived from git remote org) ─────
-# The /join skill contract: bare `airc join` from a useideem/* checkout
-# lands in #useideem; from a cambriantech/* checkout lands in #cambriantech.
+# The /join skill contract: bare `airc join` from an acme/* checkout
+# lands in #acme; from an example/* checkout lands in #example.
 # A previous PR (#104) gated this behind AIRC_AUTO_SCOPE_ROOM=1, which
 # left bare-launched agents stuck in #general regardless of cwd —
 # defeating the whole point. Re-enabled as default 2026-04-26 after a
-# session of dogfooding pain (two useideem tabs both hit #general
-# instead of converging on #useideem).
+# session of dogfooding pain (two same-org tabs both hit #general
+# instead of converging on the project room).
 #
 # Test plan: stand up a fake git repo with origin pointing to
-# `useideem/foo`, run `airc connect` in that cwd (gh-free, --no-gist),
-# verify the "Auto-scoped: #useideem (from git org; ...)" banner fires
-# and that room_name is "useideem". Then verify AIRC_NO_AUTO_ROOM=1
+# `acme/foo`, run `airc connect` in that cwd (gh-free, --no-gist),
+# verify the "Auto-scoped: #acme (from git org; ...)" banner fires
+# and that room_name is "acme". Then verify AIRC_NO_AUTO_ROOM=1
 # opts out cleanly (banner absent, falls back to #general).
 scenario_auto_scope() {
   section "auto_scope: bare connect derives room from git remote org"
@@ -1860,7 +1860,7 @@ scenario_auto_scope() {
 
   local repo=/tmp/airc-it-auto-repo
   rm -rf "$repo"; mkdir -p "$repo"
-  ( cd "$repo" && git init -q 2>/dev/null && git remote add origin https://github.com/useideem/foo.git ) \
+  ( cd "$repo" && git init -q 2>/dev/null && git remote add origin https://github.com/acme/foo.git ) \
     || { fail "git scaffold failed"; cleanup_all; return; }
 
   # Default ON: bare connect should auto-scope.
@@ -1873,13 +1873,13 @@ scenario_auto_scope() {
     grep -qE 'Hosting as|Auto-scoped' /tmp/airc-it-auto-h.log 2>/dev/null && break
   done
 
-  grep -qE 'Auto-scoped: #useideem \(from git org' /tmp/airc-it-auto-h.log \
-    && pass "auto-scope banner: 'Auto-scoped: #useideem (from git org)'" \
+  grep -qE 'Auto-scoped: #acme \(from git org' /tmp/airc-it-auto-h.log \
+    && pass "auto-scope banner: 'Auto-scoped: #acme (from git org)'" \
     || fail "auto-scope banner MISSING (got: $(head -3 /tmp/airc-it-auto-h.log | tr '\n' '|'))"
 
-  grep -qE 'Hosting #useideem' /tmp/airc-it-auto-h.log \
-    && pass "host banner reports #useideem (auto-scoped room took effect)" \
-    || fail "host banner not on #useideem (auto-scope didn't propagate to host setup)"
+  grep -qE 'Hosting #acme' /tmp/airc-it-auto-h.log \
+    && pass "host banner reports #acme (auto-scoped room took effect)" \
+    || fail "host banner not on #acme (auto-scope didn't propagate to host setup)"
 
   # Kill that run before testing the opt-out (port + scope reuse).
   for f in /tmp/airc-it-auto-h/state/airc.pid; do

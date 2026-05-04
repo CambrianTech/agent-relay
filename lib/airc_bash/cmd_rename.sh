@@ -57,7 +57,7 @@ cmd_rename() {
   [ -z "$new_name" ] && die "Invalid name (must be a-z 0-9 -)"
   [ ! -f "$CONFIG" ] && die "Not initialized — run 'airc connect' first"
 
-  # Announce sanitization (vhsm-d1f4 caught 2026-04-29: 'two words' →
+  # Announce sanitization (caught 2026-04-29: 'two words' →
   # 'two-words', 'VHSMD1F4' → 'vhsmd1f4' silently). Pre-fix the user
   # had no signal that the name they typed wasn't the name that landed.
   if [ "$_input" != "$new_name" ]; then
@@ -70,7 +70,7 @@ cmd_rename() {
     return
   fi
 
-  # Collision check (continuum-b741 + ideem-local-4bef caught
+  # Collision check (caught
   # 2026-04-29: renaming to an active peer's name was accepted
   # silently, both peers then visible as the same name, DM routing
   # ambiguous). Two-source roster:
@@ -136,7 +136,7 @@ sys.exit(0 if (target in seen and target not in my_history) else 1)
   echo "  Renamed: $old_name → $new_name"
 
   # Phase 2: propagate the config write to sibling scopes BEFORE
-  # broadcasting (#179 — vhsm-d1f4 + ideem-local-4bef caught 2026-04-28
+  # broadcasting (#179 — caught 2026-04-28
   # that nick rename only updated the current scope's config, leaving
   # any sidecar to broadcast under the OLD name).
   #

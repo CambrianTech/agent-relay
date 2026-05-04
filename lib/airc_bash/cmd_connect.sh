@@ -402,19 +402,19 @@ cmd_connect() {
   # daemon required. See project_airc_transport_architecture memory.
 
   # `airc join` (no args) auto-scopes to the room matching the current cwd.
-  # Resolution: git remote org first ('useideem/authenticator' → #useideem),
+  # Resolution: git remote org first ('acme/api' → #acme),
   # parent-dir basename second (local-only repos). Falls back to #general
   # only when neither signal fires (non-git dir, no remote). The skill
   # /join contract documents this as the default.
   #
   # The trade-off: two tabs in DIFFERENT projects on the same gh account
-  # land in different rooms (a #cambriantech tab can't see a #useideem
-  # tab). That's intentional — project work shouldn't mix with unrelated
+  # land in different rooms (an #acme tab can't see an #example
+  # tab by default). That's intentional — project work shouldn't mix with unrelated
   # project chatter. Cross-project agents who need a shared lobby:
   # `AIRC_NO_AUTO_ROOM=1 airc join` or `airc join --room general`.
   #
-  # Two tabs in the SAME project converge automatically: both useideem
-  # tabs auto-scope to #useideem, both find each other. That's the case
+  # Two tabs in the SAME project converge automatically: both acme
+  # tabs auto-scope to #acme, both find each other. That's the case
   # this default optimizes for.
   #
   # History: this was rolled back in PR #104 over the cross-project
@@ -433,7 +433,7 @@ cmd_connect() {
     [ -f "$AIRC_WRITE_DIR/room_name" ] && _saved_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
     if [ -n "$_saved_room" ]; then
       room_name="$_saved_room"
-      # Phase 2C clarity (continuum-b741's report): the mesh substrate
+      # Phase 2C clarity: the mesh substrate
       # may steer us to a different host channel than our saved
       # preference. State the preference as INTENT, not promise — the
       # post-discovery banner is the authoritative "what you actually
@@ -923,7 +923,7 @@ cmd_connect() {
         # whole quoted line including the JSON-key prefix. Strip
         # leading non-name characters: anything before the first letter
         # is JSON syntax (quotes, colons, whitespace). Found by
-        # continuum-b69f Win→Mac e2e 2026-04-27 — bash on Git Bash
+        # Win→Mac e2e 2026-04-27 — bash on Git Bash
         # ships without jq, falls through to this path, captured
         # `"invite":"authenticator-fd63@...` as the invite, then the
         # downstream @-split made the displayed peer name include
@@ -1061,13 +1061,13 @@ cmd_connect() {
     # need the gist_id for cmd_part on joiner side — only the host owns
     # the gist lifecycle — but we save the room name for display.
     if [ -n "$resolved_room_name" ]; then
-      # Phase 2B.2.1 (continuum-b741's WART 1): joiner's cwd-derived or
+      # Phase 2B.2.1: joiner's cwd-derived or
       # explicit --room intent must NOT be overwritten by the host's
-      # advertised channel. If the user wanted #cambriantech (cwd) and
-      # the mesh host happens to advertise #useideem, the joiner is
+      # advertised channel. If the user wanted #acme (cwd) and the
+      # mesh host happens to advertise #example, the joiner is
       # subscribed to BOTH — cmd_send default = user's intent; the
       # host's channel is tagged on too so their traffic still displays
-      # via [#useideem] prefix.
+      # via [#example] prefix.
       #
       # The legacy room_name file gets the user's intent when it differs
       # (so cmd_send's third-priority fallback also picks the right
@@ -1186,7 +1186,7 @@ except Exception:
         echo "" >&2
       fi
       # Either not a room flow, or no gh, or no resolved_room_name → original die.
-      # Surface the captured pair-handshake stderr (continuum-b69f 2026-04-27:
+      # Surface the captured pair-handshake stderr (2026-04-27:
       # Windows users got "Can't reach ..." with no clue the real cause was
       # a Microsoft Store python3.exe stub returning exit 49). Per the
       # global "never swallow errors" rule — evidence is for the debugger,
@@ -1285,7 +1285,7 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
     local host_identity_json; host_identity_json=$(printf '%s' "$response" | "$AIRC_PYTHON" -m airc_core.handshake get_field identity "{}" 2>/dev/null || echo "{}")
     [ -z "$host_identity_json" ] && host_identity_json="{}"
     # Pass values as env vars instead of bash-substituted into the
-    # python heredoc body. continuum-b69f's PR #164 retest 2026-04-27
+    # python heredoc body. PR #164 retest 2026-04-27
     # found host_airc_home / host_name / host_port / host_ssh_pub /
     # host_identity all silently unwritten on Win→Mac join: if ANY of
     # the bash substitutions broke the python source (newline in
@@ -1699,9 +1699,9 @@ JSON
                 # --filename or run interactively" — heartbeat fails N
                 # times in a row and the host self-evicts (deletes its
                 # own gist + respawns) when nothing was actually wrong.
-                # That eviction loop is the surface ideem-local-4bef
+                # That eviction loop is the surface QA
                 # root-caused 2026-04-29; it's also what nuked the
-                # #useideem gist mid-ping-debug. Ensuring the temp
+                # #example gist mid-ping-debug. Ensuring the temp
                 # basename matches the canonical filename closes the
                 # whole convergent class.
                 local _hb_tmpdir; _hb_tmpdir=$(mktemp -d -t airc-hb.XXXXXX)

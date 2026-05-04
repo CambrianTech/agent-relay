@@ -512,7 +512,7 @@ _doctor_health() {
   # Scope to subscribed_channels ONLY (Codex's first-run report 2026-05-02
   # exposed this — same fix-shape as #406's beacon scoping). Pre-fix the
   # probe globbed every bearer_state.*.json on disk INCLUDING stale files
-  # from prior subscriptions (a #cambriantech the user parted, an old
+  # from prior subscriptions (an #old-project the user parted, an old
   # qa-foo room from a previous test, etc.). Codex correctly identified
   # the noise: "sees stale bearer-state files for older channels". Real
   # fix is to intersect with the current subscribed_channels list — same

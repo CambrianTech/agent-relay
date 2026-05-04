@@ -31,7 +31,7 @@ set -euo pipefail
 # cmd_send then took the HOST path (no host_target) and mirrored
 # locally without ever attempting the SSH push. Net: every Win→Mac
 # broadcast silently no-op'd while pretending success. Caught by
-# continuum-b69f via cross-Mac/Windows substrate-bypass gist
+# a cross-Mac/Windows substrate-bypass gist
 # 2026-04-27.
 #
 # Fix: env-var holds the resolved interpreter path. Bash variables
@@ -95,7 +95,7 @@ export AIRC_PYTHON
 # `--host-airc-home /Users/joelteply/.airc` arrives at python.exe as
 # `--host-airc-home C:/Program Files/Git/Users/joelteply/.airc` —
 # silently corrupting paths that the joiner later sends back over SSH
-# to a real Unix host. continuum-b69f traced + fixed this 2026-04-27;
+# to a real Unix host. Traced + fixed 2026-04-27;
 # the targeted exclude covers macOS / Linux / root home prefixes
 # without breaking `/tmp/` or `/c/` paths (which DO need translation
 # for `--config "$CONFIG"` where $CONFIG is on the local Windows
@@ -110,7 +110,7 @@ export MSYS2_ARG_CONV_EXCL="${MSYS2_ARG_CONV_EXCL:-/Users/;/home/;/root/}"
 # error handler catches it, and the message gets silently dropped from
 # the user's view. PYTHONIOENCODING=utf-8 is the standard remedy —
 # applies to every Python subprocess airc spawns. Honors user override.
-# continuum-b69f's catch + verify 2026-04-27.
+# traced + verified 2026-04-27.
 export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
 
 # Resolve the airc install dir's lib/ path and prepend to PYTHONPATH so
@@ -245,9 +245,9 @@ derive_name() {
 # Two signals, tried in order:
 #
 #   1. gh org from `origin` remote URL (the stable, cross-machine ID).
-#      useideem/vHSM on Joel's Mac + useideem/authenticator on Brian's
-#      Linux box both default to #useideem. No matter where on disk
-#      either of us keeps the checkout, the remote URL fingerprints it.
+#      acme/api on one machine + acme/frontend on another both default
+#      to #acme. No matter where on disk either checkout lives, the
+#      remote URL fingerprints the shared project owner.
 #      Handles github / gitlab / bitbucket / self-hosted (just the
 #      owner segment between host and repo). Matches airc's "gh OAuth
 #      scope IS the trust boundary" philosophy — the org that owns the
@@ -443,7 +443,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 # cmd_status used any-alive logic and cmd_send used all-alive logic, so a
 # pidfile with one stale orphan + one live process showed "monitor:
 # running" in status BUT "Send NOT delivered — pidfile stale" from msg.
-# vhsm-d1f4 + authenticator-448f independently reproduced 2026-04-29.
+# Independently reproduced by two agents 2026-04-29.
 #
 # Contract: a scope is "alive" if AT LEAST ONE pid in the pidfile is
 # alive. Stale pids are pruned in-place so the file converges on
@@ -1115,7 +1115,7 @@ _primary_scope_for() {
   # like '.airc' (canonical primary scope name in real deployments) — the
   # regex eats the whole thing. Without the empty-prefix guard, '.airc'
   # gets treated as a sidecar of '' under '<parent>/' which then can't
-  # find config.json and silently no-ops. Bug surfaced by vhsm-d1f4 in
+  # find config.json and silently no-ops. Bug surfaced during QA in
   # PR #144 e2e (2026-04-27): airc join --general silently failed because
   # _clear_parted_room got the wrong path. Test scenario_part_persists
   # passed because its fixture path is 'state'/'state.general' (no
@@ -1138,7 +1138,7 @@ _clear_parted_room()  { [ -f "$1/config.json" ] && "$AIRC_PYTHON" -m airc_core.c
 # its project room AND the lobby. Identity NICK is shared via AIRC_NAME;
 # ssh_key + peer records are per-scope. Each subscription gets its own
 # wire (the python formatter prefixes events with the scope's room_name,
-# so the user sees `[#useideem] X` and `[#general] Y` interleaved).
+# so the user sees `[#acme] X` and `[#general] Y` interleaved).
 #
 # Reads from cmd_connect's locals via bash's dynamic scoping:
 #   general_sidecar     1 = spawn, 0 = don't (--no-general / --room-only /
@@ -1952,7 +1952,7 @@ reminder_timer_loop() {
       # ancient last_recv_ts values that, if included in the MAX, would
       # silently rot the beacon's calculation. Caught live 2026-05-02:
       # beacon reported '288919s silent' on a fresh-restart bearer
-      # because bearer_state.useideem.json from 80hrs prior had a
+      # because bearer_state.old-room.json from 80hrs prior had a
       # positive last_recv_ts that won the MAX over the freshly-opened
       # bearer's null. The freshly-opened bearer's correct read should
       # have been "small recv_silent because the file was just written"

@@ -211,7 +211,7 @@ ensure_prereqs() {
     # Strict probe: presence on PATH AND a successful --version invocation.
     # Used selectively: python3 needs the strict variant because Windows
     # Store's python3.exe alias is on PATH but exits 49 with a Store-
-    # redirect (continuum-b69f, 2026-04-27). git/gh all
+    # redirect (2026-04-27). git/gh all
     # support --version cleanly. ssh-keygen does NOT have a version
     # flag at all (different from `ssh -V`); calling `ssh-keygen
     # --version` exits non-zero on every install, so the strict probe
@@ -427,7 +427,7 @@ else
   # First install. Honor AIRC_CHANNEL if set so users can land on canary
   # directly via `AIRC_CHANNEL=canary curl|bash` without a follow-up
   # `airc canary && airc update` dance. Default to main (the release
-  # branch) when AIRC_CHANNEL is unset. Caught by vhsm-d1f4 2026-04-28
+  # branch) when AIRC_CHANNEL is unset. Caught by QA 2026-04-28
   # during the #191 release-gate fresh-install verification: env var was
   # silently ignored, install landed on main.
   CHANNEL_TARGET="${AIRC_CHANNEL:-main}"
@@ -460,7 +460,7 @@ ln -sf "$CLONE_DIR/airc" "$BIN_DIR/relay"
 # made airc.ps1 a thin forwarder to bash, but that's moot if the
 # .ps1 isn't on PATH. cp (not ln -sf) — Windows symlinks are
 # privileged + flaky; copying is universal. Caught by
-# continuum-b69f 2026-04-29 (issue #249 PowerShell row).
+# 2026-04-29 (issue #249 PowerShell row).
 case "$(uname -s 2>/dev/null)" in
   MINGW*|MSYS*|CYGWIN*)
     [ -f "$CLONE_DIR/airc.cmd" ] && cp -f "$CLONE_DIR/airc.cmd" "$BIN_DIR/airc.cmd"

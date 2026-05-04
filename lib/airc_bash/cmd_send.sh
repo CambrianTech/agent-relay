@@ -32,7 +32,7 @@ cmd_send() {
   # model means a tab is in #project-room AND #general simultaneously,
   # but each room has its own scope. Without --room support here, sending
   # to a non-current room required `AIRC_HOME=$cwd/.airc.<room> airc msg`,
-  # which is nonobvious (vhsm-Claude attempted `airc msg --room general`
+  # which is nonobvious (an agent attempted `airc msg --room general`
   # on 2026-04-26, the unrecognized flag silently became part of the
   # message body — exactly the evidence-eating shape the project rejects).
   #
@@ -166,7 +166,7 @@ cmd_send() {
     case "$1" in
       @*)
         local _p="${1#@}"
-        # Reject empty `@` (continuum-b741 + ideem-local-4bef caught
+        # Reject empty `@` (caught
         # 2026-04-29: `airc msg @ body` silently broadcast). Reject
         # double-@ `@@peer` while we're here (also caught: accepted as
         # DM to literal '@peer'). Reject numeric-only DMs as per the
@@ -219,7 +219,7 @@ cmd_send() {
     msg="$*"
   fi
   # Reject empty broadcast bodies — pre-fix `airc msg ""` printed the
-  # usage line but exited 0 (continuum-b741 caught 2026-04-29). The
+  # usage line but exited 0 (caught 2026-04-29). The
   # other "no message" path already dies above; this one is the
   # explicit-empty-string case that fell through.
   [ "$peer_name" = "all" ] && [ -z "$msg" ] \
