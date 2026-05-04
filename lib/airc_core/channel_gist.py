@@ -237,9 +237,25 @@ def find_existing(channel: str, require_invite: bool = False) -> Optional[str]:
         matches.sort(key=lambda g: g.get("created_at", ""))
         return matches[0].get("id")
 
+    def _room_desc_matches(matches: list[dict]) -> list[dict]:
+        """Prefer explicit per-channel room gists over generic mesh gists.
+
+        A bad host can add `airc-room-<channel>.json` to a newer generic
+        `airc mesh` gist during recovery. The durable chain created by
+        channel_gist.create_new has description `airc room: #<channel>`;
+        that description is a stronger canonical signal than a generic
+        mesh description with an accidentally matching filename.
+        """
+        prefix = f"airc room: #{channel}"
+        return [g for g in matches if (g.get("description") or "").strip().startswith(prefix)]
+
+    def _choose_canonical(matches: list[dict]) -> Optional[str]:
+        exact_desc = _room_desc_matches(matches)
+        return _oldest(exact_desc) or _oldest(matches)
+
     # Pass 1: canonical single-channel match (cheap, listing-response).
     canonical_matches = [g for g in candidates if _is_single_channel_match(g, channel, require_invite=require_invite)]
-    chosen = _oldest(canonical_matches)
+    chosen = _choose_canonical(canonical_matches)
     if chosen:
         return chosen
 
@@ -257,7 +273,7 @@ def find_existing(channel: str, require_invite: bool = False) -> Optional[str]:
             # Carry created_at from the listing so _oldest can sort.
             full.setdefault("created_at", g.get("created_at", ""))
             deep_canonical.append(full)
-    chosen = _oldest(deep_canonical)
+    chosen = _choose_canonical(deep_canonical)
     if chosen:
         return chosen
 
