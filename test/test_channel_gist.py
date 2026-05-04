@@ -186,7 +186,12 @@ class LocalCacheFallbackTests(unittest.TestCase):
                 current: self._snapshot(current, "general", ["general"], "2026-05-04T18:11:00Z"),
                 island: self._snapshot(island, "general", ["general", "cambriantech"], "2026-05-04T18:27:00Z"),
             }
-            with mock.patch.dict(os.environ, {"AIRC_GIST_CACHE_ROOTS": tmp, "AIRC_DISABLE_LOCAL_GIST_FALLBACK": ""}), \
+            roots = os.pathsep.join([
+                str(Path(tmp) / "old-worktree" / ".airc"),
+                str(Path(tmp) / "current-worktree" / ".airc"),
+                str(Path(tmp) / "solo-island" / ".airc"),
+            ])
+            with mock.patch.dict(os.environ, {"AIRC_GIST_CACHE_ROOTS": roots, "AIRC_DISABLE_LOCAL_GIST_FALLBACK": ""}), \
                  mock.patch.object(channel_gist, "_gh_list_user_gists", return_value=[]), \
                  mock.patch.object(channel_gist, "_git_gist_snapshot", side_effect=lambda gid: snapshots.get(gid)):
                 self.assertEqual(channel_gist.find_existing("general"), current)
@@ -201,10 +206,66 @@ class LocalCacheFallbackTests(unittest.TestCase):
                 old: self._snapshot(old, "cambriantech", ["cambriantech", "general"], "2026-05-04T17:40:00Z"),
                 current: self._snapshot(current, "cambriantech", ["cambriantech", "general"], "2026-05-04T18:22:49Z"),
             }
-            with mock.patch.dict(os.environ, {"AIRC_GIST_CACHE_ROOTS": tmp, "AIRC_DISABLE_LOCAL_GIST_FALLBACK": ""}), \
+            roots = os.pathsep.join([
+                str(Path(tmp) / "old" / ".airc"),
+                str(Path(tmp) / "current" / ".airc"),
+            ])
+            with mock.patch.dict(os.environ, {"AIRC_GIST_CACHE_ROOTS": roots, "AIRC_DISABLE_LOCAL_GIST_FALLBACK": ""}), \
                  mock.patch.object(channel_gist, "_gh_list_user_gists", return_value=[]), \
                  mock.patch.object(channel_gist, "_git_gist_snapshot", side_effect=lambda gid: snapshots.get(gid)):
                 self.assertEqual(channel_gist.find_existing("cambriantech"), current)
+
+    def test_default_local_fallback_only_reads_current_airc_home_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            broad = home / "Development" / "project" / ".airc"
+            current = home / "current" / ".airc"
+            broad.mkdir(parents=True)
+            current.mkdir(parents=True)
+            (broad / "config.json").write_text(
+                json.dumps({"channel_gists": {"general": "broadscan"}}),
+                encoding="utf-8",
+            )
+            current_gid = "cccccccc"
+            (current / "config.json").write_text(
+                json.dumps({"channel_gists": {"general": current_gid}}),
+                encoding="utf-8",
+            )
+            old_home = os.environ.get("HOME")
+            env = {"AIRC_HOME": str(current), "AIRC_DISABLE_LOCAL_GIST_FALLBACK": ""}
+            with mock.patch.dict(os.environ, env, clear=False), \
+                 mock.patch("os.path.expanduser", side_effect=lambda p: str(home) if p == "~" else p), \
+                 mock.patch("os.walk", side_effect=AssertionError("local fallback must not crawl directories")), \
+                 mock.patch.object(channel_gist, "_git_gist_snapshot", return_value=None) as snapshot:
+                candidates = channel_gist._local_config_gist_candidates("general")
+            if old_home is not None:
+                os.environ["HOME"] = old_home
+            self.assertEqual(candidates, [(current_gid, os.path.getmtime(current / "config.json"))])
+            snapshot.assert_not_called()
+
+    def test_explicit_local_fallback_roots_are_config_files_or_airc_dirs_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Path(tmp) / "first.airc"
+            second = Path(tmp) / "second-config.json"
+            first.mkdir()
+            (first / "config.json").write_text(
+                json.dumps({"channel_gists": {"general": "11111111"}}),
+                encoding="utf-8",
+            )
+            second.write_text(
+                json.dumps({"channel_gists": {"general": "22222222"}}),
+                encoding="utf-8",
+            )
+            roots = os.pathsep.join([str(first), str(second)])
+            with mock.patch.dict(os.environ, {"AIRC_GIST_CACHE_ROOTS": roots, "AIRC_HOME": ""}), \
+                 mock.patch("os.walk", side_effect=AssertionError("local fallback must not crawl directories")):
+                self.assertEqual(
+                    sorted(channel_gist._local_config_gist_candidates("general")),
+                    sorted([
+                        ("11111111", os.path.getmtime(first / "config.json")),
+                        ("22222222", os.path.getmtime(second)),
+                    ]),
+                )
 
 
 class GistListCacheTests(unittest.TestCase):

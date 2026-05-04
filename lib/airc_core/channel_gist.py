@@ -44,22 +44,6 @@ _GH_BIN = "gh"
 _GH_API_TIMEOUT = 10.0
 _GIST_LIST_LIMIT = 100   # `airc list` uses 50; we go a bit higher to be safe
 _GIST_ID_CHARS = set("0123456789abcdefABCDEF")
-_LOCAL_SCAN_MAX_DEPTH = 7
-_LOCAL_SCAN_PRUNE = {
-    ".git",
-    ".hg",
-    ".svn",
-    ".venv",
-    "__pycache__",
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    ".next",
-    ".turbo",
-}
-
-
 def _cache_path(name: str) -> str:
     uid = str(os.getuid()) if hasattr(os, "getuid") else os.environ.get("USERNAME", "user")
     return os.path.join(tempfile.gettempdir(), f"airc-{name}-{uid}.json")
@@ -311,28 +295,28 @@ def _strict_single_channel_match(gist: dict, channel: str, require_invite: bool 
     return False
 
 
-def _local_scan_roots() -> list[str]:
+def _local_config_paths() -> list[str]:
     raw = os.environ.get("AIRC_GIST_CACHE_ROOTS", "")
-    roots: list[str] = []
+    paths: list[str] = []
     if raw:
-        roots.extend(p for p in raw.split(os.pathsep) if p)
+        for entry in (p for p in raw.split(os.pathsep) if p):
+            expanded = os.path.abspath(os.path.expanduser(entry))
+            if os.path.isdir(expanded):
+                paths.append(os.path.join(expanded, "config.json"))
+            else:
+                paths.append(expanded)
     airc_home = os.environ.get("AIRC_HOME", "")
     if airc_home:
-        roots.append(os.path.dirname(os.path.dirname(os.path.abspath(airc_home))))
-    cwd = os.getcwd()
-    roots.append(cwd)
-    home = os.path.expanduser("~")
-    for rel in ("Development", "dev", "src", "Code"):
-        roots.append(os.path.join(home, rel))
+        paths.append(os.path.join(os.path.abspath(airc_home), "config.json"))
 
     out: list[str] = []
     seen: set[str] = set()
-    for root in roots:
-        root = os.path.abspath(os.path.expanduser(root))
-        if root in seen or not os.path.isdir(root):
+    for path in paths:
+        path = os.path.abspath(os.path.expanduser(path))
+        if path in seen or not os.path.isfile(path):
             continue
-        seen.add(root)
-        out.append(root)
+        seen.add(path)
+        out.append(path)
     return out
 
 
@@ -341,33 +325,27 @@ def _local_config_gist_candidates(channel: str) -> list[tuple[str, float]]:
 
     This is deliberately read-only evidence. It lets a machine recover
     a previously-known canonical room while the gh REST listing surface
-    is unavailable, without creating a new island.
+    is unavailable, without creating a new island. Default discovery is
+    intentionally constrained to the current AIRC_HOME; broader scans
+    are opt-in through AIRC_GIST_CACHE_ROOTS so background daemons do not
+    crawl user folders or trip OS privacy prompts.
     """
     found: dict[str, float] = {}
-    for root in _local_scan_roots():
-        root_depth = root.rstrip(os.sep).count(os.sep)
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in _LOCAL_SCAN_PRUNE]
-            if dirpath.rstrip(os.sep).count(os.sep) - root_depth > _LOCAL_SCAN_MAX_DEPTH:
-                dirnames[:] = []
-                continue
-            if "config.json" not in filenames or os.path.basename(dirpath) != ".airc":
-                continue
-            path = os.path.join(dirpath, "config.json")
-            try:
-                with open(path, encoding="utf-8") as f:
-                    cfg = json.load(f)
-            except (OSError, ValueError, TypeError):
-                continue
-            gists = cfg.get("channel_gists") or {}
-            gid = gists.get(channel)
-            if not _valid_gist_id(gid):
-                continue
-            try:
-                mtime = os.path.getmtime(path)
-            except OSError:
-                mtime = 0.0
-            found[gid] = max(found.get(gid, 0.0), mtime)
+    for path in _local_config_paths():
+        try:
+            with open(path, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except (OSError, ValueError, TypeError):
+            continue
+        gists = cfg.get("channel_gists") or {}
+        gid = gists.get(channel)
+        if not _valid_gist_id(gid):
+            continue
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = 0.0
+        found[gid] = max(found.get(gid, 0.0), mtime)
     return list(found.items())
 
 
