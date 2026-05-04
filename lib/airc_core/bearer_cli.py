@@ -133,8 +133,26 @@ def _read_lock_owner(pidfile: str) -> Tuple[int, str]:
     return (pid, gist)
 
 
+def _recv_lock_pidfile(state_file: str, gist_id: str) -> str:
+    """Return the pidfile path for a recv lock.
+
+    Natural key is the wire, not the channel label. Two subscribed
+    channels may legitimately point at the same gist during host
+    bootstrap, gist rotation, or same-room aliases; only one bearer
+    should poll that gist in a scope. The envelope's channel field and
+    monitor_formatter handle display/routing downstream.
+    """
+    if gist_id:
+        lock_dir = os.path.dirname(state_file) or "."
+        safe = "".join(c if c.isalnum() else "_" for c in gist_id)
+        return os.path.join(lock_dir, f"bearer_gist.{safe}.pid")
+    if state_file.endswith(".json"):
+        return state_file[: -len(".json")] + ".pid"
+    return state_file + ".pid"
+
+
 def _claim_recv_lock(args) -> RecvLockResult:
-    """Per-(scope, channel, gist) bearer-recv lock.
+    """Per-(scope, gist) bearer-recv lock.
 
     Returns (pidfile_path, my_pid) on successful claim — caller registers
     atexit cleanup. Returns _LOCK_HELD if another live bearer already
@@ -142,10 +160,11 @@ def _claim_recv_lock(args) -> RecvLockResult:
     _LOCK_DISABLED when no lock can/should be used, and caller should
     continue without the duplicate-emission guarantee.
 
-    Pidfile path is derived from --state-file by replacing the .json
-    suffix with .pid (e.g. bearer_state.general.json → bearer.general.pid).
-    Without --state-file, no lock is taken (legacy / test invocations
-    that don't use state-file stay unaffected).
+    Pidfile path is derived from --state-file's directory and
+    --room-gist-id (e.g. bearer_gist.<gist>.pid). Without --state-file,
+    no lock is taken (legacy / test invocations that don't use
+    state-file stay unaffected). Without --room-gist-id, the legacy
+    state-file-derived path is used.
 
     Stale-pidfile recovery:
       - PID dead → stale; take over.
@@ -158,12 +177,9 @@ def _claim_recv_lock(args) -> RecvLockResult:
     state_file = getattr(args, "state_file", None)
     if not state_file:
         return _LOCK_DISABLED
-    if state_file.endswith(".json"):
-        pidfile = state_file[: -len(".json")] + ".pid"
-    else:
-        pidfile = state_file + ".pid"
 
     my_gist = getattr(args, "room_gist_id", None) or ""
+    pidfile = _recv_lock_pidfile(state_file, my_gist)
     my_pid = os.getpid()
 
     lock_payload = f"{my_pid}\t{my_gist}\n".encode("utf-8")

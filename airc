@@ -1333,37 +1333,51 @@ _monitor_multi_channel() {
         _pids+=("$!:$ch")
       done <<< "$channel_map"
 
-      # Watch loop: any child death → kill survivors + break.
+      # Watch loop: any child death → restart only that channel.
+      # Pre-#452 this killed every survivor and rebuilt the whole
+      # formatter pipe, so a flaky/stale project-room gist could disturb
+      # #general delivery. Keep healthy channels flowing; the failed
+      # channel gets its own retry loop.
       # macOS bash 3.2 lacks `wait -n`, so poll explicitly.
-      local _dead=""
       while [ "${#_pids[@]}" -gt 0 ]; do
         sleep 2
         local _alive=()
-        local entry pid ch
+        local entry pid ch gid
         for entry in "${_pids[@]}"; do
           pid="${entry%%:*}"
           ch="${entry#*:}"
           if kill -0 "$pid" 2>/dev/null; then
             _alive+=("$entry")
           else
-            _dead="$ch"
-            break 2
+            echo "airc: bearer recv for #${ch} died — see ${AIRC_WRITE_DIR}/bearer_recv.${ch}.log; restarting that channel only" >&2
+            # Surface the last-error tail so the user sees WHY without
+            # having to know to read the log file.
+            if [ -s "$AIRC_WRITE_DIR/bearer_recv.${ch}.log" ]; then
+              tail -3 "$AIRC_WRITE_DIR/bearer_recv.${ch}.log" | sed 's/^/airc:   /' >&2
+            fi
+            # Re-read the channel's gist from config. If the host rotated
+            # or send-path self-heal updated channel_gists while this
+            # bearer was dying, restart against the new gist. If the
+            # mapping disappeared, leave this channel down; healthy
+            # channels keep flowing and the next outer cycle/config
+            # refresh can pick it up again.
+            gid=$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
+              --config "$CONFIG" 2>/dev/null | awk -F '\t' -v c="$ch" '$1 == c {print $2; exit}')
+            if [ -n "$gid" ]; then
+              sleep 3
+              "$AIRC_PYTHON" -u -m airc_core.bearer_cli recv "self" \
+                --room-gist-id "$gid" \
+                --offset-file "$AIRC_WRITE_DIR/monitor_offset.${ch}" \
+                --state-file "$AIRC_WRITE_DIR/bearer_state.${ch}.json" \
+                2>>"$AIRC_WRITE_DIR/bearer_recv.${ch}.log" &
+              _alive+=("$!:$ch")
+            else
+              echo "airc: #${ch} has no channel_gists mapping; leaving it offline while other channels continue" >&2
+            fi
           fi
         done
         _pids=("${_alive[@]}")
       done
-      if [ -n "$_dead" ]; then
-        echo "airc: bearer recv for #${_dead} died — see ${AIRC_WRITE_DIR}/bearer_recv.${_dead}.log; restarting all channels" >&2
-        # Surface the last-error tail so the user sees WHY without
-        # having to know to read the log file.
-        if [ -s "$AIRC_WRITE_DIR/bearer_recv.${_dead}.log" ]; then
-          tail -3 "$AIRC_WRITE_DIR/bearer_recv.${_dead}.log" | sed 's/^/airc:   /' >&2
-        fi
-        for entry in "${_pids[@]}"; do
-          kill "${entry%%:*}" 2>/dev/null
-        done
-        wait 2>/dev/null
-      fi
     } | monitor_formatter "$my_name" || true
     local fmt_exit="${PIPESTATUS[1]:-0}"
 

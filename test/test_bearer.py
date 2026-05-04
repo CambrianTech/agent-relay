@@ -606,7 +606,7 @@ class BearerCliStateFileTests(unittest.TestCase):
 
 
 class BearerCliRecvLockTests(unittest.TestCase):
-    """Per-(scope, channel, gist) bearer-lock prevents multiple bearer_cli
+    """Per-(scope, gist) bearer-lock prevents multiple bearer_cli
     processes from polling the same gist concurrently — the duplicate
     emission Joel diagnosed 2026-05-04 (scope teardown leaked orphan
     bearers + host-gist-rotation respawned a second one).
@@ -619,6 +619,8 @@ class BearerCliRecvLockTests(unittest.TestCase):
         (host-gist-rotation case); claim succeeds.
       - Pidfile present, PID alive AND for SAME gist → claim fails;
         return _LOCK_HELD so caller exits cleanly.
+      - Different channel state-files with the SAME gist contend for the
+        same pidfile; gist is the wire, channel is just the display label.
       - Pidfile cannot be written → return _LOCK_DISABLED so caller
         continues without the duplicate-emission guarantee.
       - Release removes pidfile only when it still contains our pid
@@ -629,8 +631,8 @@ class BearerCliRecvLockTests(unittest.TestCase):
         import tempfile
         self._tmpdir = tempfile.mkdtemp(prefix="airc-cli-lock-test-")
         self._state_file = self._tmpdir + "/bearer_state.general.json"
-        # Pidfile follows the .json → .pid rule baked into _claim_recv_lock.
-        self._pidfile = self._tmpdir + "/bearer_state.general.pid"
+        # Pidfile follows the per-gist rule baked into _claim_recv_lock.
+        self._pidfile = self._tmpdir + "/bearer_gist.abc123.pid"
 
     def tearDown(self):
         import shutil
@@ -691,6 +693,7 @@ class BearerCliRecvLockTests(unittest.TestCase):
         # Host-gist-rotation case: previous bearer is alive but polling
         # the OLD gist; new bearer for the NEW gist should claim.
         import os
+        self._pidfile = self._tmpdir + "/bearer_gist.new_gist_id.pid"
         my_other_pid = 99999998  # used as "live but not us" stub
         with open(self._pidfile, "w") as f:
             f.write(f"{my_other_pid}\told-gist-id\n")
@@ -721,6 +724,26 @@ class BearerCliRecvLockTests(unittest.TestCase):
             content = f.read().strip()
         self.assertTrue(content.startswith(f"{my_other_pid}\t"),
                         "pidfile must NOT be overwritten when we lose the claim race")
+
+    def test_same_gist_different_channel_state_files_share_one_lock(self):
+        first_pidfile = self._tmpdir + "/bearer_gist.samegist.pid"
+        other_pid = 99999996
+        with open(first_pidfile, "w") as f:
+            f.write(f"{other_pid}\tsamegist\n")
+        self.assertEqual(first_pidfile, self._tmpdir + "/bearer_gist.samegist.pid")
+
+        second_args = self._args(
+            state_file=self._tmpdir + "/bearer_state.useideem.json",
+            room_gist_id="samegist",
+        )
+        with mock.patch.object(bearer_cli, "_pid_alive", return_value=True), \
+             mock.patch.object(bearer_cli, "_is_our_bearer", return_value=True):
+            second = bearer_cli._claim_recv_lock(second_args)
+        self.assertEqual(second, bearer_cli._LOCK_HELD,
+                         "same gist through a second channel must not spawn a duplicate bearer")
+        with open(first_pidfile) as f:
+            content = f.read().strip()
+        self.assertEqual(int(content.split("\t", 1)[0]), other_pid)
 
     def test_lock_write_failure_does_not_make_recv_exit_as_lock_held(self):
         # If the pidfile cannot be created, _claim_recv_lock must report
