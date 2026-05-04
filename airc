@@ -2080,8 +2080,10 @@ except Exception:
 # this loop, every host restart breaks the substrate until manual
 # intervention — the satellite-killer scenario.
 #
-# Cost: one `gh gist list` per cycle (~150 bytes over the wire). At
-# 300s default cadence: 12 calls/hour, well under gh's 5000/hr ceiling.
+# Cost is bounded by channel_gist's shared gist-list cache. Do not make
+# this a tight GitHub loop: several agents on one machine/account share
+# the same substrate, and "cheap" health/discovery probes can still trip
+# secondary limits when multiplied across tabs.
 #
 # Single-account scope: _mesh_find lists the CURRENT gh account's
 # gists. For mesh peers on the same gh account (the dominant case
@@ -2093,16 +2095,12 @@ except Exception:
 # is out of scope; loud-fail (Mac's bearer_gh.py PR) covers that path.
 _mesh_rediscover_loop() {
   local _parent_pid="$PPID"
-  # Cadence: 30s default. Was 300s → 60s in #407 → 30s here. Joel's
-  # "satellite/bios" framing wants the tightest cadence that's still
-  # gh-rate-limit safe. _mesh_find does ~1 gh api call per cycle
-  # (~120 calls/hour/peer at 30s), well under gh's 5000/hr limit.
-  # Tonight's repro 2026-05-02: I rotated my host gist via teardown,
-  # 60s+ later b69f still couldn't reach me — Joel had to relay.
-  # 30s halves that worst-case window and starts approaching the
-  # bearer's own 15s poll cadence so the rediscover happens at most
-  # 2 polls late from the bearer's PoV.
-  local interval="${AIRC_MESH_REDISCOVER_SEC:-30}"
+  # Cadence: 120s default. The prior 30s loop was survivable for one
+  # process but not for four agents on the same gh account plus humans
+  # running status/doctor. channel_gist caches the actual list call, so
+  # normal recovery is still fast enough without making GitHub a liveness
+  # dependency.
+  local interval="${AIRC_MESH_REDISCOVER_SEC:-120}"
   while true; do
     sleep "$interval"
     if ! kill -0 "$_parent_pid" 2>/dev/null; then

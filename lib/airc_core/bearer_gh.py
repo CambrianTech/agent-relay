@@ -42,6 +42,7 @@ import time as _time
 from collections import deque
 from typing import Iterator, Optional, Tuple
 
+from . import gh_backoff
 from .bearer import (
     Bearer,
     BearerError,
@@ -285,9 +286,12 @@ def _gh_api_get(gist_id: str) -> Optional[dict]:
         sys.stderr.flush()
         _gh_api_get._last_err = str(e)  # type: ignore[attr-defined]
         return None
+    if gh_backoff.backoff_active():
+        _gh_api_get._last_err = "secondary rate limit backoff active"  # type: ignore[attr-defined]
+        return None
     try:
         r = subprocess.run(
-            [gh, "api", f"gists/{gist_id}"],
+            [gh, "api", "--include", f"gists/{gist_id}"],
             capture_output=True,
             text=True,
             timeout=_GH_API_TIMEOUT,
@@ -301,12 +305,16 @@ def _gh_api_get(gist_id: str) -> Optional[dict]:
         combined = (r.stderr or "") + (r.stdout or "")
         _gh_api_get._last_err = combined  # type: ignore[attr-defined]
         kind = _classify_gh_error(combined, True)
+        if kind == "secondary_rate_limit":
+            gh_backoff.record_backoff(combined)
         if kind != "secondary_rate_limit" or _truthy(os.environ.get("AIRC_GH_DEBUG")):
             sys.stderr.write(f"[airc:bearer_gh] _gh_api_get({gist_id}): gh api exit={r.returncode}: {combined.strip()[:500]}\n")
             sys.stderr.flush()
         return None
     try:
-        return json.loads(r.stdout)
+        headers, body = gh_backoff.split_include_output(r.stdout)
+        gh_backoff.record_backoff(headers)
+        return json.loads(body)
     except (ValueError, TypeError) as e:
         sys.stderr.write(f"[airc:bearer_gh] _gh_api_get({gist_id}): JSON parse failed: {e}; first 200 bytes: {(r.stdout or '')[:200]!r}\n")
         sys.stderr.flush()
@@ -369,10 +377,12 @@ def _gh_api_patch_messages_jsonl(gist_id: str, content: str) -> tuple[bool, str]
         gh = _resolve_gh_bin()
     except GhBearerError as e:
         return (False, str(e))
+    if gh_backoff.backoff_active():
+        return (False, "secondary rate limit backoff active")
     body = json.dumps({"files": {_MESSAGES_FILE: {"content": content}}})
     try:
         r = subprocess.run(
-            [gh, "api", "--method", "PATCH", f"gists/{gist_id}", "--input", "-"],
+            [gh, "api", "--include", "--method", "PATCH", f"gists/{gist_id}", "--input", "-"],
             input=body,
             capture_output=True,
             text=True,
@@ -381,8 +391,12 @@ def _gh_api_patch_messages_jsonl(gist_id: str, content: str) -> tuple[bool, str]
     except (subprocess.TimeoutExpired, OSError) as e:
         return (False, f"gh api PATCH failed: {e}")
     if r.returncode == 0:
+        headers, _ = gh_backoff.split_include_output(r.stdout)
+        gh_backoff.record_backoff(headers)
         return (True, "")
     err = (r.stderr or r.stdout or "gh api PATCH failed").strip()
+    if _classify_gh_error(err, True) == "secondary_rate_limit":
+        gh_backoff.record_backoff(err)
     return (False, err)
 
 

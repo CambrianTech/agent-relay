@@ -29,6 +29,59 @@
 # (airc_self_heal_gh_auth) so callers control when re-auth is allowed
 # (interactive contexts only).
 
+# ── airc_gh_rate_limit_json_cached — cheap/budgeted rate-limit probe ──
+#
+# `gh api rate_limit` is cheaper than `/user`, but it is still a GitHub
+# request. During an outage humans and agents hammer `airc status` /
+# `doctor --health`, and repeated "health" probes can deepen the same
+# secondary throttle they are trying to diagnose. Cache successful JSON
+# briefly and cache failures even more briefly so observation has a
+# bounded request rate.
+#
+# Env:
+#   AIRC_GH_RATE_CACHE_SEC       success TTL, default 300s
+#   AIRC_GH_RATE_FAIL_CACHE_SEC  failure TTL, default 60s
+#
+# Returns:
+#   0 + prints JSON when fresh cache or live probe succeeds
+#   1 when gh missing, live probe fails, or recent failure backoff active
+airc_gh_rate_limit_json_cached() {
+  command -v gh >/dev/null 2>&1 || return 1
+
+  local _uid; _uid=$(id -u 2>/dev/null || echo nobody)
+  local _base="${TMPDIR:-/tmp}/airc-gh-rate-limit-${_uid}"
+  local _cache_file="${_base}.json"
+  local _fail_file="${_base}.fail"
+  local _ok_ttl="${AIRC_GH_RATE_CACHE_SEC:-300}"
+  local _fail_ttl="${AIRC_GH_RATE_FAIL_CACHE_SEC:-60}"
+  local _now; _now=$(date +%s 2>/dev/null || echo 0)
+
+  if [ -f "$_cache_file" ]; then
+    local _cache_mtime; _cache_mtime=$(file_mtime "$_cache_file" 2>/dev/null || echo 0)
+    if [ "$(( _now - _cache_mtime ))" -lt "$_ok_ttl" ] 2>/dev/null; then
+      cat "$_cache_file" 2>/dev/null && return 0
+    fi
+  fi
+
+  if [ -f "$_fail_file" ]; then
+    local _fail_mtime; _fail_mtime=$(file_mtime "$_fail_file" 2>/dev/null || echo 0)
+    if [ "$(( _now - _fail_mtime ))" -lt "$_fail_ttl" ] 2>/dev/null; then
+      return 1
+    fi
+  fi
+
+  local _json
+  if _json=$(gh api rate_limit 2>/dev/null) && [ -n "$_json" ]; then
+    printf '%s\n' "$_json" > "$_cache_file" 2>/dev/null || true
+    rm -f "$_fail_file" 2>/dev/null || true
+    printf '%s\n' "$_json"
+    return 0
+  fi
+
+  : > "$_fail_file" 2>/dev/null || true
+  return 1
+}
+
 # ── airc_detect_gh_auth_state — echo one of {ok, invalid, rate_limited, not_installed} ──
 #
 # Probes gh's auth state without side-effects. Output goes to STDOUT
@@ -110,7 +163,7 @@ airc_detect_gh_auth_state() {
   # (c) Real keyring auth failure (no GH_TOKEN env, keyring is dead).
   #     This is the common Joel-reports-FREQUENT case, and the case
   #     self-heal CAN fix via the browser flow.
-  if gh api rate_limit >/dev/null 2>&1; then
+  if airc_gh_rate_limit_json_cached >/dev/null 2>&1; then
     echo "rate_limited"
   elif [ -n "${GH_TOKEN:-}" ]; then
     # GH_TOKEN takes precedence over the keyring in gh's auth resolution.

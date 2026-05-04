@@ -33,8 +33,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from typing import Optional
+
+from . import gh_backoff
 
 
 _GH_BIN = "gh"
@@ -57,6 +60,40 @@ _LOCAL_SCAN_PRUNE = {
 }
 
 
+def _cache_path(name: str) -> str:
+    uid = str(os.getuid()) if hasattr(os, "getuid") else os.environ.get("USERNAME", "user")
+    return os.path.join(tempfile.gettempdir(), f"airc-{name}-{uid}.json")
+
+
+def _load_cached_gist_list(max_age: float) -> Optional[list[dict]]:
+    path = _cache_path("gh-gist-list")
+    try:
+        age = time.time() - os.path.getmtime(path)
+        if age > max_age:
+            return None
+        with open(path, encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, list):
+            return loaded
+    except (OSError, ValueError, TypeError):
+        return None
+    return None
+
+
+def _save_cached_gist_list(gists: list[dict]) -> None:
+    path = _cache_path("gh-gist-list")
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(gists, f)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def _resolve_gh_bin() -> Optional[str]:
     """Return path to gh CLI, or None if absent. Caller-visible None
     means we can't do gh-side resolution at all — return early."""
@@ -70,42 +107,48 @@ def _gh_list_user_gists() -> list[dict]:
     Uses `gh api gists` (with pagination) rather than `gh gist list`
     because the JSON shape is stable + complete. gh gist list output
     is human-shaped (tab-delimited) and shifts across versions.
+
+    Cached because this is the hottest GitHub control-plane path:
+    join discovery, send-path recovery, and the rediscovery loop all
+    call through here. One machine can run several agents on the same
+    gh account, so "one list every 30s" quickly becomes enough traffic
+    to trip secondary limits. Fresh cache default is 60s; if the live
+    probe fails, stale cache default is 15m so peers can keep using the
+    last-known room map instead of creating new islands.
     """
+    cache_sec = float(os.environ.get("AIRC_GIST_LIST_CACHE_SEC", "60"))
+    stale_sec = float(os.environ.get("AIRC_GIST_LIST_STALE_SEC", "900"))
+    cached = _load_cached_gist_list(cache_sec)
+    if cached is not None:
+        return cached
+    if gh_backoff.backoff_active():
+        return _load_cached_gist_list(stale_sec) or []
+
     gh = _resolve_gh_bin()
     if gh is None:
-        return []
+        return _load_cached_gist_list(stale_sec) or []
     try:
         r = subprocess.run(
-            [gh, "api", f"gists?per_page={_GIST_LIST_LIMIT}", "--paginate"],
+            [gh, "api", "--include", f"gists?per_page={_GIST_LIST_LIMIT}"],
             capture_output=True,
             text=True,
             timeout=_GH_API_TIMEOUT * 3,
         )
     except (subprocess.TimeoutExpired, OSError):
-        return []
+        return _load_cached_gist_list(stale_sec) or []
     if r.returncode != 0:
-        return []
+        gh_backoff.record_backoff((r.stderr or "") + (r.stdout or ""))
+        return _load_cached_gist_list(stale_sec) or []
     out: list[dict] = []
-    # `--paginate` concatenates JSON arrays inline. Split on `][` to
-    # rejoin pages without depending on gh's exact output shape.
-    raw = r.stdout.strip()
+    headers, body = gh_backoff.split_include_output(r.stdout)
+    gh_backoff.record_backoff(headers)
+    raw = body.strip()
     if not raw:
         return []
-    chunks = raw.replace("][", "],[")
-    if chunks.startswith("["):
-        chunks = chunks
     try:
-        # Try direct parse first (single-page or already-merged).
         loaded = json.loads(raw)
         if isinstance(loaded, list):
-            return loaded
-    except (ValueError, TypeError):
-        pass
-    # Fallback: split into separate JSON arrays and merge.
-    try:
-        joined = "[" + chunks.lstrip("[").rstrip("]") + "]"
-        loaded = json.loads(joined)
-        if isinstance(loaded, list):
+            _save_cached_gist_list(loaded)
             return loaded
     except (ValueError, TypeError):
         pass
@@ -163,17 +206,22 @@ def _gh_api_get_gist(gist_id: str) -> Optional[dict]:
     gh = _resolve_gh_bin()
     if gh is None:
         return None
+    if gh_backoff.backoff_active():
+        return None
     try:
         r = subprocess.run(
-            [gh, "api", f"gists/{gist_id}"],
+            [gh, "api", "--include", f"gists/{gist_id}"],
             capture_output=True, text=True, timeout=_GH_API_TIMEOUT,
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
     if r.returncode != 0:
+        gh_backoff.record_backoff((r.stderr or "") + (r.stdout or ""))
         return None
+    headers, body = gh_backoff.split_include_output(r.stdout)
+    gh_backoff.record_backoff(headers)
     try:
-        return json.loads(r.stdout)
+        return json.loads(body)
     except (ValueError, TypeError):
         return None
 

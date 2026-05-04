@@ -184,13 +184,29 @@ _doctor_probe_gh_auth() {
   if ! command -v gh >/dev/null 2>&1; then
     return 0  # already reported missing by the gh probe
   fi
-  if gh auth status >/dev/null 2>&1; then
-    printf "  [ok] gh authenticated\n"
-    return 0
-  fi
-  printf "  [MISSING] gh authenticated (gist scope)\n"
-  printf "         Fix: gh auth login -s gist\n"
-  return 1
+  local _state
+  _state="$(airc_detect_gh_auth_state 2>/dev/null || echo invalid)"
+  case "$_state" in
+    ok)
+      printf "  [ok] gh authenticated\n"
+      return 0
+      ;;
+    rate_limited)
+      printf "  [BLOCKED] gh secondary rate limit (abuse detection) — token is fine\n"
+      printf "         Fix: wait 5-15 min; airc caches probes so health checks do not deepen the throttle\n"
+      return 1
+      ;;
+    env_token_invalid)
+      printf "  [BLOCKED] GH_TOKEN is set but invalid\n"
+      printf "         Fix: unset/fix GH_TOKEN, then retry\n"
+      return 1
+      ;;
+    *)
+      printf "  [MISSING] gh authenticated (gist scope)\n"
+      printf "         Fix: gh auth login -s gist\n"
+      return 1
+      ;;
+  esac
 }
 
 # Probe the venv cryptography package — issue #341 follow-up. airc's
@@ -275,36 +291,43 @@ _doctor_connect_preflight() {
   # gist-scope-less token (Copilot caught this on #87 review).
   if ! _doctor_probe "gh" "$mgr" "Gist substrate (room discovery)"; then
     issues=$((issues+1))
-  elif ! gh auth status >/dev/null 2>&1; then
+  else
+    local _gh_state
+    _gh_state="$(airc_detect_gh_auth_state 2>/dev/null || echo invalid)"
+    if [ "$_gh_state" != "ok" ]; then
     # Distinguish a real auth failure from a GitHub secondary rate limit
     # (abuse detection). The /rate_limit endpoint is reachable during
     # secondary limits, so if it works, the token is fine — the user just
     # needs to wait. `gh auth status` probes /user, which gets 403'd, and
     # gh then misreports the symptom as 'token invalid'. Issue #341.
-    if gh api rate_limit >/dev/null 2>&1; then
+    if [ "$_gh_state" = "rate_limited" ]; then
       printf "  [BLOCKED] gh secondary rate limit (abuse detection) — token is fine\n"
-      printf "         Fix: wait 5-15 min then re-run; cause is too many gh API calls in a short window\n"
+      printf "         Fix: wait 5-15 min; airc caches probes so health checks do not deepen the throttle\n"
+    elif [ "$_gh_state" = "env_token_invalid" ]; then
+      printf "  [BLOCKED] GH_TOKEN is set but invalid\n"
+      printf "         Fix: unset/fix GH_TOKEN, then retry\n"
     else
       printf "  [BLOCKED] gh authenticated\n"
       printf "         Fix: gh auth login -s gist\n"
     fi
     issues=$((issues+1))
-  elif ! gh auth status 2>&1 | grep -qiE '(scopes|token scopes):.*\bgist\b'; then
+    elif ! gh auth status 2>&1 | grep -qiE '(scopes|token scopes):.*\bgist\b'; then
     printf "  [BLOCKED] gh authed but missing 'gist' scope (room substrate needs it)\n"
     printf "         Fix: gh auth refresh -s gist\n"
     issues=$((issues+1))
-  elif ! gh api 'gists?per_page=1' >/dev/null 2>&1; then
+    elif ! gh api 'gists?per_page=1' >/dev/null 2>&1; then
     # Same misdiagnosis risk here — distinguish rate-limit vs other.
-    if gh api rate_limit >/dev/null 2>&1; then
+    if airc_gh_rate_limit_json_cached >/dev/null 2>&1; then
       printf "  [BLOCKED] gh secondary rate limit (abuse detection) — token + scope are fine\n"
-      printf "         Fix: wait 5-15 min then re-run\n"
+      printf "         Fix: wait 5-15 min; airc caches probes so health checks do not deepen the throttle\n"
     else
       printf "  [BLOCKED] gist API not reachable -- network outage or token revoked\n"
       printf "         Fix: check internet; if persistent, run 'gh auth refresh'\n"
     fi
     issues=$((issues+1))
-  else
+    else
     printf "  [ok] gh authed with gist scope, gists API reachable\n"
+    fi
   fi
 
   # ── Connect-specific: tailscale state. The default doctor only marks
@@ -434,7 +457,7 @@ _doctor_health() {
   # the cliff that wedged the bus pre-#416/#419.
   if command -v gh >/dev/null 2>&1; then
     local rate_json
-    if rate_json=$(gh api rate_limit 2>/dev/null); then
+    if rate_json=$(airc_gh_rate_limit_json_cached); then
       local core_remaining core_limit
       core_remaining=$(echo "$rate_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['resources']['core']['remaining'])" 2>/dev/null || echo "")
       core_limit=$(echo "$rate_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['resources']['core']['limit'])" 2>/dev/null || echo "")
