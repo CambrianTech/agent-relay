@@ -224,7 +224,7 @@ class DisplayFilterLoudDropTests(unittest.TestCase):
     drops a peer broadcast (channel name truly differs, e.g.
     'cambriantech' vs subs=['general'] — #401's '#'-prefix tolerance
     cannot help), emit a stdout warning so Claude Code's Monitor wakes
-    + the operator sees they need `airc subscribe <channel>`.
+    + the operator sees they need `airc join --room <channel>`.
 
     Pre-fix: silent drop produced #399's 9-hour blackout pattern even
     after #401 merged.
