@@ -285,6 +285,21 @@ class LocalCacheFallbackTests(unittest.TestCase):
             finally:
                 channel_gist._LAST_GIST_LIST_UNAVAILABLE = False
 
+    def test_host_preflight_blocks_when_discovery_untrusted(self):
+        with mock.patch.object(channel_gist, "find_existing", return_value=None), \
+             mock.patch.object(channel_gist.gh_backoff, "backoff_active", return_value=False):
+            channel_gist._LAST_GIST_LIST_UNAVAILABLE = True
+            try:
+                self.assertEqual(channel_gist.host_preflight("general"), ("blocked", None))
+            finally:
+                channel_gist._LAST_GIST_LIST_UNAVAILABLE = False
+
+    def test_host_preflight_allows_create_only_after_trusted_empty_discovery(self):
+        with mock.patch.object(channel_gist, "find_existing", return_value=None), \
+             mock.patch.object(channel_gist.gh_backoff, "backoff_active", return_value=False):
+            channel_gist._LAST_GIST_LIST_UNAVAILABLE = False
+            self.assertEqual(channel_gist.host_preflight("general"), ("create", None))
+
 
 class GistListCacheTests(unittest.TestCase):
     """Gist discovery should not spam GitHub during monitor/status churn."""
