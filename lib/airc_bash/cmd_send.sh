@@ -672,6 +672,13 @@ cmd_send() {
     else
       echo "  → @${peer_name} on #${active_channel}"
     fi
+    local _peer_count=0
+    if [ -d "$PEERS_DIR" ]; then
+      _peer_count=$(find "$PEERS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | wc -l | tr -d ' ')
+    fi
+    if [ "${_peer_count:-0}" -eq 0 ] 2>/dev/null; then
+      echo "  ⚠ collaboration: 0 peer records in this scope; this may be a solo mesh. Run 'airc peers' and verify others joined this gist." >&2
+    fi
   fi
 }
 
