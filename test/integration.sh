@@ -2034,6 +2034,63 @@ PY
   cleanup_all
 }
 
+# ── Scenario: monitor_liveness_process_evidence ────────────────────────
+# A project .airc scope can be shared by several Claude/Codex tabs. This
+# scenario keeps monitor liveness honest at the process-evidence layer:
+# fresh bearer_state is channel health only, a formatter for THIS scope
+# counts as a scope monitor, and a formatter for a sibling scope does not.
+scenario_monitor_liveness_process_evidence() {
+  section "monitor_liveness_process_evidence: bearer freshness is not monitor liveness"
+  cleanup_all
+
+  local home=/tmp/airc-it-mlpe/state
+  local other=/tmp/airc-it-mlpe/state.other
+  mkdir -p "$home/identity" "$home/peers" "$other/peers"
+  scaffold_identity "$home/identity" 'airc-test-mlpe'
+  cat > "$home/config.json" <<'JSON'
+{ "name": "monitor-liveness-test", "subscribed_channels": ["general"] }
+JSON
+  echo "99999" > "$home/airc.pid"
+  "${AIRC_PYTHON:-python3}" - <<PY
+import json, time
+with open("$home/bearer_state.general.json", "w") as f:
+    json.dump({"last_recv_ts": time.time(), "kind": "gist"}, f)
+PY
+
+  local status_out
+  status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
+  echo "$status_out" | grep -qE 'monitor:\s+stale pidfile|monitor:\s+not running' \
+    && pass "fresh bearer_state alone does not satisfy monitor liveness" \
+    || fail "fresh bearer_state falsely satisfied monitor liveness (got: $status_out)"
+
+  ( exec -a "python -u -X utf8 -m airc_core.monitor_formatter --peers-dir $other/peers --my-name foreign" sleep 60 ) &
+  local foreign_pid=$!
+  sleep 1
+  status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
+  echo "$status_out" | grep -qE 'monitor:\s+stale pidfile|monitor:\s+not running' \
+    && pass "formatter for sibling scope does not satisfy this scope" \
+    || fail "foreign formatter falsely satisfied this scope (got: $status_out)"
+  kill "$foreign_pid" 2>/dev/null || true
+  wait "$foreign_pid" 2>/dev/null || true
+
+  ( exec -a "python -u -X utf8 -m airc_core.monitor_formatter --peers-dir $home/peers --my-name local" sleep 60 ) &
+  local local_pid=$!
+  local seen=0 i
+  for i in $(seq 1 10); do
+    sleep 1
+    status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
+    echo "$status_out" | grep -qE "monitor:\s+running for scope .*formatter PID $local_pid" && { seen=1; break; }
+  done
+  [ "$seen" = "1" ] \
+    && pass "scope-owned monitor_formatter satisfies scope monitor liveness" \
+    || fail "scope-owned formatter did not satisfy monitor liveness (got: $status_out)"
+  kill "$local_pid" 2>/dev/null || true
+  wait "$local_pid" 2>/dev/null || true
+
+  rm -rf /tmp/airc-it-mlpe
+  cleanup_all
+}
+
 # ── Scenario: solo_mesh_warns (transport health != collaboration) ───────
 # A self-healed host can have fresh local transport/bearer state while no
 # peers are actually paired to the mesh. `airc status` / `doctor --health`
@@ -4186,6 +4243,7 @@ case "$MODE" in
   two_tab_localhost) scenario_two_tab_localhost ;;
   auto_scope)   scenario_auto_scope ;;
   send_dead_monitor_dies) scenario_send_dead_monitor_dies ;;
+  monitor_liveness_process_evidence) scenario_monitor_liveness_process_evidence ;;
   solo_mesh_warns) scenario_solo_mesh_warns ;;
   connect_after_kill_recovers) scenario_connect_after_kill_recovers ;;
   general_sidecar_default) scenario_general_sidecar_default ;;
@@ -4220,7 +4278,8 @@ case "$MODE" in
     scenario_auth_failure; scenario_room; scenario_events; scenario_get_host
     scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat
     scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope
-    scenario_send_dead_monitor_dies; scenario_solo_mesh_warns
+    scenario_send_dead_monitor_dies; scenario_monitor_liveness_process_evidence
+    scenario_solo_mesh_warns
     scenario_connect_after_kill_recovers
     scenario_general_sidecar_default; scenario_away
     scenario_list; scenario_quit; scenario_platform_adapters
@@ -4232,7 +4291,7 @@ case "$MODE" in
     scenario_custom_room_creates_gist
     scenario_invite_human
     ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|monitor_liveness_process_evidence|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
 esac
 
 echo
