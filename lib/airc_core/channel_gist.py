@@ -224,6 +224,19 @@ def _valid_gist_id(gist_id: object) -> bool:
     return 8 <= len(gist_id) <= 64 and all(c in _GIST_ID_CHARS for c in gist_id)
 
 
+def _config_channel_gist(config_path: Optional[str], channel: str) -> Optional[str]:
+    if not config_path:
+        return None
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return None
+    gists = cfg.get("channel_gists") or {}
+    gid = gists.get(channel)
+    return gid if _valid_gist_id(gid) else None
+
+
 def _parse_ts(value: object) -> float:
     if not isinstance(value, str) or not value:
         return 0.0
@@ -673,7 +686,7 @@ def resolve(channel: str, create_if_missing: bool = False, require_invite: bool 
     return None
 
 
-def host_preflight(channel: str) -> tuple[str, Optional[str]]:
+def host_preflight(channel: str, config_path: Optional[str] = None) -> tuple[str, Optional[str]]:
     """Return the host bootstrap decision for a channel.
 
     - ("existing", gid): use this canonical gist.
@@ -685,6 +698,9 @@ def host_preflight(channel: str) -> tuple[str, Optional[str]]:
     decision so a failed GitHub listing cannot be mistaken for an empty
     account.
     """
+    configured = _config_channel_gist(config_path, channel)
+    if configured:
+        return "existing", configured
     existing = find_existing(channel)
     if existing:
         return "existing", existing
@@ -711,6 +727,7 @@ def _cli() -> int:
 
     hp = sub.add_parser("host-preflight", help="Print existing gist id, or exit 2 when discovery is unavailable")
     hp.add_argument("--channel", required=True)
+    hp.add_argument("--config", default="")
 
     args = parser.parse_args()
 
@@ -727,7 +744,7 @@ def _cli() -> int:
             return 0
         return 1
     if args.cmd == "host-preflight":
-        decision, gid = host_preflight(args.channel)
+        decision, gid = host_preflight(args.channel, config_path=args.config)
         if decision == "existing" and gid:
             print(gid)
             return 0

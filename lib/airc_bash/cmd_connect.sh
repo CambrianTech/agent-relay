@@ -1478,7 +1478,7 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
           if [ -z "$_existing_room_gid" ] && [ "${AIRC_NO_DISCOVERY:-0}" != "1" ]; then
             local _host_preflight_rc=0
             _existing_room_gid=$("$AIRC_PYTHON" -m airc_core.channel_gist host-preflight \
-                                 --channel "$room_name" 2>/dev/null) || _host_preflight_rc=$?
+                                 --channel "$room_name" --config "$CONFIG" 2>/dev/null) || _host_preflight_rc=$?
             if [ "${_host_preflight_rc:-0}" = "2" ]; then
               die "GitHub room discovery is unavailable for #${room_name}; refusing to create a new solo room. Retry after the GitHub backoff clears."
             fi

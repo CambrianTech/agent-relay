@@ -294,11 +294,36 @@ class LocalCacheFallbackTests(unittest.TestCase):
             finally:
                 channel_gist._LAST_GIST_LIST_UNAVAILABLE = False
 
+    def test_host_preflight_uses_current_config_before_discovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.json"
+            cfg.write_text(
+                json.dumps({"channel_gists": {"general": "abcdef1234567890"}}),
+                encoding="utf-8",
+            )
+            with mock.patch.object(channel_gist, "find_existing") as find_existing:
+                self.assertEqual(
+                    channel_gist.host_preflight("general", config_path=str(cfg)),
+                    ("existing", "abcdef1234567890"),
+                )
+                find_existing.assert_not_called()
+
     def test_host_preflight_allows_create_only_after_trusted_empty_discovery(self):
         with mock.patch.object(channel_gist, "find_existing", return_value=None), \
              mock.patch.object(channel_gist.gh_backoff, "backoff_active", return_value=False):
             channel_gist._LAST_GIST_LIST_UNAVAILABLE = False
             self.assertEqual(channel_gist.host_preflight("general"), ("create", None))
+
+    def test_host_preflight_first_user_missing_config_can_create_after_trusted_empty_discovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_config = str(Path(tmp) / "new-user" / ".airc" / "config.json")
+            with mock.patch.object(channel_gist, "find_existing", return_value=None), \
+                 mock.patch.object(channel_gist.gh_backoff, "backoff_active", return_value=False):
+                channel_gist._LAST_GIST_LIST_UNAVAILABLE = False
+                self.assertEqual(
+                    channel_gist.host_preflight("general", config_path=missing_config),
+                    ("create", None),
+                )
 
 
 class GistListCacheTests(unittest.TestCase):
