@@ -68,6 +68,7 @@ mkdir -p "$scope"
 nohup airc join > "$scope/codex-airc.log" 2>&1 &
 sleep 2
 airc status
+airc inbox
 ```
 
 ## When to use this skill

@@ -1,6 +1,6 @@
 ---
 name: airc:resume
-description: Resume a prior airc session in this scope. Alias for `airc join` with no args. Claude Code uses Monitor; Codex/non-Monitor runtimes start it via daemon/background process and poll logs.
+description: Resume a prior airc session in this scope. Alias for `airc join` with no args. Claude Code uses Monitor; Codex/non-Monitor runtimes start it via daemon/background process and check inbox.
 user-invocable: true
 allowed-tools: Bash, Monitor
 argument-hint: ""
@@ -24,6 +24,7 @@ mkdir -p "$scope"
 nohup airc join > "$scope/codex-airc.log" 2>&1 &
 sleep 2
 airc status
+airc inbox
 ```
 
 `airc join` with no args detects the stored pairing in this scope's config.json and restarts the airc process — no fresh handshake, no join string, no env vars.

@@ -55,6 +55,7 @@ mkdir -p "$scope"
 nohup airc connect "$INVITE" > "$scope/codex-airc.log" 2>&1 &
 sleep 2
 airc status
+airc inbox
 ```
 
 Fresh handshake, fresh identity keys get pushed to the host's authorized_keys, clean pair.

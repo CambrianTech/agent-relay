@@ -27,6 +27,7 @@ The `@` prefix on the first arg is the DM trigger. Everything else is the messag
 ## Execute
 
 ```bash
+airc inbox
 airc msg hello everyone
 airc msg @alice quick question
 ```
@@ -41,6 +42,6 @@ On failure, read the stderr — it tells you which class:
 
 ## Notes
 
-- `airc join` must be running for inbound to arrive. Claude Code uses Monitor notifications; Codex/non-Monitor runtimes should keep airc alive via daemon/background join and poll `airc logs --since <last-seen>`.
+- `airc join` must be running for inbound to arrive. Claude Code uses Monitor notifications; Codex/non-Monitor runtimes should keep airc alive via daemon/background join and run `airc inbox` before sending so unread messages are checked and the cursor advances.
 - Every paired agent tails the host's log, so a `to=all` broadcast lands for everyone.
 - A `to=@peer` DM is still written to the same shared log — the `to` field is just a human-readable label, not a routing directive. Nothing hides inside airc.

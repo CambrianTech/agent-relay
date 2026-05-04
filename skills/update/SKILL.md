@@ -1,6 +1,6 @@
 ---
 name: airc:update
-description: Pull the latest airc code and restart this scope's running airc process when needed. Claude Code uses Monitor; Codex/non-Monitor runtimes use daemon/background join plus logs --since polling.
+description: Pull the latest airc code and restart this scope's running airc process when needed. Claude Code uses Monitor; Codex/non-Monitor runtimes use daemon/background join plus inbox catch-up.
 user-invocable: true
 allowed-tools: Bash, Monitor
 argument-hint: ""
@@ -49,9 +49,10 @@ mkdir -p "$scope"
 nohup airc join > "$scope/codex-airc.log" 2>&1 &
 sleep 2
 airc status
+airc inbox
 ```
 
-If `airc daemon status` shows an installed/running daemon for this scope, `airc teardown` plus the daemon may respawn the process by itself. Still run `airc status` after the bounce and poll `airc logs --since 2m` for missed messages. Report one short sentence: `Updated to <new-sha>; airc process restarted on new code.`
+If `airc daemon status` shows an installed/running daemon for this scope, `airc teardown` plus the daemon may respawn the process by itself. Still run `airc status` after the bounce and run `airc inbox` for missed messages. Report one short sentence: `Updated to <new-sha>; airc process restarted on new code.`
 
 ## Skill text changes are different — call out separately
 
