@@ -829,10 +829,9 @@ class GhBearer(Bearer):
              yield. Bump consumed_lines + offset file.
           4. Sleep poll_interval (default 15s), repeat.
 
-        On gh API failure (rate limit, network blip), we sleep the same
-        cadence and try again. The bearer's job is to keep producing
-        events; the caller's watchdog observes extended silence via
-        liveness().
+        On gh API failure, keep the bearer alive. Secondary rate limits
+        honor the shared GitHub backoff window instead of polling every
+        15s and extending the throttle.
         """
         self._check_alive()
 
@@ -848,11 +847,15 @@ class GhBearer(Bearer):
                 yield msg
                 if self._closed:
                     return
-            gist = _gh_api_get(gist_id)
+            gist, get_kind = _gh_api_get_classified(gist_id)
             if gist is None:
-                # Transient gh API failure. Sleep + retry. Caller's
-                # watchdog observes extended silence and escalates.
-                self._sleep_or_break(self._poll_interval)
+                if get_kind == "secondary_rate_limit":
+                    delay = max(self._poll_interval, gh_backoff.backoff_until() - _time.time(), 60.0)
+                    self._sleep_or_break(delay)
+                else:
+                    # Transient gh API failure. Sleep + retry. Caller's
+                    # watchdog observes extended silence and escalates.
+                    self._sleep_or_break(self._poll_interval)
                 continue
             content = _read_messages_content(gist)
             # splitlines() on the str preserves multi-byte sequences and

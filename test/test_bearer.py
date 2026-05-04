@@ -1760,6 +1760,29 @@ class GhBearerRecvTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].sender_peer_id, "bob")
 
+    def test_recv_secondary_rate_limit_sleeps_through_shared_backoff(self):
+        b = self._bearer({"poll_interval": 15})
+        sleeps = []
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            b.close()
+
+        with mock.patch.object(
+            bearer_gh,
+            "_gh_api_get_classified",
+            return_value=(None, "secondary_rate_limit"),
+        ), mock.patch.object(
+            bearer_gh.gh_backoff,
+            "backoff_until",
+            return_value=bearer_gh._time.time() + 120,
+        ), mock.patch.object(b, "_sleep_or_break", side_effect=fake_sleep):
+            list(b.recv_stream())
+
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreaterEqual(sleeps[0], 60)
+        self.assertGreater(sleeps[0], 100)
+
     def test_recv_resumes_past_offset_file(self):
         import tempfile, os as _os
         with tempfile.NamedTemporaryFile("w", delete=False) as f:
