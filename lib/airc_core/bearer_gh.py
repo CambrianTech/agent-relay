@@ -522,17 +522,23 @@ class GhBearer(Bearer):
 
     @classmethod
     def can_serve(cls, peer_meta: dict) -> bool:
-        """Serve any peer with a room_gist_id and a working gh auth.
+        """Serve any peer with a room_gist_id.
 
         Why room_gist_id rather than peer_id-derived addressing: gh-as-
         bearer uses the SHARED room gist for the substrate's message
         log. Every peer in the room reads/writes the same gist file.
         This matches how IRC works on a server — the channel is the
         bearer's addressable surface, not individual peers.
+
+        Deliberately no gh-auth probe here. can_serve is resolver
+        metadata inspection, not transport I/O. Auth/rate/network
+        failures belong in send()/recv_stream() where they become
+        structured SendOutcome values and visible monitor diagnostics.
+        Pre-fix, a poisoned GH_TOKEN made the resolver report "no
+        registered bearer can serve" even though gh is the correct
+        bearer for a room_gist_id.
         """
-        if not peer_meta.get("room_gist_id"):
-            return False
-        return _has_gh_auth()
+        return bool(peer_meta.get("room_gist_id"))
 
     def __init__(self, peer_meta: Optional[dict] = None) -> None:
         # No IO — concrete bearers MUST be cheap to instantiate.

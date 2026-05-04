@@ -33,12 +33,28 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from typing import Optional
 
 
 _GH_BIN = "gh"
 _GH_API_TIMEOUT = 10.0
 _GIST_LIST_LIMIT = 100   # `airc list` uses 50; we go a bit higher to be safe
+_GIST_ID_CHARS = set("0123456789abcdefABCDEF")
+_LOCAL_SCAN_MAX_DEPTH = 7
+_LOCAL_SCAN_PRUNE = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".turbo",
+}
 
 
 def _resolve_gh_bin() -> Optional[str]:
@@ -160,6 +176,240 @@ def _gh_api_get_gist(gist_id: str) -> Optional[dict]:
         return json.loads(r.stdout)
     except (ValueError, TypeError):
         return None
+
+
+def _valid_gist_id(gist_id: object) -> bool:
+    if not isinstance(gist_id, str):
+        return False
+    return 8 <= len(gist_id) <= 64 and all(c in _GIST_ID_CHARS for c in gist_id)
+
+
+def _parse_ts(value: object) -> float:
+    if not isinstance(value, str) or not value:
+        return 0.0
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return 0.0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _gist_activity_ts(gist: dict) -> float:
+    """Best-effort freshness signal from cloned gist contents.
+
+    GitHub REST `updated_at` is not available on the git fallback path.
+    The wire data itself is enough: room envelopes carry heartbeat-ish
+    timestamps and messages.jsonl lines carry message timestamps.
+    """
+    best = _parse_ts(gist.get("updated_at")) or _parse_ts(gist.get("created_at"))
+    files = gist.get("files") or {}
+    for name, entry in files.items():
+        content = entry.get("content")
+        if not isinstance(content, str) or not content:
+            continue
+        if name == "messages.jsonl":
+            for line in content.splitlines():
+                try:
+                    env = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(env, dict):
+                    continue
+                for key in ("ts", "updated", "last_heartbeat", "created"):
+                    best = max(best, _parse_ts(env.get(key)))
+            continue
+        try:
+            env = json.loads(content)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(env, dict):
+            continue
+        for key in ("updated", "updated_at", "last_heartbeat", "created", "created_at"):
+            best = max(best, _parse_ts(env.get(key)))
+    return best
+
+
+def _strict_single_channel_match(gist: dict, channel: str, require_invite: bool = False) -> bool:
+    """True only when the envelope is exclusively for this channel.
+
+    This is stricter than _is_single_channel_match, which deliberately
+    tolerates older heartbeat code adding sibling labels to an exact
+    filename. The local fallback uses this stricter tier first so a
+    newer multi-channel solo island cannot beat a real per-channel
+    chain during REST outage recovery.
+    """
+    files = gist.get("files") or {}
+    exact_name = f"airc-room-{channel}.json"
+    for name, entry in files.items():
+        content = entry.get("content")
+        if not content:
+            continue
+        try:
+            env = json.loads(content)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(env, dict):
+            continue
+        if require_invite and not env.get("invite"):
+            continue
+        channels = env.get("channels")
+        if isinstance(channels, list) and channels == [channel]:
+            return name == exact_name or len(files) == 1
+    return False
+
+
+def _local_scan_roots() -> list[str]:
+    raw = os.environ.get("AIRC_GIST_CACHE_ROOTS", "")
+    roots: list[str] = []
+    if raw:
+        roots.extend(p for p in raw.split(os.pathsep) if p)
+    airc_home = os.environ.get("AIRC_HOME", "")
+    if airc_home:
+        roots.append(os.path.dirname(os.path.dirname(os.path.abspath(airc_home))))
+    cwd = os.getcwd()
+    roots.append(cwd)
+    home = os.path.expanduser("~")
+    for rel in ("Development", "dev", "src", "Code"):
+        roots.append(os.path.join(home, rel))
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        root = os.path.abspath(os.path.expanduser(root))
+        if root in seen or not os.path.isdir(root):
+            continue
+        seen.add(root)
+        out.append(root)
+    return out
+
+
+def _local_config_gist_candidates(channel: str) -> list[tuple[str, float]]:
+    """Return locally remembered gist ids for channel across worktrees.
+
+    This is deliberately read-only evidence. It lets a machine recover
+    a previously-known canonical room while the gh REST listing surface
+    is unavailable, without creating a new island.
+    """
+    found: dict[str, float] = {}
+    for root in _local_scan_roots():
+        root_depth = root.rstrip(os.sep).count(os.sep)
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _LOCAL_SCAN_PRUNE]
+            if dirpath.rstrip(os.sep).count(os.sep) - root_depth > _LOCAL_SCAN_MAX_DEPTH:
+                dirnames[:] = []
+                continue
+            if "config.json" not in filenames or os.path.basename(dirpath) != ".airc":
+                continue
+            path = os.path.join(dirpath, "config.json")
+            try:
+                with open(path, encoding="utf-8") as f:
+                    cfg = json.load(f)
+            except (OSError, ValueError, TypeError):
+                continue
+            gists = cfg.get("channel_gists") or {}
+            gid = gists.get(channel)
+            if not _valid_gist_id(gid):
+                continue
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                mtime = 0.0
+            found[gid] = max(found.get(gid, 0.0), mtime)
+    return list(found.items())
+
+
+def _git_gist_snapshot(gist_id: str) -> Optional[dict]:
+    """Read a gist through the git endpoint, bypassing gh REST listing.
+
+    `git clone https://gist.github.com/<id>.git` has been reachable in
+    the same failures where `gh api /gists` is throttled or confused by
+    invalid env auth. We only use it for candidate ids already found in
+    local config, not for global discovery.
+    """
+    if not _valid_gist_id(gist_id) or shutil.which("git") is None:
+        return None
+    tmpdir = tempfile.mkdtemp(prefix="airc-gist-snapshot-")
+    try:
+        r = subprocess.run(
+            [
+                "git",
+                "-c",
+                "credential.helper=",
+                "clone",
+                "--quiet",
+                "--depth",
+                "1",
+                f"https://gist.github.com/{gist_id}.git",
+                tmpdir,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_GH_API_TIMEOUT,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+        if r.returncode != 0:
+            return None
+        files: dict[str, dict] = {}
+        for name in os.listdir(tmpdir):
+            path = os.path.join(tmpdir, name)
+            if name == ".git" or not os.path.isfile(path):
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    files[name] = {"content": f.read(), "truncated": False}
+            except OSError:
+                continue
+        if not files:
+            return None
+        desc = "airc mesh"
+        for name in files:
+            if name.startswith("airc-room-") and name.endswith(".json"):
+                room = name[len("airc-room-"):-len(".json")]
+                desc = f"airc room: #{room} (git fallback)"
+                break
+        return {"id": gist_id, "description": desc, "files": files}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _choose_local_fallback(matches: list[tuple[dict, float]], channel: str, require_invite: bool) -> Optional[str]:
+    if not matches:
+        return None
+
+    def rank(item: tuple[dict, float]) -> tuple[int, float, float, str]:
+        gist, local_mtime = item
+        if _strict_single_channel_match(gist, channel, require_invite=require_invite):
+            tier = 3
+        elif _is_single_channel_match(gist, channel, require_invite=require_invite):
+            tier = 2
+        elif _gist_describes_channel(gist, channel, require_invite=require_invite):
+            tier = 1
+        else:
+            tier = 0
+        return (tier, _gist_activity_ts(gist), local_mtime, gist.get("id", ""))
+
+    valid = [item for item in matches if rank(item)[0] > 0]
+    if not valid:
+        return None
+    valid.sort(key=rank, reverse=True)
+    return valid[0][0].get("id")
+
+
+def _find_existing_via_local_cache(channel: str, require_invite: bool = False) -> Optional[str]:
+    if os.environ.get("AIRC_DISABLE_LOCAL_GIST_FALLBACK") == "1":
+        return None
+    snapshots: list[tuple[dict, float]] = []
+    for gid, local_mtime in _local_config_gist_candidates(channel):
+        snapshot = _git_gist_snapshot(gid)
+        if snapshot is None:
+            continue
+        snapshots.append((snapshot, local_mtime))
+    return _choose_local_fallback(snapshots, channel, require_invite)
 
 
 def _is_single_channel_match(gist: dict, channel: str, require_invite: bool = False) -> bool:
@@ -294,7 +544,11 @@ def find_existing(channel: str, require_invite: bool = False) -> Optional[str]:
         if _gist_describes_channel(full, channel, require_invite=require_invite):
             full.setdefault("created_at", g.get("created_at", ""))
             deep_legacy.append(full)
-    return _oldest(deep_legacy)
+    chosen = _oldest(deep_legacy)
+    if chosen:
+        return chosen
+
+    return _find_existing_via_local_cache(channel, require_invite=require_invite)
 
 
 def create_new(channel: str) -> Optional[str]:

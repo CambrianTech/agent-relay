@@ -1126,28 +1126,31 @@ class ResolverOrderTests(unittest.TestCase):
 
 
 class GhBearerCanServeTests(unittest.TestCase):
-    """Phase 3b: GhBearer.can_serve must require BOTH room_gist_id
-    AND a working gh auth. Either alone is insufficient — gist id with
-    no auth means we can't actually read/write; auth with no gist id
-    means we have nowhere to send to."""
+    """GhBearer.can_serve is metadata-only.
+
+    Auth/rate/network failures are transport outcomes from send/recv,
+    not resolver gating. Otherwise a bad GH_TOKEN turns a valid
+    room_gist_id into "no registered bearer can serve" and hides the
+    real failure class from users and retry logic.
+    """
 
     def test_serves_with_gist_id_and_gh_auth(self):
-        with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
+        with mock.patch.object(bearer_gh, "_has_gh_auth", side_effect=AssertionError("can_serve must not probe gh auth")):
             self.assertTrue(GhBearer.can_serve({"room_gist_id": "abc123"}))
 
     def test_rejects_without_gist_id(self):
-        with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
+        with mock.patch.object(bearer_gh, "_has_gh_auth", side_effect=AssertionError("can_serve must not probe gh auth")):
             self.assertFalse(GhBearer.can_serve({}))
             self.assertFalse(GhBearer.can_serve({"room_gist_id": ""}))
 
-    def test_rejects_without_gh_auth(self):
+    def test_serves_even_when_gh_auth_probe_would_fail(self):
         with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=False):
-            self.assertFalse(GhBearer.can_serve({"room_gist_id": "abc123"}))
+            self.assertTrue(GhBearer.can_serve({"room_gist_id": "abc123"}))
 
     def test_can_serve_does_not_mutate_meta(self):
         meta = {"room_gist_id": "abc123"}
         before = dict(meta)
-        with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
+        with mock.patch.object(bearer_gh, "_has_gh_auth", side_effect=AssertionError("can_serve must not probe gh auth")):
             GhBearer.can_serve(meta)
         self.assertEqual(meta, before)
 
@@ -1702,16 +1705,16 @@ class ResolverPostPhase3cPlusTests(unittest.TestCase):
         self.assertNotIn("local", kinds)
 
     def test_gh_picked_when_only_room_gist_id(self):
-        # peer_meta has only room_gist_id + gh auth available → GhBearer.
-        with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
+        # peer_meta has only room_gist_id → GhBearer. Actual auth is
+        # classified by the bearer operation, not by resolver selection.
+        with mock.patch.object(bearer_gh, "_has_gh_auth", side_effect=AssertionError("resolver must not probe gh auth")):
             bearer = resolve({"room_gist_id": "abc123"})
         self.assertEqual(bearer.KIND, "gh")
 
-    def test_unreachable_when_no_gh_auth(self):
-        # Without gh auth, nothing can serve.
+    def test_gh_still_picked_when_auth_probe_would_fail(self):
         with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=False):
-            with self.assertRaises(PeerUnreachable):
-                resolve({"room_gist_id": "abc123"})
+            bearer = resolve({"room_gist_id": "abc123"})
+        self.assertEqual(bearer.KIND, "gh")
 
 
 if __name__ == "__main__":
