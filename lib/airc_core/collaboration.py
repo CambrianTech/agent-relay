@@ -183,7 +183,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         f"  [BLOCKED] collaboration mesh has 0 peer records — last remote traffic was "
         f"{max(0, now - any_recent.ts)}s ago from {any_recent.name}; this may be a solo island"
     )
-    print("         Check: airc peers; ask peers to run 'airc update --channel canary && airc connect <current invite>'")
+    print("         Check: airc peers; ask peers to run 'airc update --channel canary && airc join <current invite>'")
     return 2
 
 

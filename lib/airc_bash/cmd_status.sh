@@ -251,7 +251,7 @@ cmd_status() {
       fi
     fi
   elif [ -f "$pidfile" ]; then
-    monitor_state="stale pidfile (no live PIDs — run 'airc connect' to self-heal)"
+    monitor_state="stale pidfile (no live PIDs — run 'airc join' to self-heal)"
   fi
   echo "  monitor:     $monitor_state"
   _airc_monitor_health_report all

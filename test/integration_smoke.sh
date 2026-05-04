@@ -326,7 +326,7 @@ scenario_clean_install_smoke() {
 
   # help works (smoke for argument parsing)?
   if "$SANDBOX/bin/airc" --help >/dev/null 2>&1 \
-       || "$SANDBOX/bin/airc" connect --help >/dev/null 2>&1; then
+       || "$SANDBOX/bin/airc" join --help >/dev/null 2>&1; then
     pass "airc help paths work"
   else
     fail "airc help paths broken"

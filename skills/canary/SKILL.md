@@ -42,7 +42,7 @@ If canary breaks something:
 
 ```bash
 airc update --channel main
-airc teardown && airc connect
+airc join
 ```
 
 That's it. Branch switch + restart monitor on the new code. Identity, peers, room state all persist (they're in `$AIRC_HOME`, not `$AIRC_DIR`).
@@ -57,7 +57,7 @@ Then if they had a paired session you should restart the current scope for them.
 
 Claude Code:
 ```
-Monitor(persistent=true, command="airc connect")
+Monitor(persistent=true, command="airc join")
 ```
 
 Codex / non-Monitor runtimes:
@@ -80,7 +80,7 @@ airc inbox
 ## When NOT to use this skill
 
 - For routine updates → use `/airc:update` (stays on whatever channel they're on; doesn't switch).
-- For first-time install → use `/airc:connect` which auto-installs main.
+- For first-time install → use `/airc:join` which auto-installs main.
 
 ## Notes
 

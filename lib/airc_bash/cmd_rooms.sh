@@ -82,8 +82,8 @@ cmd_rooms() {
   local count; count=$(printf '%s' "$raw" | grep -c . || true)
   if [ "$count" = "0" ]; then
     echo "  No open airc rooms or invites on your gh account."
-    echo "  Host the default room:  airc connect"
-    echo "  Host a named room:      airc connect --room <name>"
+    echo "  Host the default room:  airc join"
+    echo "  Host a named room:      airc join --room <name>"
     return 0
   fi
   # First pass: count how many are stale vs fresh, so we can show an
@@ -144,8 +144,8 @@ cmd_rooms() {
     echo "  pruned $pruned stale gist(s)."
     return 0
   fi
-  echo "  Join (auto-resolves on same gh account): airc connect"
-  echo "  Join by id (cross-account share):        airc connect <id>"
+  echo "  Join (auto-resolves on same gh account): airc join"
+  echo "  Join by id (cross-account share):        airc join <id>"
   echo ""
 }
 
@@ -414,7 +414,7 @@ except Exception:
 
   if [ -z "$primary_gid" ]; then
     echo "  ERROR: no published room gist found in this scope." >&2
-    echo "  Run 'airc connect' first so a room exists to invite into." >&2
+    echo "  Run 'airc join' first so a room exists to invite into." >&2
     return 1
   fi
 
@@ -430,7 +430,7 @@ except Exception:
 curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
 
 # 2) Join my room.
-~/.local/bin/airc connect ${primary_gid}
+~/.local/bin/airc join ${primary_gid}
 
 # 3) Say hi so we know you made it.
 ~/.local/bin/airc msg "hello, I'm \$(whoami)"
@@ -472,7 +472,7 @@ cmd_invite() {
     host_port=$(get_config_val host_port 7547)
     host_ssh_pub=$(get_config_val host_ssh_pub "")
     if [ -z "$host_name" ] || [ -z "$host_ssh_pub" ]; then
-      die "Host info missing from config. Re-pair with 'airc teardown' then 'airc connect <join-string>'."
+      die "Host info missing from config. Re-pair with 'airc join <join-string>'."
     fi
     pubkey_b64=$(printf '%s\n' "$host_ssh_pub" | base64 | tr -d '\n')
     local port_suffix=""
@@ -501,8 +501,8 @@ cmd_invite() {
   echo ""
   echo "    $join_string"
   echo ""
-  echo "  Receiver runs:  airc connect <paste-the-above>"
-  echo "  Same-account peers can use:  airc rooms (then 'airc connect' auto-resolves the mesh gist)."
+  echo "  Receiver runs:  airc join <paste-the-above>"
+  echo "  Same-account peers can use:  airc rooms (then 'airc join' auto-resolves the mesh gist)."
 }
 
 cmd_peers() {

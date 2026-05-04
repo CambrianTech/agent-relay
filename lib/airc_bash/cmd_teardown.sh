@@ -6,7 +6,7 @@
 #                     looking process on the machine.
 #   cmd_disconnect  — "leave the room" softly: kill processes, clear
 #                     host-pairing fields, preserve identity + peers +
-#                     message history. Next `airc connect` is a fresh
+#                     message history. Next `airc join` is a fresh
 #                     host instead of resume.
 #
 # External cross-references (call-time): die, ensure_init, get_config_val,
@@ -361,7 +361,7 @@ cmd_teardown() {
 cmd_disconnect() {
   # "Leave the room" — kill running processes in scope, then clear only the
   # host-pairing fields from config.json. Your identity (name + keys), peers
-  # list, and message history are all preserved. Next `airc connect` (no
+  # list, and message history are all preserved. Next `airc join` (no
   # args) starts fresh host mode instead of auto-resuming the prior pairing.
   # Use when you want to switch to a different mesh or host a new one, but
   # keep your agent identity stable.
@@ -385,5 +385,5 @@ except Exception:
     pass
 " 2>/dev/null || true
   fi
-  echo "  Disconnected. Identity preserved. Next 'airc connect' starts fresh (not a resume)."
+  echo "  Disconnected. Identity preserved. Next 'airc join' starts fresh."
 }

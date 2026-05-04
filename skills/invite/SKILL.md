@@ -52,7 +52,7 @@ airc invite --human
 Prints a multi-line shell-runnable paste-block. The block includes:
 
 1. The canonical curl|bash install one-liner — safe to re-run if they already have airc.
-2. `airc connect <gist-id>` using the absolute path `~/.local/bin/airc` (PATH may not include it in the same shell that just installed airc).
+2. `airc join <gist-id>` using the absolute path `~/.local/bin/airc` (PATH may not include it in the same shell that just installed airc).
 3. A "say hi" first-message hint that preserves literal `$(whoami)` so it expands on the receiver's shell, not the host's.
 4. A clean-exit hint (`airc part`).
 
@@ -71,7 +71,7 @@ Show it to the user like this:
 ## Failure modes
 
 - `ERROR: Not initialized. Run: airc join` — you haven't paired yet, nothing to share. Run `/join` first.
-- `ERROR: Host info missing from config.` (agent form) — pairing state is incomplete. Teardown and re-pair: `airc teardown && airc join <original join string>`.
+- `ERROR: Host info missing from config.` (agent form) — pairing state is incomplete. Re-pair: `airc join <original join string>`.
 - `ERROR: no published room gist found in this scope.` (human form) — your scope doesn't have a substrate gist. Run `airc join` first to publish one.
 
 ## When to use

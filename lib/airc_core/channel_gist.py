@@ -79,6 +79,36 @@ def _save_cached_gist_list(gists: list[dict]) -> None:
             pass
 
 
+def _remember_created_gist(gist_id: str, channel: str, description: str, envelope: dict) -> None:
+    """Update the local gist-list cache after creating a room gist.
+
+    GitHub's list endpoint is eventually consistent. Without this, the
+    same process can create a room gist, immediately bounce, read a
+    still-stale cached list that lacks the new gist, and create a second
+    duplicate room. The cache entry only needs the fields used by
+    find_existing(): id, timestamps, description, and inline file content.
+    """
+    if not gist_id:
+        return
+    cached = _load_cached_gist_list(float("inf")) or []
+    cached = [g for g in cached if g.get("id") != gist_id]
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    filename = f"airc-room-{channel}.json"
+    cached.insert(0, {
+        "id": gist_id,
+        "description": description,
+        "created_at": now,
+        "updated_at": now,
+        "files": {
+            filename: {
+                "filename": filename,
+                "content": json.dumps(envelope),
+            }
+        },
+    })
+    _save_cached_gist_list(cached[:_GIST_LIST_LIMIT])
+
+
 def _resolve_gh_bin() -> Optional[str]:
     """Return path to gh CLI, or None if absent. Caller-visible None
     means we can't do gh-side resolution at all — return early."""
@@ -642,7 +672,10 @@ def create_new(channel: str) -> Optional[str]:
         last = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
         if not last:
             return None
-        return last.rsplit("/", 1)[-1] or None
+        gist_id = last.rsplit("/", 1)[-1] or None
+        if gist_id:
+            _remember_created_gist(gist_id, channel, desc, envelope)
+        return gist_id
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -729,6 +762,12 @@ def _cli() -> int:
     hp.add_argument("--channel", required=True)
     hp.add_argument("--config", default="")
 
+    m = sub.add_parser("remember-created", help="Record a just-created room gist in the local discovery cache")
+    m.add_argument("--channel", required=True)
+    m.add_argument("--gist-id", required=True)
+    m.add_argument("--description", required=True)
+    m.add_argument("--payload-file", required=True)
+
     args = parser.parse_args()
 
     if args.cmd == "resolve":
@@ -751,6 +790,14 @@ def _cli() -> int:
         if decision == "blocked":
             return 2
         return 1
+    if args.cmd == "remember-created":
+        try:
+            with open(args.payload_file, encoding="utf-8") as f:
+                envelope = json.load(f)
+        except (OSError, ValueError, TypeError):
+            return 1
+        _remember_created_gist(args.gist_id, args.channel, args.description, envelope)
+        return 0
     return 1
 
 
