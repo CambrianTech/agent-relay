@@ -1657,40 +1657,13 @@ JSON
                 # joiners that lose connection re-discover and try the
                 # new address set.
                 local _hb_addrs; _hb_addrs=$(host_addresses_json "${_hb_port}")
-                # Phase 2C: build channels[] from recent message activity
-                # so joiners on different cwds can advertise their channels
-                # without coordinating with the host. Self-correcting —
-                # silent channels age out, active ones surface. Falls back
-                # to the host's primary room if no recent activity.
-                local _hb_channels
-                _hb_channels=$(AIRC_HB_MSGS="$_hb_messages" \
-                               AIRC_HB_ROOM="$_hb_room" \
-                               "$AIRC_PYTHON" -c '
-import json, os, sys
-log = os.environ.get("AIRC_HB_MSGS", "")
-fallback = os.environ.get("AIRC_HB_ROOM", "general") or "general"
-window = int(os.environ.get("AIRC_HB_RECENT", "200"))
-chans = []
-seen = set()
-try:
-    with open(log) as f:
-        # Read last N lines without slurping the full file.
-        lines = f.readlines()[-window:]
-    for line in lines:
-        try:
-            ch = json.loads(line).get("channel", "")
-        except Exception:
-            continue
-        if ch and ch not in seen:
-            seen.add(ch); chans.append(ch)
-except Exception:
-    pass
-if not chans:
-    chans = [fallback]
-elif fallback not in seen:
-    chans.append(fallback)
-print(json.dumps(chans))
-' 2>/dev/null || echo "[\"${_hb_room}\"]")
+                # One gist is the durable wire for one channel. Keep
+                # the host lease envelope single-channel even if this
+                # scope is subscribed to multiple channels; otherwise
+                # the resolver can stop treating the actual
+                # airc-room-<channel>.json gist as canonical and drift
+                # toward a newer solo invite duplicate.
+                local _hb_channels="[\"${_hb_room}\"]"
                 local _hb_payload; _hb_payload=$(cat <<JSON
 {
   "airc": 1,

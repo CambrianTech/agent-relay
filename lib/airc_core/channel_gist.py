@@ -163,11 +163,17 @@ def _gh_api_get_gist(gist_id: str) -> Optional[dict]:
 
 
 def _is_single_channel_match(gist: dict, channel: str, require_invite: bool = False) -> bool:
-    """A gist is the canonical post-3c per-channel gist for `channel`
-    iff its envelope has channels=[<exactly channel>]. Single-element
-    list, exact match. The post-3c shape created by create_new()."""
+    """Return True for the canonical post-3c per-channel gist.
+
+    The canonical signal is the in-gist filename
+    `airc-room-<channel>.json`. Older hosts briefly wrote multiple
+    channel labels into that envelope during heartbeat refresh; do not
+    let that demote the actual per-channel chain below a newer solo
+    invite duplicate.
+    """
     files = gist.get("files") or {}
-    for entry in files.values():
+    exact_name = f"airc-room-{channel}.json"
+    for name, entry in files.items():
         content = entry.get("content")
         if not content:
             continue
@@ -180,6 +186,8 @@ def _is_single_channel_match(gist: dict, channel: str, require_invite: bool = Fa
         if require_invite and not env.get("invite"):
             continue
         channels = env.get("channels")
+        if name == exact_name and isinstance(channels, list) and channel in channels:
+            return True
         if isinstance(channels, list) and len(channels) == 1 and channels[0] == channel:
             return True
     return False
