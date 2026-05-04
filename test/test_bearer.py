@@ -8,7 +8,9 @@ or:  cd test && python -m unittest test_bearer
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -1161,7 +1163,9 @@ class GhBearerSendTests(unittest.TestCase):
     (the write step) so no real gh API is touched."""
 
     def _bearer(self, meta=None):
-        m = meta or {"room_gist_id": "abc123"}
+        m = {"room_gist_id": "abc123", "disable_local_bus": True}
+        if meta:
+            m.update(meta)
         b = GhBearer(m)
         b.open("alice")
         return b
@@ -1318,7 +1322,9 @@ class GhBearerErrorClassificationTests(unittest.TestCase):
     recovery surface."""
 
     def _bearer(self, meta=None):
-        m = meta or {"room_gist_id": "abc123"}
+        m = {"room_gist_id": "abc123", "disable_local_bus": True}
+        if meta:
+            m.update(meta)
         b = GhBearer(m)
         b.open("alice")
         return b
@@ -1450,6 +1456,77 @@ class GhBearerErrorClassificationTests(unittest.TestCase):
         self.assertLess(max_observed, 50.0)
 
 
+class GhBearerLocalBusTests(unittest.TestCase):
+    """Same-machine fallback: gh room ids also address a local bus.
+
+    This is the production escape hatch for local agents when GitHub's
+    REST/gist path is throttled. GitHub remains the rendezvous/control
+    identity, but same-user processes on one machine can exchange the
+    signed envelope through a local append-only room log.
+    """
+
+    def _env(self, root):
+        return mock.patch.dict(os.environ, {"AIRC_LOCAL_BUS_DIR": root, "AIRC_DISABLE_LOCAL_BUS": ""})
+
+    def test_send_reports_delivered_when_gh_is_rate_limited_but_local_bus_wrote(self):
+        with tempfile.TemporaryDirectory() as tmp, self._env(tmp):
+            def _fake_get(_gist_id):
+                bearer_gh._gh_api_get._last_err = "gh: API rate limit exceeded (HTTP 403)"
+                return None
+
+            b = GhBearer({"room_gist_id": "abc123"})
+            b.open("alice")
+            with mock.patch.object(bearer_gh, "_gh_api_get", side_effect=_fake_get):
+                outcome = b.send("alice", "general", b'{"from":"me","channel":"general","msg":"local"}')
+
+            self.assertEqual(outcome.kind, "delivered")
+            self.assertIn("local bus", outcome.detail)
+            path = Path(tmp) / "abc123" / "messages.jsonl"
+            self.assertIn('"msg":"local"', path.read_text(encoding="utf-8"))
+
+    def test_recv_yields_local_bus_lines_when_gh_get_fails(self):
+        with tempfile.TemporaryDirectory() as tmp, self._env(tmp):
+            path = Path(tmp) / "abc123" / "messages.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text('{"from":"local-peer","channel":"general","msg":"hi"}\n', encoding="utf-8")
+
+            b = GhBearer({"room_gist_id": "abc123", "poll_interval": 0})
+            b.open("alice")
+            with mock.patch.object(bearer_gh, "_gh_api_get", return_value=None):
+                events = []
+                for ev in b.recv_stream():
+                    events.append(ev)
+                    b.close()
+                    break
+
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].sender_peer_id, "local-peer")
+            self.assertEqual(events[0].channel, "general")
+
+    def test_recv_dedupes_same_line_from_local_bus_and_gist(self):
+        line = '{"from":"peer","channel":"general","msg":"once"}'
+        with tempfile.TemporaryDirectory() as tmp, self._env(tmp):
+            path = Path(tmp) / "abc123" / "messages.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text(line + "\n", encoding="utf-8")
+
+            b = GhBearer({"room_gist_id": "abc123", "poll_interval": 0})
+            b.open("alice")
+            second = '{"from":"peer","channel":"general","msg":"second"}'
+            with mock.patch.object(
+                bearer_gh, "_gh_api_get",
+                return_value={"files": {"messages.jsonl": {"content": line + "\n" + second + "\n"}}},
+            ):
+                events = []
+                for ev in b.recv_stream():
+                    events.append(ev)
+                    if len(events) >= 2:
+                        b.close()
+                        break
+
+            self.assertEqual([e.bearer_metadata["envelope"]["msg"] for e in events], ["once", "second"])
+
+
 class GhBearerRecvTests(unittest.TestCase):
     """GhBearer.recv_stream: poll the gist, yield new lines.
 
@@ -1458,7 +1535,9 @@ class GhBearerRecvTests(unittest.TestCase):
     15s default."""
 
     def _bearer(self, meta=None):
-        m = meta or {"room_gist_id": "abc123", "poll_interval": 0}
+        m = {"room_gist_id": "abc123", "poll_interval": 0, "disable_local_bus": True}
+        if meta:
+            m.update(meta)
         b = GhBearer(m)
         b.open("alice")
         return b
