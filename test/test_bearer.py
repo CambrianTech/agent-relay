@@ -554,6 +554,29 @@ class BearerCliStateFileTests(unittest.TestCase):
         # Bearer's liveness ts was 1714435200 + (2 events × 1s for liveness call) + 1 (init) → check it's reasonable
         self.assertGreater(state["last_recv_ts"], 1714435200.0)
         self.assertEqual(state["kind"], "fake-ssh")
+        self.assertGreaterEqual(state["last_heartbeat_ts"], state["last_recv_ts"])
+
+    def test_heartbeat_touch_does_not_fake_receive(self):
+        import json as _json
+        import os as _os
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json") as f:
+            state_path = f.name
+            _json.dump({
+                "kind": "gh",
+                "peer_id": "alice",
+                "last_recv_ts": 123.0,
+                "events_total": 7,
+            }, f)
+
+        bearer_cli._touch_state_heartbeat(state_path, 456.0)
+
+        with open(state_path) as f:
+            state = _json.load(f)
+        self.assertEqual(state["last_recv_ts"], 123.0)
+        self.assertEqual(state["events_total"], 7)
+        self.assertEqual(state["last_heartbeat_ts"], 456.0)
+        _os.unlink(state_path)
 
     def test_no_state_file_means_no_writes(self):
         events = [ReceivedMessage(

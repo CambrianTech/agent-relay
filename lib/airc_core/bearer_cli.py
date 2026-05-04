@@ -45,6 +45,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import asdict
 from typing import Optional, Tuple, Union
 
@@ -390,6 +391,8 @@ def cmd_recv(args) -> int:
                     except (BrokenPipeError, ValueError):
                         # Downstream gone or stdout closed; stop trying.
                         return
+                if state_file:
+                    _touch_state_heartbeat(state_file, _ti.time())
                 next_tick = now + _heartbeat_sec
             # Wake every 100ms so close() takes effect promptly.
             _stop_heartbeat.wait(0.1)
@@ -421,6 +424,7 @@ def cmd_recv(args) -> int:
                     "events_total": events_total,
                     "diag": live.bearer_diag,
                 })
+                _touch_state_heartbeat(state_file, time.time())
     except KeyboardInterrupt:
         pass
     finally:
@@ -457,6 +461,23 @@ def _write_state_file(path: str, state: dict) -> None:
                 pass
     except OSError:
         pass
+
+
+def _touch_state_heartbeat(path: str, ts: float) -> None:
+    """Record bearer-loop heartbeat without pretending a peer message arrived.
+
+    last_recv_ts remains the timestamp of the last real envelope. The
+    heartbeat timestamp lets `airc status` distinguish an idle but live
+    bearer from a dead channel, which is the signal users and agents need
+    when a monitor silently wedges.
+    """
+    try:
+        with open(path) as f:
+            state = json.load(f)
+    except Exception:
+        state = {}
+    state["last_heartbeat_ts"] = ts
+    _write_state_file(path, state)
 
 
 def _build_parser() -> argparse.ArgumentParser:
