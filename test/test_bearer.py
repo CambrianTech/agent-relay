@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -1483,6 +1484,9 @@ class GhBearerLocalBusTests(unittest.TestCase):
             self.assertIn("local bus", outcome.detail)
             path = Path(tmp) / "abc123" / "messages.jsonl"
             self.assertIn('"msg":"local"', path.read_text(encoding="utf-8"))
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
 
     def test_recv_yields_local_bus_lines_when_gh_get_fails(self):
         with tempfile.TemporaryDirectory() as tmp, self._env(tmp):
@@ -1496,12 +1500,13 @@ class GhBearerLocalBusTests(unittest.TestCase):
                 events = []
                 for ev in b.recv_stream():
                     events.append(ev)
-                    b.close()
                     break
 
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0].sender_peer_id, "local-peer")
             self.assertEqual(events[0].channel, "general")
+            self.assertIn("local bus", b.liveness("alice").bearer_diag)
+            b.close()
 
     def test_recv_dedupes_same_line_from_local_bus_and_gist(self):
         line = '{"from":"peer","channel":"general","msg":"once"}'
@@ -1525,6 +1530,82 @@ class GhBearerLocalBusTests(unittest.TestCase):
                         break
 
             self.assertEqual([e.bearer_metadata["envelope"]["msg"] for e in events], ["once", "second"])
+
+    def test_recv_does_not_advance_past_partial_local_line(self):
+        with tempfile.TemporaryDirectory() as tmp, self._env(tmp):
+            path = Path(tmp) / "abc123" / "messages.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text('{"from":"peer","channel":"general","msg":"complete"}\n{"from":"peer"', encoding="utf-8")
+
+            b = GhBearer({"room_gist_id": "abc123", "poll_interval": 0})
+            b.open("alice")
+            with mock.patch.object(bearer_gh, "_gh_api_get", return_value=None):
+                events = []
+                for ev in b.recv_stream():
+                    events.append(ev)
+                    b.close()
+                    break
+
+            self.assertEqual([e.bearer_metadata["envelope"]["msg"] for e in events], ["complete"])
+            # The byte offset should stop after the newline-terminated record,
+            # leaving the partial tail to be retried once it is completed.
+            self.assertLess(b._local_byte_offset, path.stat().st_size)
+
+    def test_recv_uses_byte_offset_file_not_legacy_line_offset_file(self):
+        with tempfile.TemporaryDirectory() as tmp, self._env(tmp):
+            bus = Path(tmp) / "abc123" / "messages.jsonl"
+            bus.parent.mkdir(parents=True)
+            bus.write_text('{"from":"peer","channel":"general","msg":"first"}\n', encoding="utf-8")
+            offset = Path(tmp) / "state.offset"
+            offset.write_text("1", encoding="utf-8")
+            (Path(str(offset) + ".local")).write_text("3", encoding="utf-8")
+
+            b = GhBearer({"room_gist_id": "abc123", "poll_interval": 0, "offset_file": str(offset)})
+            b.open("alice")
+            with mock.patch.object(bearer_gh, "_gh_api_get", return_value=None):
+                events = []
+                for ev in b.recv_stream():
+                    events.append(ev)
+                    b.close()
+                    break
+
+            self.assertEqual([e.bearer_metadata["envelope"]["msg"] for e in events], ["first"])
+            self.assertTrue(Path(str(offset) + ".local.bytes").exists())
+            self.assertEqual((Path(str(offset) + ".local")).read_text(encoding="utf-8"), "3")
+
+    def test_recv_does_not_advance_past_invalid_utf8_local_line(self):
+        with tempfile.TemporaryDirectory() as tmp, self._env(tmp):
+            path = Path(tmp) / "abc123" / "messages.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b'{"from":"peer","channel":"general","msg":"ok"}\n\xff\n')
+
+            lines, next_offset = bearer_gh._local_bus_read_from("abc123", 0, {})
+
+            self.assertEqual(lines, [])
+            self.assertEqual(next_offset, 0)
+
+    def test_truthy_env_disables_local_bus(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"AIRC_LOCAL_BUS_DIR": tmp, "AIRC_DISABLE_LOCAL_BUS": "true"}):
+                def _fake_get(_gist_id):
+                    bearer_gh._gh_api_get._last_err = "gh: API rate limit exceeded (HTTP 403)"
+                    return None
+
+                b = GhBearer({"room_gist_id": "abc123"})
+                b.open("alice")
+                with mock.patch.object(bearer_gh, "_gh_api_get", side_effect=_fake_get):
+                    outcome = b.send("alice", "general", b'{"from":"me","channel":"general","msg":"local"}')
+
+            self.assertEqual(outcome.kind, "secondary_rate_limit")
+            self.assertFalse((Path(tmp) / "abc123" / "messages.jsonl").exists())
+
+    def test_seen_payload_cache_is_bounded(self):
+        b = GhBearer({"room_gist_id": "abc123", "disable_local_bus": True})
+        b.open("alice")
+        for i in range(bearer_gh._SEEN_PAYLOAD_MAX + 25):
+            self.assertFalse(b._seen(f"line-{i}"))
+        self.assertLessEqual(len(b._seen_payloads), bearer_gh._SEEN_PAYLOAD_MAX)
+        self.assertFalse(b._seen("line-0"), "oldest entries should be evicted from dedupe cache")
 
 
 class GhBearerRecvTests(unittest.TestCase):

@@ -39,6 +39,7 @@ import subprocess
 import sys
 import tempfile
 import time as _time
+from collections import deque
 from typing import Iterator, Optional, Tuple
 
 from .bearer import (
@@ -62,6 +63,8 @@ _DEFAULT_POLL_INTERVAL = 15.0  # seconds; tuned for gh rate limit headroom
 _GH_API_TIMEOUT = 10.0          # per-call seconds; total wall time bounded by retry policy
 _LOCAL_BUS_ROOT_ENV = "AIRC_LOCAL_BUS_DIR"
 _DISABLE_LOCAL_BUS_ENV = "AIRC_DISABLE_LOCAL_BUS"
+_SEEN_PAYLOAD_MAX = 5000
+_TRUTHY = {"1", "true", "yes", "on"}
 
 # Rotation thresholds (gh hard limit on a gist file is 1MB; we trim
 # proactively well before that so the next append always has headroom).
@@ -80,10 +83,18 @@ def _safe_gist_id(gist_id: str) -> str:
     return "".join(c if c.isalnum() else "_" for c in str(gist_id))
 
 
-def _local_bus_enabled(peer_meta: Optional[dict] = None) -> bool:
-    if os.environ.get(_DISABLE_LOCAL_BUS_ENV) == "1":
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
         return False
-    if peer_meta and peer_meta.get("disable_local_bus"):
+    return str(value).strip().lower() in _TRUTHY
+
+
+def _local_bus_enabled(peer_meta: Optional[dict] = None) -> bool:
+    if _truthy(os.environ.get(_DISABLE_LOCAL_BUS_ENV)):
+        return False
+    if peer_meta and _truthy(peer_meta.get("disable_local_bus")):
         return False
     return True
 
@@ -103,26 +114,51 @@ def _local_bus_append(gist_id: str, line: str, peer_meta: Optional[dict] = None)
         return (False, "local bus disabled")
     framed = line if line.endswith("\n") else line + "\n"
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        directory = os.path.dirname(path)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
             os.write(fd, framed.encode("utf-8"))
         finally:
             os.close(fd)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
     except OSError as e:
         return (False, f"local bus append failed: {e}")
     return (True, "")
 
 
-def _local_bus_read_lines(gist_id: str, peer_meta: Optional[dict] = None) -> list[str]:
+def _local_bus_read_from(gist_id: str, byte_offset: int, peer_meta: Optional[dict] = None) -> tuple[list[str], int]:
     path = _local_bus_path(gist_id, peer_meta)
     if not path:
-        return []
+        return ([], byte_offset)
     try:
-        with open(path, encoding="utf-8") as f:
-            return f.read().splitlines()
+        size = os.path.getsize(path)
+        if byte_offset > size:
+            byte_offset = 0
+        with open(path, "rb") as f:
+            f.seek(byte_offset)
+            chunk = f.read()
     except OSError:
-        return []
+        return ([], byte_offset)
+    if not chunk:
+        return ([], byte_offset)
+    newline = chunk.rfind(b"\n")
+    if newline < 0:
+        return ([], byte_offset)
+    complete = chunk[: newline + 1]
+    new_offset = byte_offset + len(complete)
+    try:
+        text = complete.decode("utf-8")
+    except UnicodeDecodeError:
+        return ([], byte_offset)
+    return (text.splitlines(), new_offset)
 
 
 def _resolve_gh_bin() -> str:
@@ -599,11 +635,13 @@ class GhBearer(Bearer):
         self._opened_peer_id: Optional[str] = None
         self._closed = False
         self._last_recv_ts: Optional[float] = None
+        self._last_recv_source: Optional[str] = None
         # Tracks how many lines of messages.jsonl we've already yielded.
         # Resumed from offset_file on first poll if available.
         self._consumed_lines: int = 0
-        self._local_consumed_lines: int = 0
+        self._local_byte_offset: int = 0
         self._seen_payloads: set[str] = set()
+        self._seen_payload_order: deque[str] = deque()
         # Polling cadence; can be overridden via peer_meta for tests.
         self._poll_interval: float = float(
             peer_meta.get("poll_interval", _DEFAULT_POLL_INTERVAL)
@@ -624,7 +662,7 @@ class GhBearer(Bearer):
         # doesn't reset to disk state mid-stream.
         offset_file = self._peer_meta.get("offset_file")
         self._consumed_lines = self._read_offset(offset_file)
-        self._local_consumed_lines = self._read_offset(self._local_offset_file(offset_file))
+        self._local_byte_offset = self._read_offset(self._local_offset_file(offset_file))
 
     def send(self, peer_id: str, channel: str, payload: bytes) -> SendOutcome:
         """Append `payload` to the room gist's messages.jsonl file with
@@ -817,18 +855,18 @@ class GhBearer(Bearer):
             # picked up.
             if self._consumed_lines > len(lines):
                 self._consumed_lines = len(lines)
-                self._on_line_received(self._consumed_lines, offset_file)
+                self._write_offset(offset_file, self._consumed_lines)
             for idx in range(self._consumed_lines, len(lines)):
                 line = lines[idx]
                 raw = line.encode("utf-8")
                 self._consumed_lines = idx + 1
-                self._on_line_received(self._consumed_lines, offset_file)
-                if line in self._seen_payloads:
+                self._write_offset(offset_file, self._consumed_lines)
+                if self._seen(line):
                     continue
-                self._seen_payloads.add(line)
                 msg = self._parse_envelope(raw)
                 if msg is None:
                     continue
+                self._mark_received("gh poll")
                 yield msg
                 if self._closed:
                     return
@@ -840,26 +878,32 @@ class GhBearer(Bearer):
     def _local_offset_file(offset_file: Optional[str]) -> Optional[str]:
         if not offset_file:
             return None
-        return f"{offset_file}.local"
+        return f"{offset_file}.local.bytes"
 
     def _drain_local_bus(self, gist_id: str, offset_file: Optional[str]) -> Iterator[ReceivedMessage]:
-        lines = _local_bus_read_lines(gist_id, self._peer_meta)
         local_offset = self._local_offset_file(offset_file)
-        if self._local_consumed_lines > len(lines):
-            self._local_consumed_lines = len(lines)
-            self._write_offset(local_offset, self._local_consumed_lines)
-        for idx in range(self._local_consumed_lines, len(lines)):
-            line = lines[idx]
-            self._local_consumed_lines = idx + 1
-            self._write_offset(local_offset, self._local_consumed_lines)
-            if line in self._seen_payloads:
+        lines, new_offset = _local_bus_read_from(gist_id, self._local_byte_offset, self._peer_meta)
+        if new_offset != self._local_byte_offset:
+            self._local_byte_offset = new_offset
+            self._write_offset(local_offset, self._local_byte_offset)
+        for line in lines:
+            if self._seen(line):
                 continue
-            self._seen_payloads.add(line)
             msg = self._parse_envelope(line.encode("utf-8"))
             if msg is None:
                 continue
-            self._last_recv_ts = _time.time()
+            self._mark_received("local bus")
             yield msg
+
+    def _seen(self, line: str) -> bool:
+        if line in self._seen_payloads:
+            return True
+        self._seen_payloads.add(line)
+        self._seen_payload_order.append(line)
+        while len(self._seen_payload_order) > _SEEN_PAYLOAD_MAX:
+            old = self._seen_payload_order.popleft()
+            self._seen_payloads.discard(old)
+        return False
 
     @staticmethod
     def _read_offset(offset_file: Optional[str]) -> int:
@@ -888,11 +932,10 @@ class GhBearer(Bearer):
         except OSError:
             pass
 
-    def _on_line_received(self, line_count: int, offset_file: Optional[str]) -> None:
-        """Bump last_recv_ts (for liveness) and persist offset (for resume).
-        Persistence failures are swallowed — the bearer keeps streaming."""
+    def _mark_received(self, source: str) -> None:
+        """Record actual delivered-message liveness."""
         self._last_recv_ts = _time.time()
-        self._write_offset(offset_file, line_count)
+        self._last_recv_source = source
 
     @staticmethod
     def _parse_envelope(raw_line: bytes) -> Optional[ReceivedMessage]:
@@ -934,12 +977,12 @@ class GhBearer(Bearer):
             return LivenessResult(
                 peer_id=peer_id,
                 last_seen_ts=None,
-                bearer_diag="no events received via gh poll yet",
+                bearer_diag="no events received via gh/local bus yet",
             )
         return LivenessResult(
             peer_id=peer_id,
             last_seen_ts=self._last_recv_ts,
-            bearer_diag="last event from gh poll",
+            bearer_diag=f"last event from {self._last_recv_source or 'gh/local bus'}",
         )
 
     def close(self) -> None:
