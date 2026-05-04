@@ -3342,6 +3342,123 @@ scenario_custom_room_creates_gist() {
   cleanup_all
 }
 
+scenario_invite_human() {
+  # `airc invite --human` produces a self-contained shell paste-block
+  # a coworker can run in their terminal — including the install
+  # one-liner so the "they don't have airc yet" case works. The block
+  # uses the room's raw gist-id (not the mnemonic) so it works for
+  # coworkers on a DIFFERENT gh account; mnemonic resolution is
+  # same-gh-account-only.
+  #
+  # This scenario tests the END-TO-END user flow Joel calls "Toby's
+  # case for humans" — friend pastes the block, ends up in the room.
+  # We can't actually run the install one-liner in the test (would
+  # touch the real ~/.local/bin/airc and pull from main), but we
+  # CAN extract the connect line and execute its substantive part:
+  # (1) the paste-block has the right shape, and (2) the connect
+  # command in it actually puts a fresh joiner scope into the host's
+  # room.
+  section "invite --human: paste-block onboards a coworker end-to-end"
+  requires_gh_auth_or_skip "invite_human" || return
+  cleanup_all
+
+  local home_h=/tmp/airc-it-ihp-h
+  mkdir -p "$home_h/state"
+  local rname="ihp-room-$$"
+  ( cd "$home_h" && AIRC_HOME="$home_h/state" AIRC_NAME=ihp-host AIRC_PORT=7567 \
+      AIRC_NO_DISCOVERY=1 AIRC_NO_AUTO_ROOM=1 \
+      "$AIRC" connect --room "$rname" --no-general > "$home_h/out.log" 2>&1 & )
+  # Wait up to 30s for the host to publish channel_gists[$rname] —
+  # gist creation hits the gh API and can be slow on first call.
+  # Loop early-exits as soon as the field appears.
+  local host_gid="" i
+  for i in $(seq 1 30); do
+    sleep 1
+    [ -f "$home_h/state/config.json" ] || continue
+    host_gid=$(python3 -c "
+import json
+try:
+    c = json.load(open('$home_h/state/config.json'))
+    print(c.get('channel_gists', {}).get('$rname', ''))
+except Exception:
+    pass
+" 2>/dev/null)
+    [ -n "$host_gid" ] && break
+  done
+
+  if [ -z "$host_gid" ]; then
+    fail "host did not publish a room gist within 30s (channel_gists['$rname'] empty); out.log: $(tail -10 "$home_h/out.log" 2>/dev/null)"
+    cleanup_all; return
+  fi
+  pass "host published room gist: $host_gid (#$rname)"
+
+  trap "[ -n '$host_gid' ] && gh gist delete '$host_gid' --yes 2>/dev/null || true" EXIT
+
+  # Capture invite --human output.
+  local block; block=$(AIRC_HOME="$home_h/state" "$AIRC" invite --human 2>&1)
+
+  # Shape assertions — the block must contain each onboarding step a
+  # human-without-airc-yet would need. Each missing piece is a real
+  # regression in coworker-onboarding UX.
+  printf '%s\n' "$block" | grep -q "curl -fsSL" \
+    && pass "paste-block contains install one-liner" \
+    || fail "paste-block missing install one-liner"
+  printf '%s\n' "$block" | grep -q "airc connect" \
+    && pass "paste-block contains 'airc connect'" \
+    || fail "paste-block missing 'airc connect'"
+  printf '%s\n' "$block" | grep -q "airc msg" \
+    && pass "paste-block contains 'airc msg' (first-message hint)" \
+    || fail "paste-block missing 'airc msg' (recipient won't know how to be heard)"
+  printf '%s\n' "$block" | grep -q "airc part" \
+    && pass "paste-block contains 'airc part' (clean-exit hint)" \
+    || fail "paste-block missing 'airc part'"
+
+  # The connect must reference the actual gist-id (cross-account-safe),
+  # NOT the mnemonic (which only resolves on the same gh account).
+  printf '%s\n' "$block" | grep -qE "airc connect $host_gid" \
+    && pass "paste-block uses raw gist-id (cross-account safe)" \
+    || fail "paste-block missing the actual gist-id ($host_gid) on the connect line"
+
+  # $(whoami) must be LITERAL in the printed block — it expands at
+  # paste-time on the receiver's shell, not at generation-time on
+  # the host's. If the heredoc lost its quoted delimiter, the host's
+  # username would leak instead.
+  printf '%s\n' "$block" | grep -qF '$(whoami)' \
+    && pass "paste-block preserves literal \$(whoami) (resolves on receiver, not host)" \
+    || fail "paste-block has expanded \$(whoami) — would leak host username"
+
+  # The gist-id in the paste-block must be the host's ACTUAL room gist
+  # (extracted to confirm — not a mistake like a stale ID or the long
+  # invite string).
+  local connect_gid; connect_gid=$(printf '%s\n' "$block" | grep -oE "airc connect [a-f0-9]{32}" | head -1 | awk '{print $3}')
+  if [ "$connect_gid" = "$host_gid" ]; then
+    pass "paste-block gist-id matches host's published room gist"
+  else
+    fail "paste-block gist-id ($connect_gid) != host's room gist ($host_gid)"
+  fi
+
+  # The gist referenced in the paste-block must actually exist on gh —
+  # if it's a stale ID or a 404, the coworker's `airc connect` will
+  # silently spin or error out and they won't know why.
+  if gh api "gists/$connect_gid" --jq '.id' >/dev/null 2>&1; then
+    pass "paste-block gist actually exists and is reachable on gh"
+  else
+    fail "paste-block gist ($connect_gid) NOT reachable via gh api — the receiver's 'airc connect' would fail"
+  fi
+
+  # The paste-block uses absolute paths (~/.local/bin/airc) rather
+  # than bare 'airc'. PATH may not include ~/.local/bin in the same
+  # shell that just curl|bash'd install.sh, so bare 'airc' would fail
+  # for fresh installs. Absolute paths protect against that.
+  printf '%s\n' "$block" | grep -q "~/.local/bin/airc" \
+    && pass "paste-block uses absolute path (~/.local/bin/airc) so PATH-not-yet-refreshed shells still find airc" \
+    || fail "paste-block missing absolute airc path — would fail in a shell that just installed airc"
+
+  trap - EXIT
+  [ -n "$host_gid" ] && gh gist delete "$host_gid" --yes 2>/dev/null || true
+  cleanup_all
+}
+
 scenario_bearer_local() {
   # LocalBearer used to serve same-machine peers via direct filesystem
   # reads/writes — a "skip the network" optimization correct in the
@@ -3918,6 +4035,7 @@ case "$MODE" in
   channel_gist_prefers_single_channel) scenario_channel_gist_prefers_single_channel ;;
   gist_rotates_under_size_limit) scenario_gist_rotates_under_size_limit ;;
   custom_room_creates_gist) scenario_custom_room_creates_gist ;;
+  invite_human) scenario_invite_human ;;
   ""|all)
     # Default = run everything. The peers_cross_scope + whois_cross_scope
     # scenarios were removed in PR #239 (sidecar walk semantics deleted
@@ -3937,8 +4055,9 @@ case "$MODE" in
     scenario_bearer_observability; scenario_bearer_local; scenario_bearer_gh
     scenario_e2e_encryption
     scenario_custom_room_creates_gist
+    scenario_invite_human
     ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|all]"; exit 2 ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|invite_human|all]"; exit 2 ;;
 esac
 
 echo
