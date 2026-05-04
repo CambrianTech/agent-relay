@@ -292,66 +292,27 @@ cmd_status() {
   fi
   _airc_collaboration_health_report
 
-  # Monitor alive? Use the shared sandbox-robust helper
+  # Scope monitor alive? Use the shared sandbox-robust helper
   # (_monitor_alive_with_bearer_fallback in airc top-level). Phase 1 =
-  # kill -0 against airc.pid (canonical, fast); phase 2 = bearer-state
-  # freshness fallback (covers Codex sandbox kill -0 blindness — see
-  # #370/#371/#372). The helper is read-only (doesn't prune the pidfile
-  # the way the older prune_pidfile_and_count did, which would silently
-  # corrupt state when phase 1 was wrong).
+  # kill -0 against airc.pid (canonical, fast); phase 2 = scope-specific
+  # monitor_formatter process evidence (covers Codex sandbox kill -0
+  # blindness without treating bearer_state freshness as a Monitor).
+  # The helper is read-only (doesn't prune the pidfile the way the older
+  # prune_pidfile_and_count did, which would silently corrupt state when
+  # phase 1 was wrong).
   local monitor_state="not running"
   local pidfile="$AIRC_WRITE_DIR/airc.pid"
   if [ "$(_monitor_alive_with_bearer_fallback "$pidfile")" = "yes" ]; then
     if [ -f "$pidfile" ]; then
       local first_alive; first_alive=$(awk '{print $1}' "$pidfile" 2>/dev/null)
       # Distinguish "alive per kill -0" (we have a verified PID) from
-      # "alive per bearer-state-only" (kill -0 blind, but bearer-recv
-      # child is provably writing to bearer_state). For the latter,
-      # surface the diagnostic so a Carl debugging "why does pid X
-      # show running when it's not in ps" has the answer.
+      # "alive per formatter process only" (kill -0 blind against the
+      # pidfile, but the scope's monitor_formatter is visible by argv).
       if kill -0 "$first_alive" 2>/dev/null; then
-        monitor_state="running (PID $first_alive)"
+        monitor_state="running for scope (PID $first_alive)"
       else
-        # Walk bearer_state to find which channel is freshest, for the
-        # informational message. (The helper already proved freshness;
-        # we re-check just to extract the age + channel name.)
-        # Scope to subscribed_channels ONLY — same fix-shape as #428
-        # for --health. Pre-fix this globbed every bearer_state.*.json
-        # on disk INCLUDING stale files from prior subscriptions, so a
-        # parted #cambriantech room (last_recv_ts = 14kS ago) would
-        # show as the "freshest" stale value, making `airc status`
-        # report monitor age way off from actual liveness. QA caught
-        # this 2026-05-02 self-test.
-        local _bs_summary; _bs_summary=$("$AIRC_PYTHON" -c "
-import json, glob, time
-subs = set()
-try:
-    cfg = json.load(open('$CONFIG'))
-    for c in cfg.get('subscribed_channels') or []:
-        subs.add(c)
-except Exception:
-    pass
-fresh = []
-for path in glob.glob('$AIRC_WRITE_DIR/bearer_state.*.json'):
-    try:
-        s = json.load(open(path))
-    except Exception:
-        continue
-    ts = s.get('last_recv_ts')
-    if not ts:
-        continue
-    ch = path.split('bearer_state.', 1)[1].rsplit('.json', 1)[0]
-    # Skip channels we no longer subscribe to. Empty subs (legacy
-    # scope) falls back to all-files for backward compat.
-    if subs and ch not in subs:
-        continue
-    fresh.append((int(time.time() - float(ts)), ch))
-if fresh:
-    fresh.sort()
-    age, ch = fresh[0]
-    print(f'{age}s via #{ch}')
-" 2>/dev/null)
-        monitor_state="likely-alive (${_bs_summary:-bearer-state fresh}; kill -0 blind in this sandbox — see #370)"
+        local _fmt_pid; _fmt_pid=$(_airc_scope_monitor_formatter_pids "$AIRC_WRITE_DIR" | head -1)
+        monitor_state="running for scope (formatter PID ${_fmt_pid:-?}; pidfile not visible/alive)"
       fi
     fi
   elif [ -f "$pidfile" ]; then

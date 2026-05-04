@@ -458,14 +458,13 @@ cmd_send() {
     #
     # Detect monitor liveness via the shared sandbox-robust helper
     # (_monitor_alive_with_bearer_fallback in airc top-level). Same
-    # contract as cmd_status post-#371. Phase 1 = kill -0 (canonical);
-    # phase 2 = bearer-state freshness (covers Codex's sandbox where
-    # kill -0 is process-tree-blind even when bearer-recv is provably
-    # writing to bearer_state.<channel>.json). Pre-fix this used the
-    # naked prune_pidfile_and_count helper which would ALSO actively
-    # delete the pidfile when phase 1 was wrong about death — silently
-    # corrupting state inside Codex's sandbox. The new helper is read-
-    # only + sandbox-aware. #370/#371/#372 root cause cluster.
+    # contract as cmd_status. Phase 1 = kill -0 (canonical); phase 2 =
+    # scope-owned monitor_formatter process evidence (covers Codex's
+    # sandbox without confusing fresh bearer_state with a Monitor).
+    # Pre-fix this used the naked prune_pidfile_and_count helper which
+    # would ALSO actively delete the pidfile when phase 1 was wrong
+    # about death — silently corrupting state inside Codex's sandbox.
+    # The helper is read-only + sandbox-aware.
     local _pidfile="$AIRC_WRITE_DIR/airc.pid"
     local _monitor_alive=0
     if [ "$(_monitor_alive_with_bearer_fallback "$_pidfile")" = "yes" ]; then

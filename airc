@@ -490,22 +490,38 @@ prune_pidfile_and_count() {
 }
 
 # Liveness check that's robust to sandbox process-tree blindness.
-# Returns "yes" if the monitor is alive, "no" otherwise. Two-phase:
+# Returns "yes" if the scope monitor pipeline is alive, "no" otherwise.
+# Two-phase:
 #
 #   1. kill -0 on PIDs in pidfile (the canonical, fast path)
-#   2. bearer-state-freshness fallback when (1) returns no live PIDs but
+#   2. monitor_formatter process fallback when (1) returns no live PIDs but
 #      a pidfile is present — covers Codex's sandbox where kill -0 across
-#      process trees returns false-negative even when the monitor's
-#      bearer-recv loop is provably writing to bearer_state.<channel>.json
-#      every poll cycle. #370/#371/#372 root cause.
+#      process trees can be false-negative. The formatter argv includes
+#      --peers-dir <scope>/peers, which proves the scope has a monitor
+#      pipeline.
 #
 # Pure read — does NOT prune the pidfile (which would silently corrupt
 # state when phase 1 was wrong about death). Use prune_pidfile_and_count
 # only when you genuinely want pids removed (e.g. teardown).
 #
-# Phase-2 freshness window = 2x the reminder interval (default 300s →
-# 600s window). bearer-state's last_recv_ts is the truth: it's only
-# updated when a bearer_recv subprocess actually reads from the wire.
+# Fresh bearer_state is deliberately NOT accepted as monitor liveness.
+# Multiple Claude/Codex tabs can share one project .airc scope, and a
+# bearer can keep channel health files fresh while one tab's user-facing
+# Monitor is absent. bearer_state is channel health evidence; process
+# evidence is monitor evidence.
+_airc_scope_monitor_formatter_pids() {
+  local scope_dir="${1:-}"
+  [ -n "$scope_dir" ] || return 0
+  local p cmd
+  proc_airc_pids_matching 'airc_core\.monitor_formatter' 2>/dev/null | while IFS= read -r p; do
+    case "$p" in ''|*[!0-9]*) continue ;; esac
+    cmd=$(proc_cmdline "$p" 2>/dev/null || true)
+    printf '%s\n' "$cmd" | grep -Fq -- 'airc_core.monitor_formatter' || continue
+    printf '%s\n' "$cmd" | grep -Fq -- "--peers-dir $scope_dir/peers" || continue
+    printf '%s\n' "$p"
+  done
+}
+
 _monitor_alive_with_bearer_fallback() {
   local pidfile="${1:-}"
   local scope_dir
@@ -525,7 +541,7 @@ _monitor_alive_with_bearer_fallback() {
   # like an airc connect/join wrapper. Same regex shape as cmd_teardown's
   # parent-chain reaper (#446) — keeps the two paths in lockstep on what
   # "an airc process" means. PID reuse → cmdline doesn't match → treat as
-  # dead, fall through to Phase 2 (bearer-state freshness).
+  # dead, fall through to Phase 2 (scope formatter process evidence).
   if [ -f "$pidfile" ]; then
     local p raw
     raw=$(cat "$pidfile" 2>/dev/null)
@@ -540,7 +556,7 @@ _monitor_alive_with_bearer_fallback() {
         fi
         # PID alive but not airc-shaped — OS reused this PID after our
         # monitor died (sleep/wake, container restart, etc.). Skip; let
-        # Phase 2 bearer-state freshness be the truth.
+        # Phase 2 scope formatter process evidence decide.
       fi
     done
   else
@@ -551,52 +567,13 @@ _monitor_alive_with_bearer_fallback() {
     return 0
   fi
 
-  # Phase 2: bearer-state-freshness fallback. Only reached when pidfile
-  # exists but kill -0 said all PIDs dead — could be real death, could
-  # be sandbox blindness. bearer-state freshness disambiguates.
-  #
-  # Skip when AIRC_BACKGROUND_OK=1 — that env var is set by the daemon
-  # launcher (cmd_daemon.sh's .bat / launchd plist / systemd unit), and
-  # in daemon context kill -0 is reliable (no Codex-style sandbox
-  # blindness). The fallback's 600s window otherwise creates a
-  # 10-minute "daemon can't take over" blackout after an interactive
-  # airc connect dies: the dying process leaves bearer_state with a
-  # fresh last_recv_ts, the daemon's next launch sees it as "monitor
-  # alive," early-exits, and the .bat retries every 5s for 10 minutes
-  # before the window expires. b69f filed as #4 in the 2026-05-02
-  # daemon audit. Trust kill -0 in daemon context so takeover is
-  # immediate. Joel's BIOS-grade self-heal directive: substrate must
-  # work without a human in the loop, including across interactive
-  # process death.
-  if [ "${AIRC_BACKGROUND_OK:-0}" = "1" ]; then
-    echo "no"
+  # Phase 2: formatter-process fallback. Only reached when pidfile exists
+  # but kill -0/cmdline verification found no airc parent. This covers
+  # sandbox/process-tree blind spots without confusing fresh bearer state
+  # with a running Monitor.
+  if [ -n "$(_airc_scope_monitor_formatter_pids "$scope_dir" | head -1)" ]; then
+    echo "yes"
     return 0
-  fi
-  local _reminder_secs=300
-  if [ -f "$scope_dir/reminder" ]; then
-    _reminder_secs=$(cat "$scope_dir/reminder" 2>/dev/null)
-  fi
-  if [ -z "$_reminder_secs" ] || ! [ "$_reminder_secs" -gt 0 ] 2>/dev/null; then
-    _reminder_secs=300
-  fi
-  local _fresh_window=$((_reminder_secs * 2))
-  if ls "$scope_dir"/bearer_state.*.json >/dev/null 2>&1; then
-    if "$AIRC_PYTHON" -c "
-import json, glob, sys, time
-window = $_fresh_window
-for path in glob.glob('$scope_dir/bearer_state.*.json'):
-    try:
-        s = json.load(open(path))
-    except Exception:
-        continue
-    ts = s.get('last_recv_ts')
-    if ts and (time.time() - float(ts)) <= window:
-        sys.exit(0)
-sys.exit(1)
-" 2>/dev/null; then
-      echo "yes"
-      return 0
-    fi
   fi
 
   echo "no"

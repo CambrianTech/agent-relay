@@ -252,11 +252,10 @@ cmd_connect() {
   # that's already working.
   #
   # Pre-#372 this used naked kill -0 inline, which returned false on
-  # Codex (sandbox process-tree blindness) even when the monitor was
-  # provably alive (bearer-state.json updates every poll cycle).
-  # The shared helper checks bearer-state freshness as a fallback, so
-  # Codex sessions ALSO hit this short-circuit when their monitor
-  # is alive — exactly the Carl-experience win for cross-vendor mesh.
+  # Codex (sandbox process-tree blindness) even when the monitor pipeline
+  # was alive. The shared helper checks for a scope-owned
+  # monitor_formatter process as a fallback; it deliberately does NOT
+  # accept fresh bearer_state as proof that this tab has a Monitor.
   local _early_pidfile="$AIRC_WRITE_DIR/airc.pid"
   if [ "$(_monitor_alive_with_bearer_fallback "$_early_pidfile")" = "yes" ]; then
     # 2026-05-02 QA caught (B5): if user passed --room NEWNAME and that
