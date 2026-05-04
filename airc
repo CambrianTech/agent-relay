@@ -414,21 +414,10 @@ _self_heal_stale_host() {
   # sets ROOM_INTENT_FOR_REEXEC in the cmd_connect frame whenever the
   # explicit --room flag was used; anywhere else it's empty and we
   # reexec without the override (auto-scope decides as usual).
-  local _saved_intent="${ROOM_INTENT_FOR_REEXEC:-}"
-  # _mesh_find uses the same content-based channel_gist resolver as
-  # connect/subscribe/send. If something canonical is there, another
-  # tab beat us — rejoin pointed at it. Description-only lookup caused
-  # split-brain when one path chose "airc mesh" and another chose an
-  # older live "airc room:" envelope.
-  local picked; picked=$(_mesh_find "${_saved_intent:-${room_name:-}}")
+  local _saved_intent="${ROOM_INTENT_FOR_REEXEC:-${resolved_room_name:-${room_name:-}}}"
   rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_name"
   if [ -n "$_saved_intent" ]; then
     export AIRC_ROOM_INTENT="$_saved_intent"
-  fi
-  if [ -n "$picked" ] && [ "$picked" != "$stale_id" ]; then
-    echo "  ✓ Another tab beat us to it — joining their fresh mesh gist ($picked)"
-    echo ""
-    _reexec_into rejoin "$picked"
   fi
   export AIRC_ADOPT_GIST="$stale_id"
   echo "  Re-execing into host mode on the existing mesh gist..."
