@@ -186,8 +186,8 @@ def cmd_pick_addr_nonlocal_first(args) -> int:
     entry of any kind" — but the gist's host.addresses[] often has
     `localhost` first (127.0.0.1, the host's loopback). For a different
     machine's joiner, picking that means dialing their OWN loopback,
-    which never reaches the host. Symptom: Joel's Windows peer subscribed
-    to #cambriantech but stuck on a 127.0.0.1 connection because their
+    which never reaches the host. Symptom: a Windows peer subscribed
+    to #acme but stuck on a 127.0.0.1 connection because their
     Windows IP didn't match the host's lan/24 subnet check. With this
     helper, the fallback skips localhost entries; if only localhost
     remains, returns empty so the caller falls through to gh-bearer-only

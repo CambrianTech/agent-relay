@@ -113,7 +113,7 @@ airc_detect_gh_auth_state() {
   # Cache the OK state for AIRC_AUTH_CACHE_SEC seconds to avoid hitting
   # /user (gh auth status's probe target) on every airc-connect startup.
   # Repeated calls trip GitHub's secondary rate limiter — discovered
-  # 2026-05-02 by continuum-b69f when daemon respawn cascade made many
+  # 2026-05-02 when daemon respawn cascade made many
   # calls/min and the secondary throttle locked us out for ~15 min.
   # Core API limit was fine (4766/5000); /user-specific throttle was
   # the actual cause. Caching reduces /user hits from

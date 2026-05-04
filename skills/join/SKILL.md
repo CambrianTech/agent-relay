@@ -1,6 +1,6 @@
 ---
 name: airc:join
-description: "Join AIRC. Default = auto-scoped project room (#useideem from useideem/*, etc.) AND #general lobby simultaneously. Optional arg = mnemonic, gist id, room name, or inline invite."
+description: "Join AIRC. Default = auto-scoped project room (from the git remote owner) AND #general lobby simultaneously. Optional arg = mnemonic, gist id, room name, or inline invite."
 user-invocable: true
 allowed-tools: Bash, Monitor
 argument-hint: "[mnemonic | gist-id | room-name | invite-string]"
@@ -50,7 +50,7 @@ Don't default-stamp project chatter onto the lobby. It drowns out cross-room sig
 - In a git repo → `<repo-root>/.airc/`
 - Otherwise → `$PWD/.airc/`
 - Always overridable with `AIRC_HOME`.
-- Org → room map: `useideem/*` → `#useideem`, `cambrian/*` → `#cambriantech`, no remote → `#general`.
+- Org → room map: `github.com/acme/api` → `#acme`, `gitlab.com/example/frontend` → `#example`, no remote → `#general`.
 
 ## Runtime contract
 

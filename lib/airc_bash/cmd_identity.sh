@@ -50,7 +50,7 @@
 # (airc identity set --status) still works for scripted state changes.
 cmd_away() {
   ensure_init
-  # Intercept --help BEFORE building $msg from $* — vhsm-d1f4's verb-fuzz
+  # Intercept --help BEFORE building $msg from $* — verb fuzzing
   # 2026-04-28 caught `airc away --help` writing "--help" as the status
   # string. Same anti-pattern as #231/#236; same shape fix.
   case "${1:-}" in
@@ -176,7 +176,7 @@ _identity_set() {
   if [ "$set_pronouns" = 0 ] && [ "$set_role" = 0 ] && [ "$set_bio" = 0 ] && [ "$set_status" = 0 ]; then
     die "Pass at least one of --pronouns / --role / --bio / --status"
   fi
-  # Length caps (continuum-b741 caught 2026-04-29: 4KB bio stored
+  # Length caps (caught 2026-04-29: 4KB bio stored
   # verbatim → broke peer rendering + ate gist quota). Bio is one line
   # of context, not a manifesto. Hard caps with loud rejection.
   local _max_pronouns=64
@@ -296,7 +296,7 @@ cmd_whois() {
   # peer record we don't have locally). Without that, indirect peers
   # in the singleton mesh — peers paired with the host but not with
   # us directly — return "no record". Tracked as the wart that
-  # ideem-local-4bef + continuum-b741 surfaced 2026-04-28.
+  # surfaced during QA 2026-04-28.
   if _whois_in_scope "$AIRC_WRITE_DIR" "$target"; then
     return 0
   fi

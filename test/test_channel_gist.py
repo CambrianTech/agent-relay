@@ -99,15 +99,15 @@ class FindExistingConvergenceTests(unittest.TestCase):
         """Connect discovery needs a host envelope, not just a routing
         seed. Seed-only channel gists are valid for cmd_send routing but
         cannot be joined because they have no invite/host data."""
-        seed_only = self._gist("seed-only", "cambriantech", "2026-05-04T17:27:38Z")
-        host = self._gist("host", "cambriantech", "2026-05-04T17:28:38Z")
-        env = json.loads(host["files"]["airc-room-cambriantech.json"]["content"])
+        seed_only = self._gist("seed-only", "acme", "2026-05-04T17:27:38Z")
+        host = self._gist("host", "acme", "2026-05-04T17:28:38Z")
+        env = json.loads(host["files"]["airc-room-acme.json"]["content"])
         env["invite"] = "host@example"
-        host["files"]["airc-room-cambriantech.json"]["content"] = json.dumps(env)
+        host["files"]["airc-room-acme.json"]["content"] = json.dumps(env)
         with mock.patch.object(channel_gist, "_gh_list_user_gists",
                                return_value=[seed_only, host]):
-            self.assertEqual(channel_gist.find_existing("cambriantech"), "seed-only")
-            self.assertEqual(channel_gist.find_existing("cambriantech", require_invite=True), "host")
+            self.assertEqual(channel_gist.find_existing("acme"), "seed-only")
+            self.assertEqual(channel_gist.find_existing("acme", require_invite=True), "host")
 
     def test_returns_oldest_legacy_when_no_canonical(self):
         """If only legacy mesh gists exist (none canonical), still
@@ -184,7 +184,7 @@ class LocalCacheFallbackTests(unittest.TestCase):
             snapshots = {
                 stale: self._snapshot(stale, "general", ["general"], "2026-04-30T12:00:00Z"),
                 current: self._snapshot(current, "general", ["general"], "2026-05-04T18:11:00Z"),
-                island: self._snapshot(island, "general", ["general", "cambriantech"], "2026-05-04T18:27:00Z"),
+                island: self._snapshot(island, "general", ["general", "acme"], "2026-05-04T18:27:00Z"),
             }
             roots = os.pathsep.join([
                 str(Path(tmp) / "old-worktree" / ".airc"),
@@ -200,11 +200,11 @@ class LocalCacheFallbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             old = "dddddddd"
             current = "eeeeeeee"
-            self._write_cfg(tmp, "old", "cambriantech", old)
-            self._write_cfg(tmp, "current", "cambriantech", current)
+            self._write_cfg(tmp, "old", "acme", old)
+            self._write_cfg(tmp, "current", "acme", current)
             snapshots = {
-                old: self._snapshot(old, "cambriantech", ["cambriantech", "general"], "2026-05-04T17:40:00Z"),
-                current: self._snapshot(current, "cambriantech", ["cambriantech", "general"], "2026-05-04T18:22:49Z"),
+                old: self._snapshot(old, "acme", ["acme", "general"], "2026-05-04T17:40:00Z"),
+                current: self._snapshot(current, "acme", ["acme", "general"], "2026-05-04T18:22:49Z"),
             }
             roots = os.pathsep.join([
                 str(Path(tmp) / "old" / ".airc"),
@@ -213,7 +213,7 @@ class LocalCacheFallbackTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"AIRC_GIST_CACHE_ROOTS": roots, "AIRC_DISABLE_LOCAL_GIST_FALLBACK": ""}), \
                  mock.patch.object(channel_gist, "_gh_list_user_gists", return_value=[]), \
                  mock.patch.object(channel_gist, "_git_gist_snapshot", side_effect=lambda gid: snapshots.get(gid)):
-                self.assertEqual(channel_gist.find_existing("cambriantech"), current)
+                self.assertEqual(channel_gist.find_existing("acme"), current)
 
     def test_default_local_fallback_only_reads_current_airc_home_config(self):
         with tempfile.TemporaryDirectory() as tmp:

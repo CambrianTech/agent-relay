@@ -1,8 +1,8 @@
 """channel_gist — find-or-create the canonical gist for a channel name on
 the user's gh account.
 
-Single concern: given a channel name (e.g. "general", "useideem",
-"continuum"), return the gist id that hosts that channel for THIS gh
+Single concern: given a channel name (e.g. "general", "acme",
+"example"), return the gist id that hosts that channel for THIS gh
 account. If no such gist exists and create_if_missing=True, publish a
 new mesh-shaped gist and return its id.
 
@@ -503,8 +503,8 @@ def find_existing(channel: str, require_invite: bool = False) -> Optional[str]:
     Pre-2026-04-29 bug: order was whatever gh's list-response yielded
     first (recency-ordered, may differ across calls). Two peers
     polling the listing at slightly different times could pick
-    DIFFERENT duplicates, splitting the substrate. authenticator-448f
-    + continuum-b741 saw this on #general — peers thought they were
+    DIFFERENT duplicates, splitting the substrate. Two agents saw this
+    on #general — peers thought they were
     in the same room but were writing to different gists. Sends
     looked successful, peers heard nothing.
 

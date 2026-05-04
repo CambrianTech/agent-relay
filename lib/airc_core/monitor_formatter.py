@@ -145,7 +145,7 @@ def _find_peer_by_host(peers_dir: str, host: str):
 
     #180 fix: only return a name when the host is UNAMBIGUOUS (exactly
     one peer record matches). Same-machine peers share the host field
-    (e.g. multiple Claudes on Joel's box all have host=joel@127.0.0.1),
+    (e.g. multiple agents on one box all have host=user@127.0.0.1),
     so picking one arbitrarily corrupts an unrelated peer's record.
     Ambiguous-host → return None → chain-repair skips, no phantom."""
     if not host or not os.path.isdir(peers_dir):
@@ -563,7 +563,7 @@ def run(my_name: str, peers_dir: str) -> int:
         # pre-Phase-2 messages that don't carry the envelope field.
         line_channel = m.get("channel") or room_name
 
-        # Phase 2C+ (continuum-b741's #9 from QA pass 2026-04-28):
+        # Phase 2C+ (QA pass 2026-04-28):
         # filter display by subscribed_channels. If the user is
         # subscribed to specific channels and this message is on a
         # different channel, skip display. DMs addressed to us bypass
@@ -577,8 +577,8 @@ def run(my_name: str, peers_dir: str) -> int:
             addressed_to_me = bool(to) and to not in ("", "all") and current_name() in to.split(",")
             # Channel-name comparison must be tolerant of leading "#"
             # on either side. Pre-fix: subs read from config might be
-            # ['cambriantech', 'general'] (no #), but envelopes can
-            # carry channel='#cambriantech' (with #) — or vice versa.
+            # ['acme', 'general'] (no #), but envelopes can
+            # carry channel='#acme' (with #) — or vice versa.
             # The strict `line_channel not in subs` check then misfires
             # and silently drops legit broadcasts. b69f filed this as
             # #399: joiner Monitor surfaces substrate events but room
@@ -591,7 +591,7 @@ def run(my_name: str, peers_dir: str) -> int:
             if line_norm and line_norm not in subs_norm and not addressed_to_me:
                 # b69f 2026-05-02: even after #401's '#'-prefix tolerance,
                 # legit drops still happen when the channel NAME differs
-                # (e.g. peer stamps channel='cambriantech', subs=['general'],
+                # (e.g. peer stamps channel='acme', subs=['general'],
                 # both polling the same gist). #401 catches '#general' vs
                 # 'general'; this catches every other shape of name drift.
                 # Make the drop LOUD instead of silent — emit one stdout
@@ -623,7 +623,7 @@ def run(my_name: str, peers_dir: str) -> int:
             else:
                 # PEER-SUPPLIED content. Sandbox-wrap per vuln-A
                 # mitigation (described in docs/fusion-transport.md
-                # "Pairs with" section, identified by continuum-b69f
+                # "Pairs with" section, identified during QA
                 # 2026-05-02; b69f also recommended the per-session
                 # contract notice below).
                 #

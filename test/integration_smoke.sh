@@ -529,7 +529,7 @@ scenario_my_scope_in_mesh() {
   # Joel 2026-04-29: 'remember you need to be part of it'. The other
   # scenarios spawn ephemeral test peers in /tmp and never include
   # the user's actual long-running airc scope. This one DOES — it
-  # asserts that the live authenticator-448f scope (whatever scope
+  # asserts that the live local test scope (whatever scope
   # is running in the user's primary cwd) receives messages a fresh
   # test peer sends. If my own scope's monitor is broken, this catches
   # it where the isolated tests can't.

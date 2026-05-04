@@ -412,7 +412,7 @@ cmd_logs() {
   done
   set -- "${positional[@]+"${positional[@]}"}"
   local count="${1:-20}"
-  # Validate count: positive integer (ideem-local-4bef caught 2026-04-29:
+  # Validate count: positive integer (caught 2026-04-29:
   # 'airc logs 0' and 'airc logs notanumber' silently exited 0 with no
   # output). Tail with N=0 prints nothing; with non-numeric, tail errors
   # and we swallow it.

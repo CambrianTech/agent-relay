@@ -760,7 +760,7 @@ class BearerCliRecvLockTests(unittest.TestCase):
         self.assertEqual(first_pidfile, self._tmpdir + "/bearer_gist.samegist.pid")
 
         second_args = self._args(
-            state_file=self._tmpdir + "/bearer_state.useideem.json",
+            state_file=self._tmpdir + "/bearer_state.acme.json",
             room_gist_id="samegist",
         )
         with mock.patch.object(bearer_cli, "_pid_alive", return_value=True), \
@@ -1302,7 +1302,7 @@ class GhBearerSendTests(unittest.TestCase):
         self.assertEqual(captured[1], racer_line + my_line)
 
     def test_send_retries_on_409_conflict(self):
-        # continuum-b741 caught HTTP 409 4/5 on a 5-way burst (#299).
+        # HTTP 409 was caught 4/5 on a 5-way burst (#299).
         # First PATCH 409s → loop → second PATCH succeeds → verify ok.
         gets = [
             {"files": {}},

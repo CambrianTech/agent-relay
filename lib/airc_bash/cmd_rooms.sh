@@ -215,7 +215,7 @@ cmd_part() {
 
   ensure_init
 
-  # CRITICAL bug fix 2026-05-02 (B8 from continuum-b69f): pre-fix
+  # CRITICAL bug fix 2026-05-02: pre-fix
   # `airc part QANAME` IGNORED the room arg and parted the scope's
   # DEFAULT room — deleting #general's gist when user thought they
   # were parting a test room. Mesh-splitting catastrophe: every peer
