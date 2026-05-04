@@ -39,13 +39,168 @@ nothing else.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import signal
+import subprocess
 import sys
 from dataclasses import asdict
+from typing import Optional, Tuple
 
 from .bearer_resolver import resolve
+
+
+# ── Per-(scope, channel, gist) bearer lock ─────────────────────────────
+# Without this lock, scope teardown that leaks orphan bearers OR a
+# host-gist-rotation respawn that races with the old bearer can end up
+# with TWO bearer_cli processes polling the same gist for the same
+# channel. Both yield each new line to their stdout. If their pipes
+# converge (the parent monitor's children share a downstream pipe, or
+# both feed an unprivileged log), each downstream message arrives twice.
+#
+# Repro Joel hit 2026-05-04: peer broadcast appeared TWICE in the
+# monitor stream with identical body + identical session nonce.
+# Diagnosed: 3 live bearer_cli processes for #general across leaked
+# test scopes + the live monitor's own respawned child.
+#
+# Pattern matches cmd_connect's #97 self-heal: pidfile + cmdline-shape
+# verification (kill -0 alone is unsafe — OS reuses PIDs after wake).
+
+
+def _pid_alive(pid: int) -> bool:
+    """True iff pid is a live process. Same `os.kill(pid, 0)` probe
+    cmd_connect / handshake use; no signal sent.
+
+    PermissionError (EPERM) means the PID exists but is owned by another
+    user — still counts as alive. ProcessLookupError (ESRCH) means dead.
+    Other OSError means we can't tell — be conservative, assume dead.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _is_our_bearer(pid: int, expected_gist: str) -> bool:
+    """True iff PID's cmdline matches bearer_cli recv for `expected_gist`.
+
+    Cross-platform via `ps -p <pid> -o command=`. The PID alone is unsafe
+    (OS reuses PIDs after sleep/wake — Joel hit this in #97). Verify the
+    process is actually a bearer_cli recv AND for our gist; otherwise
+    treat the pidfile as stale.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if out.returncode != 0:
+        return False
+    cmdline = (out.stdout or "").strip()
+    if "bearer_cli" not in cmdline or " recv " not in f" {cmdline} ":
+        return False
+    if expected_gist:
+        return f"--room-gist-id {expected_gist}" in cmdline
+    return True
+
+
+def _claim_recv_lock(args) -> Optional[Tuple[str, int]]:
+    """Per-(scope, channel, gist) bearer-recv lock.
+
+    Returns (pidfile_path, my_pid) on successful claim — caller registers
+    atexit cleanup. Returns None if another live bearer already serves
+    this stream — caller should exit 0 cleanly.
+
+    Pidfile path is derived from --state-file by replacing the .json
+    suffix with .pid (e.g. bearer_state.general.json → bearer.general.pid).
+    Without --state-file, no lock is taken (legacy / test invocations
+    that don't use state-file stay unaffected).
+
+    Stale-pidfile recovery:
+      - PID dead → stale; take over.
+      - PID alive but cmdline isn't a bearer_cli recv for OUR gist →
+        stale; take over. (Covers OS-PID-reuse after sleep/wake AND the
+        "old bearer is for a rotated-away gist" case.)
+      - PID alive AND cmdline is a bearer_cli recv for our gist →
+        another bearer is healthy; exit cleanly.
+    """
+    state_file = getattr(args, "state_file", None)
+    if not state_file:
+        return None
+    if state_file.endswith(".json"):
+        pidfile = state_file[: -len(".json")] + ".pid"
+    else:
+        pidfile = state_file + ".pid"
+
+    my_gist = getattr(args, "room_gist_id", None) or ""
+    my_pid = os.getpid()
+
+    if os.path.exists(pidfile):
+        try:
+            with open(pidfile, "r") as f:
+                data = f.read().strip()
+        except OSError:
+            data = ""
+        # Format: "<pid>\t<gist_id>". gist_id may be empty for non-gh bearers.
+        parts = data.split("\t", 1)
+        try:
+            other_pid = int(parts[0]) if parts and parts[0] else 0
+        except ValueError:
+            other_pid = 0
+        if other_pid > 0 and other_pid != my_pid \
+                and _pid_alive(other_pid) and _is_our_bearer(other_pid, my_gist):
+            print(
+                f"bearer_cli recv: another bearer for gist {my_gist or '(none)'} "
+                f"already running (PID {other_pid}); exiting cleanly to avoid "
+                f"duplicate emission",
+                file=sys.stderr, flush=True,
+            )
+            return None
+        # else: stale (dead pid, OS-reused, or old gist) → take over
+
+    try:
+        with open(pidfile, "w") as f:
+            f.write(f"{my_pid}\t{my_gist}\n")
+    except OSError as e:
+        # Loud, not silent — we'd rather know we couldn't lock than
+        # silently disable the dedup guarantee.
+        print(
+            f"bearer_cli recv: could not write pidfile {pidfile}: {e}; "
+            f"proceeding without lock (duplicate emission possible)",
+            file=sys.stderr, flush=True,
+        )
+        return None
+    return (pidfile, my_pid)
+
+
+def _release_lock(pidfile: str, my_pid: int) -> None:
+    """Remove the pidfile only if it still has OUR pid (don't stomp a
+    pidfile that some other bearer rewrote after we ran)."""
+    try:
+        with open(pidfile, "r") as f:
+            data = f.read().strip()
+    except OSError:
+        return
+    parts = data.split("\t", 1)
+    try:
+        owner = int(parts[0]) if parts and parts[0] else 0
+    except ValueError:
+        owner = 0
+    if owner == my_pid:
+        try:
+            os.unlink(pidfile)
+        except OSError:
+            pass
 
 
 def cmd_send(args) -> int:
@@ -99,6 +254,19 @@ def cmd_recv(args) -> int:
         the bash monitor's watchdog interprets that and decides whether
         to relaunch us.
     """
+    # Per-(scope, channel, gist) bearer lock. Prevents duplicate
+    # stream-emission when scope teardown leaks orphan bearers OR a
+    # host-gist-rotation respawn races with the old bearer (Joel's
+    # 2026-05-04 dup-message diagnosis). Without --state-file, no lock
+    # is taken — legacy / test invocations are unaffected.
+    lock = _claim_recv_lock(args)
+    if lock is None and getattr(args, "state_file", None):
+        # Another live bearer is already serving this stream.
+        # Exit cleanly so the parent monitor's watchdog doesn't escalate.
+        return 0
+    if lock is not None:
+        atexit.register(_release_lock, lock[0], lock[1])
+
     peer_meta = {
         "host_target": args.host_target,
         "remote_home": args.remote_home,
