@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+import subprocess
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "lib"))
@@ -204,6 +205,59 @@ class LocalCacheFallbackTests(unittest.TestCase):
                  mock.patch.object(channel_gist, "_gh_list_user_gists", return_value=[]), \
                  mock.patch.object(channel_gist, "_git_gist_snapshot", side_effect=lambda gid: snapshots.get(gid)):
                 self.assertEqual(channel_gist.find_existing("cambriantech"), current)
+
+
+class GistListCacheTests(unittest.TestCase):
+    """Gist discovery should not spam GitHub during monitor/status churn."""
+
+    def _cache_path(self, tmp: str) -> Path:
+        uid = str(os.getuid()) if hasattr(os, "getuid") else os.environ.get("USERNAME", "user")
+        return Path(tmp) / f"airc-gh-gist-list-{uid}.json"
+
+    def test_fresh_cache_avoids_gh_api_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            listing = [{"id": "cached", "description": "airc mesh", "files": {}}]
+            cache = self._cache_path(tmp)
+            cache.write_text(json.dumps(listing), encoding="utf-8")
+            with mock.patch.object(tempfile, "gettempdir", return_value=tmp), \
+                 mock.patch.dict(os.environ, {"AIRC_GIST_LIST_CACHE_SEC": "300"}), \
+                 mock.patch.object(channel_gist, "_resolve_gh_bin", return_value="/bin/gh"), \
+                 mock.patch.object(subprocess, "run") as run:
+                self.assertEqual(channel_gist._gh_list_user_gists(), listing)
+                run.assert_not_called()
+
+    def test_live_success_refreshes_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            listing = [{"id": "live", "description": "airc room: #general", "files": {}}]
+            completed = subprocess.CompletedProcess(
+                args=["gh"], returncode=0, stdout=json.dumps(listing), stderr=""
+            )
+            with mock.patch.object(tempfile, "gettempdir", return_value=tmp), \
+                 mock.patch.dict(os.environ, {"AIRC_GIST_LIST_CACHE_SEC": "0"}), \
+                 mock.patch.object(channel_gist, "_resolve_gh_bin", return_value="/bin/gh"), \
+                 mock.patch.object(subprocess, "run", return_value=completed):
+                self.assertEqual(channel_gist._gh_list_user_gists(), listing)
+            cache = self._cache_path(tmp)
+            self.assertEqual(json.loads(cache.read_text(encoding="utf-8")), listing)
+
+    def test_rate_limited_live_probe_uses_stale_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            listing = [{"id": "stale-but-useful", "description": "airc mesh", "files": {}}]
+            cache = self._cache_path(tmp)
+            cache.write_text(json.dumps(listing), encoding="utf-8")
+            old = 120
+            os.utime(cache, (os.path.getatime(cache) - old, os.path.getmtime(cache) - old))
+            completed = subprocess.CompletedProcess(
+                args=["gh"], returncode=1, stdout="", stderr="secondary rate limit"
+            )
+            with mock.patch.object(tempfile, "gettempdir", return_value=tmp), \
+                 mock.patch.dict(os.environ, {
+                     "AIRC_GIST_LIST_CACHE_SEC": "0",
+                     "AIRC_GIST_LIST_STALE_SEC": "900",
+                 }), \
+                 mock.patch.object(channel_gist, "_resolve_gh_bin", return_value="/bin/gh"), \
+                 mock.patch.object(subprocess, "run", return_value=completed):
+                self.assertEqual(channel_gist._gh_list_user_gists(), listing)
 
 
 if __name__ == "__main__":

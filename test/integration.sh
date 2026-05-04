@@ -2105,6 +2105,7 @@ scenario_gh_secondary_rate_limit_degraded_startup() {
   local fakebin="$root/bin"
   local home="$root/state"
   mkdir -p "$fakebin" "$home" "$root/tmp"
+  rm -f "$root/tmp"/airc-gh-auth-ok-* "$root/tmp"/airc-gh-rate-limit-* "$root/tmp"/airc-gh-backoff-until-* 2>/dev/null || true
 
   cat > "$fakebin/gh" <<'SH'
 #!/bin/sh
@@ -2132,12 +2133,14 @@ SH
 
   (
     cd "$root" || exit 1
-    PATH="$fakebin:$PATH" \
+    env -i \
+      HOME="$HOME" \
+      PATH="$fakebin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin" \
       AIRC_HOME="$home" \
       AIRC_NAME=gh-secondary-test \
       AIRC_NO_DISCOVERY=1 \
       AIRC_NO_GENERAL=1 \
-      AIRC_AUTH_CACHE_SEC=0 \
+      AIRC_AUTH_CACHE_SEC=-1 \
       AIRC_RATE_LIMIT_WAIT_SEC=1 \
       TMPDIR="$root/tmp" \
       "$AIRC" connect --room gh-secondary-test > "$root/out.log" 2>&1

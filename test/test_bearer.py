@@ -38,6 +38,7 @@ from airc_core.bearer_gh import GhBearer, GhBearerError  # noqa: E402
 from airc_core import bearer_local  # noqa: E402
 from airc_core import bearer_gh  # noqa: E402
 from airc_core import bearer_cli  # noqa: E402
+from airc_core import gh_backoff  # noqa: E402
 
 
 class BearerInterfaceTests(unittest.TestCase):
@@ -1440,7 +1441,9 @@ class GhBearerErrorClassificationTests(unittest.TestCase):
         from contextlib import redirect_stderr
 
         fake = mock.Mock(returncode=1, stdout="", stderr="gh: API rate limit exceeded (HTTP 403)")
-        with mock.patch.object(bearer_gh, "_resolve_gh_bin", return_value="gh"), \
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(tempfile, "gettempdir", return_value=tmp), \
+             mock.patch.object(bearer_gh, "_resolve_gh_bin", return_value="gh"), \
              mock.patch.object(bearer_gh.subprocess, "run", return_value=fake):
             err = io.StringIO()
             with redirect_stderr(err):
@@ -1449,6 +1452,31 @@ class GhBearerErrorClassificationTests(unittest.TestCase):
         self.assertIsNone(gist)
         self.assertEqual(kind, "secondary_rate_limit")
         self.assertEqual(err.getvalue(), "")
+
+    def test_secondary_rate_limit_records_shared_backoff(self):
+        fake = mock.Mock(returncode=1, stdout="", stderr="retry-after: 123\ngh: secondary rate limit")
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(tempfile, "gettempdir", return_value=tmp), \
+             mock.patch.object(bearer_gh, "_resolve_gh_bin", return_value="gh"), \
+             mock.patch.object(bearer_gh.subprocess, "run", return_value=fake):
+            gist, kind = bearer_gh._gh_api_get_classified("abc123")
+            backoff_until = gh_backoff.backoff_until()
+
+        self.assertIsNone(gist)
+        self.assertEqual(kind, "secondary_rate_limit")
+        self.assertGreater(backoff_until, bearer_gh._time.time() + 100)
+
+    def test_backoff_active_skips_gh_get(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(tempfile, "gettempdir", return_value=tmp), \
+             mock.patch.object(bearer_gh, "_resolve_gh_bin", return_value="gh"), \
+             mock.patch.object(bearer_gh.subprocess, "run") as run:
+            gh_backoff.record_backoff("retry-after: 120")
+            gist, kind = bearer_gh._gh_api_get_classified("abc123")
+
+        self.assertIsNone(gist)
+        self.assertEqual(kind, "secondary_rate_limit")
+        run.assert_not_called()
 
     def test_send_returns_gone_when_patch_404s(self):
         """Pre-#381 the PATCH 404 case fell into the auth_failure branch
