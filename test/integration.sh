@@ -1976,6 +1976,26 @@ JSON
     && pass "stderr names the offending scope dir" \
     || fail "stderr doesn't surface scope path (user can't tell where their cwd resolved)"
 
+  # Fresh bearer_state is NOT monitor liveness. In a shared project dir,
+  # another tab or leftover bearer can keep channel health fresh while
+  # this scope's visible Monitor is absent. `status` and `msg` must not
+  # turn that into "monitor running".
+  "${AIRC_PYTHON:-python3}" - <<PY
+import json, time
+with open("$home/bearer_state.general.json", "w") as f:
+    json.dump({"last_recv_ts": time.time(), "kind": "gist"}, f)
+PY
+  local status_out
+  status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
+  echo "$status_out" | grep -qE 'monitor:\s+stale pidfile|monitor:\s+not running' \
+    && pass "fresh bearer_state does not make status claim monitor running" \
+    || fail "fresh bearer_state falsely reported monitor running (got: $status_out)"
+  AIRC_HOME="$home" "$AIRC" msg "fresh bearer state is still void" >"$out" 2>"$err"
+  rc=$?
+  [ "$rc" -ne 0 ] \
+    && pass "fresh bearer_state does not bypass dead-monitor send guard" \
+    || fail "fresh bearer_state bypassed dead-monitor send guard"
+
   # Also test the absent-pidfile path (monitor never started in this scope).
   rm -f "$home/airc.pid"
   AIRC_HOME="$home" "$AIRC" msg "still void" >"$out" 2>"$err"
