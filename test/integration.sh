@@ -3368,11 +3368,14 @@ scenario_invite_human() {
   ( cd "$home_h" && AIRC_HOME="$home_h/state" AIRC_NAME=ihp-host AIRC_PORT=7567 \
       AIRC_NO_DISCOVERY=1 AIRC_NO_AUTO_ROOM=1 \
       "$AIRC" connect --room "$rname" --no-general > "$home_h/out.log" 2>&1 & )
-  # Wait up to 30s for the host to publish channel_gists[$rname] —
+  # Wait up to 60s for the host to publish channel_gists[$rname] —
   # gist creation hits the gh API and can be slow on first call.
-  # Loop early-exits as soon as the field appears.
+  # Loop early-exits as soon as the field appears. The host scope
+  # passes AIRC_NO_DISCOVERY=1 so the find_existing convergence-check
+  # is skipped (it can take ~30s per attempt on accounts with many
+  # gists), and we go straight to create_new — should complete in ~3-5s.
   local host_gid="" i
-  for i in $(seq 1 30); do
+  for i in $(seq 1 60); do
     sleep 1
     [ -f "$home_h/state/config.json" ] || continue
     host_gid=$(python3 -c "
@@ -3387,7 +3390,7 @@ except Exception:
   done
 
   if [ -z "$host_gid" ]; then
-    fail "host did not publish a room gist within 30s (channel_gists['$rname'] empty); out.log: $(tail -10 "$home_h/out.log" 2>/dev/null)"
+    fail "host did not publish a room gist within 60s (channel_gists['$rname'] empty); out.log: $(tail -10 "$home_h/out.log" 2>/dev/null)"
     cleanup_all; return
   fi
   pass "host published room gist: $host_gid (#$rname)"

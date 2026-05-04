@@ -1445,8 +1445,21 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
           # ~4.5s on a fresh-account first-spawn (no existing gist
           # ever); accepted as a one-time cost on bootstrap to
           # guarantee convergence on every later restart.
-          _existing_room_gid=$("$AIRC_PYTHON" -m airc_core.channel_gist resolve \
-                               --channel "$room_name" 2>/dev/null || true)
+          #
+          # Exception: AIRC_NO_DISCOVERY=1 (explicit opt-out) — the
+          # caller said "don't go looking." Half-honoring that flag
+          # (skip early mesh-find but still consult find_existing
+          # here) was a real footgun: on accounts with many gists
+          # find_existing's `gh api gists --paginate` takes ~30s per
+          # call, retried 3× = ~90s before falling through to
+          # create_new. Tests + CI scenarios that explicitly opt out
+          # would block on it. When AIRC_NO_DISCOVERY=1, skip the
+          # resolve and go straight to create_new — same as the
+          # early mesh-find gate at line ~568.
+          if [ "${AIRC_NO_DISCOVERY:-0}" != "1" ]; then
+            _existing_room_gid=$("$AIRC_PYTHON" -m airc_core.channel_gist resolve \
+                                 --channel "$room_name" 2>/dev/null || true)
+          fi
         fi
         if [ -n "$_existing_room_gid" ]; then
           echo "  ✓ Found canonical gist for #${room_name} on this gh account → using existing ($_existing_room_gid)"
