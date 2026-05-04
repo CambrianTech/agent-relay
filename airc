@@ -395,9 +395,9 @@ _reexec_into() {
 }
 
 # Stale-host self-heal + race-loser detection. Args: $1=stale gist id.
-# Random jitter, delete stale, re-list to see if another tab self-healed
-# first; if yes rejoin theirs, else take over as host. Always exec's via
-# _reexec_into; does not return.
+# Random jitter, re-list to see if another tab self-healed first; if yes
+# rejoin theirs, else take over the same gist in-place as host. Always
+# exec's via _reexec_into; does not return.
 #
 # User intent preservation across re-exec: pre-2026-04-29 this wiped
 # room_name + reexec'd with NO ARGS, which silently dropped the user's
@@ -410,11 +410,6 @@ _self_heal_stale_host() {
   local stale_id="$1"
   local jitter; jitter=$(awk -v r="$RANDOM" 'BEGIN{printf "%.3f", 0.1 + (r%1500)/1000}')
   sleep "$jitter"
-  if gh gist delete "$stale_id" --yes 2>/dev/null; then
-    echo "  ✓ Stale mesh gist removed."
-  else
-    echo "  ⚠  Stale mesh gist already gone — another tab may have taken over first."
-  fi
   # Capture the user's --room intent BEFORE wiping room_name. Caller
   # sets ROOM_INTENT_FOR_REEXEC in the cmd_connect frame whenever the
   # explicit --room flag was used; anywhere else it's empty and we
@@ -435,7 +430,8 @@ _self_heal_stale_host() {
     echo ""
     _reexec_into rejoin "$picked"
   fi
-  echo "  Re-execing into host mode (mesh singleton for this gh account)..."
+  export AIRC_ADOPT_GIST="$stale_id"
+  echo "  Re-execing into host mode on the existing mesh gist..."
   echo ""
   _reexec_into host
 }
@@ -1478,13 +1474,16 @@ _monitor_multi_channel() {
     fi
     if [ "$consecutive_timeouts" -ge "$ESCALATE_AFTER" ]; then
       local _daemon_present=0
-      if _daemon_installed >/dev/null 2>&1; then _daemon_present=1; fi
+      if command -v airc_daemon_is_running_for_scope >/dev/null 2>&1 \
+         && airc_daemon_is_running_for_scope "$AIRC_WRITE_DIR" 2>/dev/null; then
+        _daemon_present=1
+      fi
       echo ""
       if [ "$_daemon_present" = "1" ]; then
         echo "airc: mesh disconnected ($consecutive_timeouts cycles); daemon restart will self-heal"
       else
-        echo "airc: mesh disconnected ($consecutive_timeouts cycles); NO DAEMON installed, restart with: airc join"
-        echo "airc:   (for auto-recovery: airc daemon install)"
+        echo "airc: mesh disconnected ($consecutive_timeouts cycles); NO DAEMON running, restart with: airc join"
+        echo "airc:   (for auto-recovery: airc daemon restart || airc daemon install)"
       fi
       exit 99
     fi
@@ -1599,15 +1598,18 @@ monitor() {
         local saved_room=""
         [ -f "$AIRC_WRITE_DIR/room_name" ] && saved_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
         local _daemon_present=0
-        if _daemon_installed >/dev/null 2>&1; then _daemon_present=1; fi
+        if command -v airc_daemon_is_running_for_scope >/dev/null 2>&1 \
+           && airc_daemon_is_running_for_scope "$AIRC_WRITE_DIR" 2>/dev/null; then
+          _daemon_present=1
+        fi
         echo ""
         if [ "$_daemon_present" = "1" ]; then
           echo "airc: mesh disconnected — #${saved_room:-?} dead $consecutive_timeouts cycles; daemon restart will self-heal"
           echo "  ⚠  Exiting airc connect — daemon restart will trigger self-heal" >&2
         else
-          echo "airc: mesh disconnected — #${saved_room:-?} dead $consecutive_timeouts cycles; NO DAEMON installed, restart with: airc join"
-          echo "airc:   (for auto-recovery: airc daemon install)"
-          echo "  ⚠  Exiting airc connect — NO DAEMON installed; rerun 'airc join' to reconnect" >&2
+          echo "airc: mesh disconnected — #${saved_room:-?} dead $consecutive_timeouts cycles; NO DAEMON running, restart with: airc join"
+          echo "airc:   (for auto-recovery: airc daemon restart || airc daemon install)"
+          echo "  ⚠  Exiting airc connect — NO DAEMON running; rerun 'airc join' to reconnect" >&2
         fi
         exit 99
       fi
@@ -2084,8 +2086,9 @@ except Exception:
   done
 }
 
-# Self-heal loop: detect host gist rotation and swap channel_gists in
-# config without human-in-the-loop teardown+rejoin. Joel 2026-05-02:
+# Self-heal loop: detect host gist rotation OR stale host lease and swap
+# channel_gists / restart into recovery without human-in-the-loop
+# teardown+rejoin. Joel 2026-05-02:
 # "you have the easy part, must self-heal, no one can be there to fix
 # your umbilical cord for you." Tonight's repro: host (Mac) tore down
 # + rejoined → new mesh gist on the same gh account; joiner (b69f) kept
@@ -2134,6 +2137,22 @@ $("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
       | awk -F'\t' 'NR==1 {print $1, $2}')
 EOF
     [ -n "$current_gist" ] || continue
+    # Same-gist host lease check. Rotation is not the only failure
+    # mode: if the hosting laptop sleeps/shuts down, the durable room
+    # gist is still the correct channel identity, but its host envelope
+    # is stale. Treat that as a restart-worthy condition so the next
+    # connect pass adopts this exact gist in-place and publishes a fresh
+    # lease. This runs continuously, not only at join time.
+    local hb_age hb_stale
+    hb_age=$(_mesh_gist_heartbeat_age "$current_gist" 2>/dev/null || true)
+    hb_stale="${AIRC_HEARTBEAT_STALE:-90}"
+    if [ -n "$hb_age" ] && [ "$hb_age" -gt "$hb_stale" ] 2>/dev/null; then
+      printf '[%s] airc: HOST LEASE STALE for #%s on gist %s (%ss > %ss). Restarting monitor so this peer can recover the same gist in-place.\n' \
+        "$(timestamp)" "$current_ch" "$current_gist" "$hb_age" "$hb_stale"
+      printf 'host lease stale for #%s on gist %s\n' "$current_ch" "$current_gist" > "$AIRC_WRITE_DIR/airc.restart-request" 2>/dev/null || true
+      kill -TERM "$_parent_pid" 2>/dev/null || true
+      return 99
+    fi
     local found_gist
     found_gist=$(_mesh_find "$current_ch" 2>/dev/null || true)
     [ -n "$found_gist" ] || continue

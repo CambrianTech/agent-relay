@@ -1620,9 +1620,14 @@ scenario_heartbeat() {
   fi
 
   # ── kill -9 the host. Heartbeat thread dies with it; gist persists.
-  local host_pids
-  host_pids=$(cat /tmp/airc-it-h/state/airc.pid 2>/dev/null)
-  [ -n "$host_pids" ] || { fail "no host pid recorded"; cleanup_all; return; }
+  # Some fast-fail paths can publish heartbeat state before monitor pid
+  # bookkeeping completes; the parent PID is enough to model a laptop
+  # power-off. Include any recorded child PIDs when present.
+  local host_pids host_parent
+  host_pids=$(cat /tmp/airc-it-h/state/airc.pid 2>/dev/null || true)
+  host_parent=$(pgrep -f "AIRC_HOME=/tmp/airc-it-h/state.*connect --room $rname" 2>/dev/null | head -1 || true)
+  [ -n "$host_parent" ] && host_pids="$host_pids $host_parent"
+  [ -n "$(printf '%s' "$host_pids" | tr -d '[:space:]')" ] || { fail "no host process found"; gh gist delete "$gist_id" --yes 2>/dev/null; cleanup_all; return; }
   kill -9 $host_pids 2>/dev/null || true
   sleep 1
   pass "host kill -9'd ($host_pids)"
@@ -1640,22 +1645,22 @@ scenario_heartbeat() {
   # ── Spawn joiner beta with discovery ON. Joiner should:
   #    - resolve the gist
   #    - detect last_heartbeat is stale
-  #    - take over: delete stale gist, exec into host mode
+  #    - take over the SAME gist in place (room gist is durable identity)
   mkdir -p /tmp/airc-it-j
   ( cd /tmp/airc-it-j && AIRC_HOME=/tmp/airc-it-j/state AIRC_NAME=beta AIRC_PORT=7550 \
       AIRC_HEARTBEAT_STALE=$hb_stale AIRC_HEARTBEAT_SEC=$hb_sec \
-      "$AIRC" connect --room "$rname" --takeover > /tmp/airc-it-j/out.log 2>&1 & )
+      "$AIRC" connect --room "$rname" > /tmp/airc-it-j/out.log 2>&1 & )
 
   for i in 1 2 3 4 5 6 7 8 9 10; do
     sleep 1
-    grep -qE 'taking over|self-healing as new host' /tmp/airc-it-j/out.log 2>/dev/null && break
+    grep -qE 'taking over existing mesh|recovering existing room gist' /tmp/airc-it-j/out.log 2>/dev/null && break
   done
 
-  grep -qE 'taking over|self-healing as new host' /tmp/airc-it-j/out.log \
-    && pass "beta detected stale heartbeat + initiated takeover" \
+  grep -qE 'taking over existing mesh|recovering existing room gist' /tmp/airc-it-j/out.log \
+    && pass "beta detected stale heartbeat + initiated in-place takeover" \
     || { fail "beta did NOT detect stale heartbeat (log: $(tail -20 /tmp/airc-it-j/out.log))"; cleanup_all; return; }
 
-  # Wait for beta to publish a fresh gist as new host.
+  # Wait for beta to adopt the same room gist as new host.
   for i in 1 2 3 4 5 6 7 8 9 10; do
     sleep 1
     [ -f /tmp/airc-it-j/state/room_gist_id ] && break
@@ -1663,35 +1668,34 @@ scenario_heartbeat() {
 
   local new_gist_id
   new_gist_id=$(cat /tmp/airc-it-j/state/room_gist_id 2>/dev/null)
-  if [ -n "$new_gist_id" ] && [ "$new_gist_id" != "$gist_id" ]; then
-    pass "beta published fresh gist as new host ($new_gist_id, replaces $gist_id)"
+  if [ "$new_gist_id" = "$gist_id" ]; then
+    pass "beta adopted original gist as new host ($new_gist_id)"
   else
-    fail "beta did not publish a fresh gist (got: '$new_gist_id', original: '$gist_id')"
+    fail "beta did not adopt original gist (got: '$new_gist_id', original: '$gist_id')"
   fi
 
-  # Old gist must be gone (beta deleted it during takeover).
-  if gh api "gists/$gist_id" >/dev/null 2>&1; then
-    fail "stale gist $gist_id still exists after takeover"
-    gh gist delete "$gist_id" --yes 2>/dev/null
+  # Original gist must still exist and now advertise beta as host.
+  local recovered_name
+  recovered_name=$(gh api "gists/$gist_id" --jq ".files[\"airc-room-${rname}.json\"].content" 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("host",{}).get("name",""))' 2>/dev/null || true)
+  if [ "$recovered_name" = "beta" ]; then
+    pass "original gist preserved and host lease updated to beta"
   else
-    pass "stale gist $gist_id removed by takeover"
+    fail "original gist did not advertise beta after takeover (host='$recovered_name')"
   fi
 
-  # Cleanup: delete the new gist beta published.
-  if [ -n "$new_gist_id" ]; then
-    gh gist delete "$new_gist_id" --yes 2>/dev/null || true
-  fi
+  gh gist delete "$gist_id" --yes 2>/dev/null || true
   cleanup_all
 }
 
-# ── Scenario: bounce (teardown should not orphan the host's gist) ─────
-# host A → teardown → host A again. Each cycle must leave AT MOST ONE
-# gist for the room name on the gh account. Pre-fix, every bounce
-# accumulated an orphan because cmd_teardown's kill -9 skipped the
-# EXIT trap that would have deleted the gist (PR #110).
+# ── Scenario: bounce (teardown preserves durable room gist) ─────
+# host A → teardown → host A again. The room gist is channel identity,
+# not process lifetime. Teardown should stop local processes and leave
+# the gist for the next host to refresh in-place; `airc part` is the
+# explicit deletion path.
 # Skips if gh is unavailable.
 scenario_bounce() {
-  section "bounce: teardown deletes hosted gist (no orphan accumulation)"
+  section "bounce: teardown preserves and reuses hosted room gist"
   requires_gh_auth_or_skip "bounce" || return
 
   if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
@@ -1721,15 +1725,18 @@ scenario_bounce() {
   AIRC_HOME=/tmp/airc-it-h/state "$AIRC" teardown >/dev/null 2>&1
   sleep 2
 
-  # Verify gist deleted
+  # Verify gist persists. This is deliberate: if the hosting laptop is
+  # shut down, the next reachable peer must be able to refresh the same
+  # source-of-truth gist rather than create an island.
   if gh api "gists/$gid1" >/dev/null 2>&1; then
-    fail "teardown LEFT gist $gid1 on gh account (orphan)"
-    gh gist delete "$gid1" --yes 2>/dev/null  # cleanup our mess
+    pass "teardown preserved durable room gist $gid1"
   else
-    pass "teardown deleted gist $gid1 ✓"
+    fail "teardown deleted durable room gist $gid1"
+    cleanup_all
+    return
   fi
 
-  # Round 2: rehost same room, verify NO orphan from round 1.
+  # Round 2: rehost same room, verify it reuses the same gist.
   # Teardown leaves room_gist_id behind (it only wipes airc.pid +
   # host_gist_id), so we can't `[ -f room_gist_id ]` as a "round 2
   # ready" signal — that file already exists from round 1. Wait for
@@ -1745,15 +1752,15 @@ scenario_bounce() {
 
   local gid2; gid2=$(cat /tmp/airc-it-h/state/host_gist_id 2>/dev/null)
   [ -z "$gid2" ] && gid2=$(cat /tmp/airc-it-h/state/room_gist_id 2>/dev/null)
-  [ -n "$gid2" ] && [ "$gid2" != "$gid1" ] \
-    && pass "round 2: alpha re-hosted, fresh gist=$gid2" \
-    || fail "round 2: no fresh gist or same as orphan (gid1=$gid1 gid2=$gid2)"
+  [ "$gid2" = "$gid1" ] \
+    && pass "round 2: alpha re-hosted on same durable gist=$gid2" \
+    || fail "round 2: did not reuse durable gist (gid1=$gid1 gid2=$gid2)"
 
   local count
   count=$(gh gist list --limit 50 2>/dev/null | awk -F'\t' -v r="airc room: $rname" '$2==r' | wc -l | tr -d ' ')
   [ "$count" = "1" ] \
-    && pass "exactly one #${rname} gist on account after bounce ✓" \
-    || fail "expected 1 gist, found $count (orphan accumulation)"
+    && pass "exactly one #${rname} gist on account after bounce" \
+    || fail "expected 1 gist, found $count"
 
   # Cleanup
   AIRC_HOME=/tmp/airc-it-h/state "$AIRC" teardown >/dev/null 2>&1
@@ -2054,8 +2061,8 @@ JSON
 #   1. Two tabs paired (alpha hosting, beta joined). Beta's CONFIG now
 #      has host_target=alpha's-address.
 #   2. Alpha's process dies (machine restart, crash, kill -9). Alpha's
-#      gist may also be gone (graceful teardown deletes it; ungraceful
-#      leaves it stale).
+#      gist remains as the durable channel identity, but its host lease
+#      may be stale.
 #   3. Beta runs `airc connect` again.
 #
 # Pre-#130: beta's resume path SSH-probed alpha's cached address. If
@@ -2114,24 +2121,21 @@ scenario_connect_after_kill_recovers() {
     && pass "beta's CONFIG has cached host_target (pre-condition)" \
     || { fail "beta's CONFIG has no host_target — pre-condition broken"; cleanup_all; return; }
 
-  # ── Kill alpha hard. SIGKILL bypasses alpha's EXIT trap, so alpha's
-  # gist is left STALE on gh (host process gone, gist still exists).
-  # This is the worst case: a cached pairing pointing at a dead host
-  # whose gist still resolves.
+  # ── Stop alpha. The room gist stays on gh as durable channel identity;
+  # beta must not trust the cached host_target, and must recover through
+  # discovery / same-gist lease refresh instead.
   AIRC_HOME=/tmp/airc-it-cakr-h/state "$AIRC" teardown >/dev/null 2>&1
-  # teardown deletes the gist gracefully — do that for round 1 to
-  # exercise the gist-gone case. (The TCP-unreachable-but-gist-alive
-  # case is exercised by scenario_two_tab_localhost's host-crash branch.)
   sleep 2
   if gh api "gists/$gid_alpha" >/dev/null 2>&1; then
-    fail "alpha's gist not deleted by teardown (test pre-condition)"
-    gh gist delete "$gid_alpha" --yes 2>/dev/null
+    pass "alpha's room gist preserved (durable channel identity)"
   else
-    pass "alpha's gist deleted (gist-gone case set up)"
+    fail "alpha's room gist disappeared; durable identity pre-condition broken"
+    cleanup_all
+    return
   fi
 
   # Beta is now in the same state Joel hit: paired CONFIG with cached
-  # host_target pointing at a dead host, gist gone. Run beta's connect.
+  # host_target pointing at a dead host. Run beta's connect.
   AIRC_HOME=/tmp/airc-it-cakr-j/state "$AIRC" teardown >/dev/null 2>&1
   sleep 1
   local recover_log=/tmp/airc-it-cakr-j-recover.log
@@ -2168,6 +2172,7 @@ scenario_connect_after_kill_recovers() {
   AIRC_HOME=/tmp/airc-it-cakr-j/state "$AIRC" teardown >/dev/null 2>&1
   sleep 1
   rm -f "$recover_log"
+  gh gist delete "$gid_alpha" --yes 2>/dev/null || true
   rm -rf /tmp/airc-it-cakr-h /tmp/airc-it-cakr-j
   cleanup_all
 }

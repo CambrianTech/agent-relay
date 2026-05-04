@@ -458,20 +458,25 @@ _doctor_health() {
     fi
   fi
 
-  # ── Daemon installed-for-this-scope check. Pre-fix probed for a
+  # ── Daemon installed/running-for-this-scope check. Pre-fix probed for a
   # `daemon.pid` file that the daemon launcher never writes anywhere
   # (Copilot caught this on PR #422 review — `--health` always reported
   # "not installed" even when the daemon was running). Use the canonical
   # detector (`airc_daemon_is_installed_for_scope`) which checks the
-  # registered launchd plist / systemd unit / HKCU Run entry. Liveness
-  # itself (is the launcher actually running and successfully polling?)
-  # is what the per-channel bearer last-recv timestamps below measure
-  # transitively — if the daemon is installed AND bearer last-recv is
-  # fresh, the daemon is alive. Fresh state with no installed daemon =
-  # an interactive `airc connect` is doing the work.
+  # registered launchd plist / systemd unit / HKCU Run entry, then a
+  # separate running probe. Installed-on-disk is not liveness: Joel hit
+  # a scope with a valid plist, no launchctl job loaded, and stale
+  # bearer state. That must be loud.
   if command -v airc_daemon_is_installed_for_scope >/dev/null 2>&1 \
      && airc_daemon_is_installed_for_scope "$AIRC_WRITE_DIR" 2>/dev/null; then
-    printf "  [ok] daemon installed for this scope (liveness inferred from per-channel last-recv below)\n"
+    if command -v airc_daemon_is_running_for_scope >/dev/null 2>&1 \
+       && airc_daemon_is_running_for_scope "$AIRC_WRITE_DIR" 2>/dev/null; then
+      printf "  [ok] daemon loaded for this scope\n"
+    else
+      printf "  [BLOCKED] daemon installed for this scope but NOT loaded/running\n"
+      printf "           Fix: airc daemon restart  (or airc daemon install if restart fails)\n"
+      issues=$((issues+1))
+    fi
   else
     printf "  [info] daemon not installed (substrate runs in-shell only)\n"
     printf "         Optional: airc daemon install  (survives sleep/crash, see README → Optional layers)\n"

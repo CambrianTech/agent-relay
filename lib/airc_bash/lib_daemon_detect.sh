@@ -144,3 +144,40 @@ airc_daemon_is_installed_for_scope() {
   esac
   return 1
 }
+
+# ── airc_daemon_is_running_for_scope <scope> ───────────────────────────
+#
+# Returns 0 only when the platform supervisor is actively loaded/running
+# for the given scope. "Installed" is not enough: a launchd plist or
+# systemd unit can exist on disk while the job is unloaded, crashed, or
+# never bootstrapped. Monitor recovery code must not claim "daemon will
+# self-heal" unless this probe is true.
+airc_daemon_is_running_for_scope() {
+  local target_scope="${1:-}"
+  [ -n "$target_scope" ] || return 1
+  airc_daemon_is_installed_for_scope "$target_scope" || return 1
+  local os; os=$(detect_platform)
+  case "$os" in
+    darwin)
+      launchctl list 2>/dev/null | awk '{print $3}' | grep -qFx "com.cambriantech.airc" && return 0
+      return 1
+      ;;
+    linux|wsl)
+      systemctl --user is-active --quiet airc.service 2>/dev/null && return 0
+      return 1
+      ;;
+    windows)
+      # HKCU Run starts the daemon at login; there is no supervisor API
+      # equivalent to launchd/systemd. Treat a live airc-daemon.bat or
+      # `airc connect` process for this scope as running.
+      if command -v powershell.exe >/dev/null 2>&1; then
+        local needle="$target_scope"
+        powershell.exe -NoProfile -Command \
+          "Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -like '*airc*' -and \$_.CommandLine -like '*$needle*' } | Select-Object -First 1 | ForEach-Object { 'yes' }" \
+          2>/dev/null | grep -q yes && return 0
+      fi
+      return 1
+      ;;
+  esac
+  return 1
+}
