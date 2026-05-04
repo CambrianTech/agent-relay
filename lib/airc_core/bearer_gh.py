@@ -299,9 +299,11 @@ def _gh_api_get(gist_id: str) -> Optional[dict]:
         return None
     if r.returncode != 0:
         combined = (r.stderr or "") + (r.stdout or "")
-        sys.stderr.write(f"[airc:bearer_gh] _gh_api_get({gist_id}): gh api exit={r.returncode}: {combined.strip()[:500]}\n")
-        sys.stderr.flush()
         _gh_api_get._last_err = combined  # type: ignore[attr-defined]
+        kind = _classify_gh_error(combined, True)
+        if kind != "secondary_rate_limit" or _truthy(os.environ.get("AIRC_GH_DEBUG")):
+            sys.stderr.write(f"[airc:bearer_gh] _gh_api_get({gist_id}): gh api exit={r.returncode}: {combined.strip()[:500]}\n")
+            sys.stderr.flush()
         return None
     try:
         return json.loads(r.stdout)

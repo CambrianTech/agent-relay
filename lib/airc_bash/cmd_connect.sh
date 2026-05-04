@@ -338,6 +338,7 @@ cmd_connect() {
     echo "    To stop it:        airc teardown"
     echo "    To restart it:     airc daemon restart   # or rerun airc connect if no daemon"
     echo "    To check it:       airc status"
+    echo "    To catch up:       airc inbox"
     return 0
     fi
   fi
@@ -1853,6 +1854,7 @@ JSON
       fi
     fi
     echo ""
+    echo "  Catch up unread messages with: airc inbox"
     echo "  Waiting for peers on port $host_port..."
     # Background: accept peer registrations via TCP (public keys only).
     #
