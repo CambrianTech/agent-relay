@@ -140,6 +140,7 @@ cmd_connect() {
   fi
   local general_sidecar=1   # default ON (issue #121) — also subscribe to #general
   local _force_general_sidecar=0   # set by --general flag (issue #136 re-opt-in)
+  local allow_takeover="${AIRC_ALLOW_TAKEOVER:-0}"
   # Recursion guard: when WE are the sidecar (spawned by another airc
   # connect), don't spawn our own sidecar. Otherwise: turtles all the way.
   [ "${AIRC_GENERAL_SIDECAR:-0}" = "1" ] && general_sidecar=0
@@ -187,6 +188,7 @@ cmd_connect() {
         echo "  --no-room                      disable substrate entirely (legacy 1:1 invite)"
         echo "  --no-general                   keep project room, skip #general subscription"
         echo "  --general                      re-opt-in to #general after a prior /part"
+        echo "  --takeover                     explicitly replace an unreachable/stale host"
         echo "  --no-gist                      don't publish/discover via gh gist (test mode)"
         echo "  --no-tailscale                 skip Tailscale even if installed"
         return 0 ;;
@@ -217,6 +219,8 @@ cmd_connect() {
         # is explicitly asking for the sidecar, override session env.
         # Symmetric inverse of --no-general.
         _force_general_sidecar=1; shift ;;
+      --takeover|-takeover)
+        allow_takeover=1; shift ;;
       --room-only|-room-only)
         # Combo: explicit project room + skip general sidecar. For
         # focused work where lobby noise would distract.
@@ -894,30 +898,26 @@ cmd_connect() {
   if [ -n "$target" ] && echo "$target" | grep -q '@'; then
     # ── JOIN MODE ──────────────────────────────────────────────────
 
-    # Stale-heartbeat fast-path takeover. If the gist we resolved had a
-    # last_heartbeat older than AIRC_HEARTBEAT_STALE (parsed above), the
-    # host is dead. Skip the SSH attempt entirely — no minute-long TCP
-    # timeout, no peer wondering "is this thing on" — go straight to
-    # take-over. Same operations as the SSH-failure self-heal at the
-    # bottom of JOIN MODE (delete stale gist, re-exec as host with
-    # AIRC_NO_DISCOVERY=1) but triggered from positive evidence (stale
-    # presence signal) rather than negative evidence (TCP timeout).
+    # Stale-heartbeat fast-path. Stale presence is evidence that the host
+    # may be gone, but it is not authority to mutate the shared mesh.
+    # Default join is read-only: preserve the existing gist and fail
+    # loudly. Operators must pass --takeover (or AIRC_ALLOW_TAKEOVER=1)
+    # to intentionally replace a stale host.
     #
     # Backward compat: pre-heartbeat gists have no last_heartbeat field,
     # _resolved_heartbeat_stale stays 0, this block is a no-op, and the
     # SSH-failure self-heal still catches the dead host (slower, but
     # correct).
     if [ "$_resolved_heartbeat_stale" = "1" ] && [ -n "$resolved_room_name" ] \
-       && [ -n "$_resolved_gist_id" ] && command -v gh >/dev/null 2>&1; then
+       && [ -n "$_resolved_gist_id" ]; then
       echo ""
-      echo "  ⚠  Host of #${resolved_room_name} is stale (last heartbeat ${_resolved_heartbeat_age}s ago) — taking over..."
+      echo "  ⚠  Host of #${resolved_room_name} is stale (last heartbeat ${_resolved_heartbeat_age}s ago)."
       echo "     (prior host's gist: $_resolved_gist_id)"
-
-      # Same race-loser detection as the SSH-failure self-heal path
-      # below. Two tabs concurrently deciding "host is stale" both
-      # delete + publish, end up with split-brain — caught only by
-      # running two tabs together.
-      _self_heal_stale_host "$_resolved_gist_id"
+      if [ "$allow_takeover" = "1" ] && command -v gh >/dev/null 2>&1; then
+        echo "     --takeover requested — replacing stale host explicitly."
+        _self_heal_stale_host "$_resolved_gist_id"
+      fi
+      die "Refusing automatic takeover of #${resolved_room_name}; existing mesh preserved. Re-run with --takeover only if you intentionally want to replace that host."
     fi
 
     # Parse name@user@host[:port]#pubkey
@@ -1110,52 +1110,19 @@ except Exception:
                   --my-identity-json "$my_identity_json" 2>&1) || _pair_ok=0
 
     if [ "$_pair_ok" = "0" ]; then
-      # ── Self-heal: stale-host takeover ─────────────────────────────
-      # If discovery handed us a kind:room gist AND the host listed in it
-      # is unreachable, the most likely cause is the prior host went away
-      # (laptop sleep, crash, network blip). Per Joel: "no claude left
-      # behind" — first agent back in becomes the new host of #general.
-      #
-      # Mechanics:
-      #   1. Delete the stale gist (we have gh perms because it's on our
-      #      own gh account, same auth as the discovery that found it).
-      #   2. Tear down the half-written CONFIG that pointed at the dead
-      #      host (else resume on next start would loop into the same
-      #      stale pair).
-      #   3. exec into a fresh airc connect in HOST mode for the same
-      #      room name. AIRC_NO_DISCOVERY=1 so we don't re-find the gist
-      #      we just deleted (gh propagation lag).
-      #
-      # Only fires when ALL FOUR are true:
-      #   - We resolved a kind:room gist (resolved_room_name + _resolved_gist_id non-empty)
-      #   - gh CLI is available (to delete the stale gist)
-      #   - Pair handshake failed (TCP unreachable / timeout)
-      #   - Address picker either succeeded ("picked") OR host published
-      #     no addresses[] at all ("no_addrs"). If picker ran but found
-      #     no reachable scope ("no_match"), the failure is THIS peer's
-      #     network mismatch — not host-down. Nuking the gist would
-      #     destroy reachability for other peers who CAN reach the host.
-      #     Bug observed live 2026-05-02: a Mac without tailscale joined
-      #     a Windows host whose only non-localhost entry was tailscale,
-      #     fell through to the invite-string ssh_target, TCP timed out,
-      #     self-heal nuked the gist that 4 other peers were happily
-      #     using. The address-picker reachability check (#397) prevents
-      #     the most common shape of this; this guard catches the
-      #     remaining "invite-string fallback after no_match" path.
-      # If any condition isn't met, fall through to the original die().
+      # Pair failure is read-only by default. An unreachable host is not
+      # proof the shared mesh should be deleted: this peer may lack the
+      # right network path, the host may be reachable to others, or the
+      # failure may be transient. Automatic takeover is the split-brain
+      # bug. Preserve the existing gist and fail loudly unless the
+      # operator explicitly requested --takeover.
       if [ -n "$resolved_room_name" ] && [ -n "$_resolved_gist_id" ] \
          && command -v gh >/dev/null 2>&1 \
-         && [ "$_addr_picker_state" != "no_match" ]; then
+         && [ "$_addr_picker_state" != "no_match" ] \
+         && [ "$allow_takeover" = "1" ]; then
         echo ""
-        echo "  ⚠  Host of #${resolved_room_name} unreachable — self-healing as new host..."
+        echo "  ⚠  Host of #${resolved_room_name} unreachable — --takeover requested, replacing host..."
         echo "     (prior host's gist: $_resolved_gist_id)"
-
-        # Jittered backoff before takeover. Without this, two tabs that
-        # hit the same dead gist concurrently both delete + publish
-        # within the same gh API window and you end up with two
-        # competing gists for the same room name (split-brain race —
-        # caught only by running two tabs against a stale gist
-        # simultaneously, NOT by the integration test).
         _self_heal_stale_host "$_resolved_gist_id"
       elif [ "$_addr_picker_state" = "no_match" ]; then
         # Picker found no scope this peer can reach. Surface the situation
@@ -1169,6 +1136,12 @@ except Exception:
         echo "  ⚠  Host of #${resolved_room_name} published no scope this peer can reach." >&2
         echo "     Skipping self-heal (gist preserved for peers who CAN reach the host)." >&2
         echo "     Direct pair unavailable; gh-bearer broadcasts still work via gist." >&2
+        echo "" >&2
+      elif [ -n "$resolved_room_name" ] && [ -n "$_resolved_gist_id" ]; then
+        echo "" >&2
+        echo "  ⚠  Host of #${resolved_room_name} unreachable; existing mesh preserved." >&2
+        echo "     Not creating a solo replacement mesh. Re-run with --takeover only if" >&2
+        echo "     you intentionally want to replace the current host gist: $_resolved_gist_id" >&2
         echo "" >&2
       fi
       # Either not a room flow, or no gh, or no resolved_room_name → original die.
@@ -1459,7 +1432,7 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
           # early mesh-find gate at line ~568.
           if [ "${AIRC_NO_DISCOVERY:-0}" != "1" ]; then
             _existing_room_gid=$("$AIRC_PYTHON" -m airc_core.channel_gist resolve \
-                                 --channel "$room_name" 2>/dev/null || true)
+                                 --channel "$room_name" --require-invite 2>/dev/null || true)
           fi
         fi
         if [ -n "$_existing_room_gid" ]; then

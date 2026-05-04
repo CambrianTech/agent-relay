@@ -1644,7 +1644,7 @@ scenario_heartbeat() {
   mkdir -p /tmp/airc-it-j
   ( cd /tmp/airc-it-j && AIRC_HOME=/tmp/airc-it-j/state AIRC_NAME=beta AIRC_PORT=7550 \
       AIRC_HEARTBEAT_STALE=$hb_stale AIRC_HEARTBEAT_SEC=$hb_sec \
-      "$AIRC" connect --room "$rname" > /tmp/airc-it-j/out.log 2>&1 & )
+      "$AIRC" connect --room "$rname" --takeover > /tmp/airc-it-j/out.log 2>&1 & )
 
   for i in 1 2 3 4 5 6 7 8 9 10; do
     sleep 1
@@ -2035,8 +2035,8 @@ JSON
   echo "$doctor_out" | grep -q 'collaboration mesh has 0 peer records' \
     && pass "doctor --health warns about zero-peer collaboration mesh" \
     || fail "doctor --health did not warn about zero peers ($doctor_out)"
-  echo "$doctor_out" | grep -q 'Bus working, .*warning' \
-    && pass "doctor summary is warning, not clean healthy" \
+  echo "$doctor_out" | grep -q 'Bus DEGRADED' \
+    && pass "doctor summary is degraded, not clean healthy" \
     || fail "doctor summary still looked clean ($doctor_out)"
 
   rm -rf /tmp/airc-it-solo
