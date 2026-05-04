@@ -533,6 +533,23 @@ _doctor_health() {
     printf "         Fix: airc join  (then re-run airc doctor --health)\n"
   fi
 
+  # ── Collaboration membership. A local bearer can be healthy while the
+  # mesh is effectively solo after host self-heal / gist rotation. That
+  # is not a healthy collaboration bus: messages may append to a fresh
+  # gist nobody else is polling. Keep this separate from transport
+  # health so users can see "wire is alive, but nobody is connected."
+  local peer_count=0
+  if [ -d "$PEERS_DIR" ]; then
+    peer_count=$(find "$PEERS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | wc -l | tr -d ' ')
+  fi
+  if [ "${peer_count:-0}" -eq 0 ] 2>/dev/null; then
+    printf "  [WARN] collaboration mesh has 0 peer records — local transport may be healthy but nobody is known to be connected\n"
+    printf "         Check: airc peers; ask peers to run 'airc update --channel canary && airc connect <current invite>'\n"
+    warns=$((warns+1))
+  else
+    printf "  [ok] collaboration mesh has %s peer record(s)\n" "$peer_count"
+  fi
+
   echo
   if [ "$issues" -eq 0 ] && [ "$warns" -eq 0 ]; then
     echo "  ✓ Bus healthy."

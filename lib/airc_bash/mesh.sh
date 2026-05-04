@@ -37,37 +37,24 @@ _mesh_desc() {
 # Singleton lookup: find the mesh gist on the current gh account.
 # Echoes the gist id (one line) or empty.
 #
-# If the listing returns 2+ candidates (race-loser collision, gh
-# replication lag, or an old per-room gist incorrectly tagged), keep
-# the OLDEST by created_at. The oldest is the legitimate winner of
-# any post-publish race because it was created first; any other entry
-# is a duplicate that should be reaped on the next takeover cycle.
+# Production invariant: the gist envelope content is the source of
+# truth, not the human description. Pre-fix this matched only gists
+# whose description was exactly "airc mesh"; meanwhile
+# airc_core.channel_gist.resolve found older "airc room: ..." gists
+# by envelope content. Two discovery systems, two answers, split-brain.
+#
+# Delegate lookup to channel_gist.find_existing so connect, subscribe,
+# send, and rediscovery all use the same canonical channel→gist rule.
+# Optional arg = channel name. Empty falls back to cmd_connect's dynamic
+# room_name, then config's default channel, then #general.
 _mesh_find() {
   command -v gh >/dev/null 2>&1 || return 0
-  local desc; desc=$(_mesh_desc)
-  # gh gist list output: <id>\t<desc>\t<files>\t<visibility>\t<updated>
-  # Filter on EXACT desc match (anchor with ^ and $ in awk).
-  local ids
-  ids=$(gh gist list --limit 50 2>/dev/null \
-    | awk -F'\t' -v d="$desc" '$2 == d { print $1 }')
-  local count; count=$(printf '%s\n' "$ids" | grep -c . || true)
-  case "$count" in
-    0) return 0 ;;
-    1) printf '%s\n' "$ids" ;;
-    *)
-      # Multiple matches — pick the oldest by created_at. Same tiebreaker
-      # cmd_connect's race-loser detection uses; centralized here.
-      local oldest="" oldest_ts=""
-      while IFS= read -r gid; do
-        [ -z "$gid" ] && continue
-        local ts; ts=$(gh api "gists/$gid" --jq '.created_at' 2>/dev/null || echo "")
-        if [ -z "$oldest_ts" ] || [ "$ts" \< "$oldest_ts" ]; then
-          oldest="$gid"; oldest_ts="$ts"
-        fi
-      done <<< "$ids"
-      [ -n "$oldest" ] && printf '%s\n' "$oldest"
-      ;;
-  esac
+  local channel="${1:-${room_name:-}}"
+  if [ -z "$channel" ] && [ -n "${CONFIG:-}" ] && [ -f "$CONFIG" ]; then
+    channel=$("$AIRC_PYTHON" -m airc_core.config default_channel --config "$CONFIG" 2>/dev/null || true)
+  fi
+  [ -z "$channel" ] && channel="general"
+  "$AIRC_PYTHON" -m airc_core.channel_gist find --channel "$channel" 2>/dev/null || true
 }
 
 # Publish a new mesh gist. Echoes the new gist id, or empty on failure.

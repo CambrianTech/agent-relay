@@ -420,10 +420,12 @@ _self_heal_stale_host() {
   # explicit --room flag was used; anywhere else it's empty and we
   # reexec without the override (auto-scope decides as usual).
   local _saved_intent="${ROOM_INTENT_FOR_REEXEC:-}"
-  # _mesh_find returns the singleton mesh gist (oldest-by-created if
-  # multiple are present from a race). If something is there, another
-  # tab beat us — rejoin pointed at it.
-  local picked; picked=$(_mesh_find)
+  # _mesh_find uses the same content-based channel_gist resolver as
+  # connect/subscribe/send. If something canonical is there, another
+  # tab beat us — rejoin pointed at it. Description-only lookup caused
+  # split-brain when one path chose "airc mesh" and another chose an
+  # older live "airc room:" envelope.
+  local picked; picked=$(_mesh_find "${_saved_intent:-${room_name:-}}")
   rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_name"
   if [ -n "$_saved_intent" ]; then
     export AIRC_ROOM_INTENT="$_saved_intent"
@@ -2125,13 +2127,15 @@ _mesh_rediscover_loop() {
     # Resolve the current default-channel gist from config. We compare
     # against the singleton mesh, so any divergence on the default
     # channel implies host rotation.
-    local current_gist
-    current_gist=$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
+    local current_ch current_gist
+    read -r current_ch current_gist <<EOF
+$("$AIRC_PYTHON" -m airc_core.config list_channel_gists \
       --config "$CONFIG" 2>/dev/null \
-      | awk -F'\t' 'NR==1 {print $2}')
+      | awk -F'\t' 'NR==1 {print $1, $2}')
+EOF
     [ -n "$current_gist" ] || continue
     local found_gist
-    found_gist=$(_mesh_find 2>/dev/null || true)
+    found_gist=$(_mesh_find "$current_ch" 2>/dev/null || true)
     [ -n "$found_gist" ] || continue
     if [ "$found_gist" = "$current_gist" ]; then
       continue

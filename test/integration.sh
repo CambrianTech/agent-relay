@@ -2007,6 +2007,42 @@ JSON
   cleanup_all
 }
 
+# ── Scenario: solo_mesh_warns (transport health != collaboration) ───────
+# A self-healed host can have fresh local transport/bearer state while no
+# peers are actually paired to the mesh. `airc status` / `doctor --health`
+# must not report that as simply healthy; the user needs to know they may
+# be talking to a solo gist.
+scenario_solo_mesh_warns() {
+  section "solo_mesh_warns: status and doctor distinguish local health from collaboration"
+  cleanup_all
+
+  local home=/tmp/airc-it-solo/state
+  mkdir -p "$home/identity" "$home/peers"
+  scaffold_identity "$home/identity" 'airc-test-solo'
+  cat > "$home/config.json" <<'JSON'
+{ "name": "solo-host", "subscribed_channels": ["general"], "channel_gists": {"general": "abc123"} }
+JSON
+  echo general > "$home/room_name"
+  echo abc123 > "$home/room_gist_id"
+
+  local status_out doctor_out
+  status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
+  echo "$status_out" | grep -q 'collaboration: SOLO' \
+    && pass "status reports SOLO when peer records are empty" \
+    || fail "status did not report solo collaboration state ($status_out)"
+
+  doctor_out=$(AIRC_HOME="$home" "$AIRC" doctor --health 2>&1)
+  echo "$doctor_out" | grep -q 'collaboration mesh has 0 peer records' \
+    && pass "doctor --health warns about zero-peer collaboration mesh" \
+    || fail "doctor --health did not warn about zero peers ($doctor_out)"
+  echo "$doctor_out" | grep -q 'Bus working, .*warning' \
+    && pass "doctor summary is warning, not clean healthy" \
+    || fail "doctor summary still looked clean ($doctor_out)"
+
+  rm -rf /tmp/airc-it-solo
+  cleanup_all
+}
+
 # ── Scenario: connect_after_kill_recovers (#130, replaces resume_*) ──────
 # The architectural property of #130: cached pairing in CONFIG is NEVER
 # trusted. Every `airc connect` runs discovery and re-pairs against the
@@ -4125,6 +4161,7 @@ case "$MODE" in
   two_tab_localhost) scenario_two_tab_localhost ;;
   auto_scope)   scenario_auto_scope ;;
   send_dead_monitor_dies) scenario_send_dead_monitor_dies ;;
+  solo_mesh_warns) scenario_solo_mesh_warns ;;
   connect_after_kill_recovers) scenario_connect_after_kill_recovers ;;
   general_sidecar_default) scenario_general_sidecar_default ;;
   away) scenario_away ;;
@@ -4158,7 +4195,8 @@ case "$MODE" in
     scenario_auth_failure; scenario_room; scenario_events; scenario_get_host
     scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat
     scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope
-    scenario_send_dead_monitor_dies; scenario_connect_after_kill_recovers
+    scenario_send_dead_monitor_dies; scenario_solo_mesh_warns
+    scenario_connect_after_kill_recovers
     scenario_general_sidecar_default; scenario_away
     scenario_list; scenario_quit; scenario_platform_adapters
     scenario_python_units
@@ -4169,7 +4207,7 @@ case "$MODE" in
     scenario_custom_room_creates_gist
     scenario_invite_human
     ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
 esac
 
 echo
