@@ -374,15 +374,84 @@ share a link if the file is hosted elsewhere."
   echo "Sent $filename ($filesize bytes)"
 }
 
+_cmd_invite_human() {
+  # Convenience method: print a self-contained shell paste-block a HUMAN
+  # coworker can paste into their terminal. Works even if they don't
+  # have airc yet (step 1 = install one-liner; safe to re-run if they
+  # already have it). Uses the substrate's primary gist ID — NOT the
+  # mnemonic — so it works for coworkers on a different gh account
+  # (mnemonic resolution is same-gh-account-only; raw gist-id is the
+  # cross-account-safe form).
+  #
+  # Output is itself shell-pasteable: comment lines + commands.
+  # Heredoc has a quoted delimiter so $(whoami) doesn't expand at
+  # generation time; it expands at paste time on the receiver's shell.
+  local primary_chan primary_gid
+  primary_chan=$("$AIRC_PYTHON" -m airc_core.config default_channel --config "$CONFIG" 2>/dev/null || true)
+  if [ -n "$primary_chan" ]; then
+    primary_gid=$("$AIRC_PYTHON" -c "
+import json, sys
+try:
+    c = json.load(open('$CONFIG'))
+    print(c.get('channel_gists', {}).get('$primary_chan', ''))
+except Exception:
+    pass
+" 2>/dev/null)
+  fi
+  # Fallback: legacy room_gist_id file (pre-channel-gists installs).
+  if [ -z "$primary_gid" ] && [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
+    primary_gid=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null)
+    [ -z "$primary_chan" ] && primary_chan="(default)"
+  fi
+
+  if [ -z "$primary_gid" ]; then
+    echo "  ERROR: no published room gist found in this scope." >&2
+    echo "  Run 'airc connect' first so a room exists to invite into." >&2
+    return 1
+  fi
+
+  cat <<PASTE
+# ── airc invite for a coworker ────────────────────────────────────────
+# Paste the entire block below to your friend (Slack/email/etc.) — they
+# paste it into their terminal and it onboards them end-to-end. Works
+# even if they don't have airc installed yet.
+#
+# Room: #${primary_chan}     Gist: ${primary_gid}
+
+# 1) Install airc (skip if already installed — safe to re-run).
+curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
+
+# 2) Join my room.
+~/.local/bin/airc connect ${primary_gid}
+
+# 3) Say hi so we know you made it.
+~/.local/bin/airc msg "hello, I'm \$(whoami)"
+
+# 4) When you're done, leave cleanly.
+#    ~/.local/bin/airc part
+PASTE
+}
+
 cmd_invite() {
+  local mode="auto"
   case "${1:-}" in
     -h|--help)
       echo "Usage:"
-      echo "  airc invite             print cross-account share invite (one-time pairing string)"
-      echo "  airc share / join-string  aliases"
+      echo "  airc invite                 print cross-account share invite (one-time pairing string)"
+      echo "  airc invite --human         print a self-contained paste-block for a coworker"
+      echo "                              (includes install one-liner; works even if they don't have airc yet)"
+      echo "  airc share / join-string    aliases"
       return 0 ;;
+    --human|--share-block|--for-friend)
+      mode="human" ;;
   esac
   ensure_init
+
+  if [ "$mode" = "human" ]; then
+    _cmd_invite_human
+    return $?
+  fi
+
   local host_target pubkey_b64 join_string
   host_target=$(get_config_val host_target "")
 
