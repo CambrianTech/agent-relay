@@ -1333,7 +1333,28 @@ _monitor_multi_channel() {
           2>>"$AIRC_WRITE_DIR/bearer_recv.${ch}.log" &
         _pids+=("$!:$ch")
       }
+      # Dedup-by-gist at spawn time. The bearer's natural unit is the
+      # gist (the wire), not the channel (a logical label). When two
+      # subscribed channels map to the same gist (host advertising one
+      # mesh gist for both — the joiner-config Joel hit 2026-05-04),
+      # spawning one bearer per channel + relying on per-(scope, gist)
+      # lock to dedup produced an infinite respawn loop: lock-loser
+      # exits 0 cleanly, supervisor sees death, respawns, loses lock
+      # again, ad infinitum. Fix the design mismatch here at the
+      # supervisor: skip channels whose gist is already served by an
+      # earlier-iteration bearer. Messages route to all subscribed
+      # channels via envelope.channel downstream — one bearer reads
+      # the gist once and yields each line; monitor_formatter dispatches
+      # by channel field. (State files stay per-channel for now;
+      # per-gist state-files is a deeper refactor.)
+      local _served_gists=""
       while IFS=$'\t' read -r ch gid; do
+        [ -z "$ch" ] && continue
+        [ -z "$gid" ] && continue
+        case " $_served_gists " in
+          *" $gid "*) continue ;;
+        esac
+        _served_gists="$_served_gists $gid"
         _start_channel_bearer "$ch" "$gid"
       done <<< "$channel_map"
 
@@ -1406,16 +1427,36 @@ _monitor_multi_channel() {
           done
           _pids=("${_kept[@]}")
 
+          # Build the set of gists currently served by live bearers,
+          # so the add-loop doesn't double-spawn for a gist that's
+          # already covered by another channel's bearer (same dedup-by-
+          # gist invariant as the initial spawn loop above).
+          local _live_gists=""
+          local _entry_ch _entry_gid
+          for entry in "${_pids[@]}"; do
+            _entry_ch="${entry#*:}"
+            _entry_gid=$(printf '%s\n' "$_current_map" | awk -F '\t' -v c="$_entry_ch" '$1 == c {print $2; exit}')
+            [ -n "$_entry_gid" ] && _live_gists="$_live_gists $_entry_gid"
+          done
+
           while IFS=$'\t' read -r ch gid; do
             [ -z "$ch" ] && continue
+            [ -z "$gid" ] && continue
             local _already=0
             for entry in "${_pids[@]}"; do
               [ "${entry#*:}" = "$ch" ] && _already=1 && break
             done
-            if [ "$_already" = "0" ]; then
-              echo "airc: #${ch} added to channel_gists; starting bearer without full monitor restart" >&2
-              _start_channel_bearer "$ch" "$gid"
+            if [ "$_already" = "1" ]; then
+              continue
             fi
+            # Don't spawn if another channel's bearer already serves
+            # this gist — that bearer's stream already covers us.
+            case " $_live_gists " in
+              *" $gid "*) continue ;;
+            esac
+            _live_gists="$_live_gists $gid"
+            echo "airc: #${ch} added to channel_gists; starting bearer without full monitor restart" >&2
+            _start_channel_bearer "$ch" "$gid"
           done <<< "$_current_map"
         fi
       done
