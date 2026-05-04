@@ -62,7 +62,7 @@ cmd_daemon() {
       return 0 ;;
     install)   cmd_daemon_install "$@" ;;
     uninstall|remove) cmd_daemon_uninstall "$@" ;;
-    restart)   shift; cmd_daemon_uninstall "$@" >/dev/null && cmd_daemon_install "$@" ;;
+    restart)   cmd_daemon_uninstall "$@" >/dev/null && cmd_daemon_install "$@" ;;
     status)    cmd_daemon_status "$@" ;;
     log|logs)  cmd_daemon_log "$@" ;;
     stop|start)
