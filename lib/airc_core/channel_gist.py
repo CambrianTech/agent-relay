@@ -659,6 +659,8 @@ def resolve(channel: str, create_if_missing: bool = False, require_invite: bool 
         if attempt < attempts - 1:
             _t.sleep(1.5 * (attempt + 1))  # 1.5s, then 3s
     if create_if_missing and not require_invite:
+        if gh_backoff.backoff_active():
+            return None
         return create_new(channel)
     return None
 

@@ -267,6 +267,13 @@ class LocalCacheFallbackTests(unittest.TestCase):
                     ]),
                 )
 
+    def test_resolve_does_not_create_new_gist_during_gh_backoff(self):
+        with mock.patch.object(channel_gist, "find_existing", return_value=None), \
+             mock.patch.object(channel_gist.gh_backoff, "backoff_active", return_value=True), \
+             mock.patch.object(channel_gist, "create_new") as create_new:
+            self.assertIsNone(channel_gist.resolve("general", create_if_missing=True))
+            create_new.assert_not_called()
+
 
 class GistListCacheTests(unittest.TestCase):
     """Gist discovery should not spam GitHub during monitor/status churn."""
