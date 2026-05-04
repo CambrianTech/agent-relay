@@ -20,6 +20,28 @@
 # install.sh sources both files explicitly from $CLONE_DIR before
 # calling this; runtime sources them via airc's lib-dir resolver.
 
+airc_daemon_scope_id() {
+  local target_scope="${1:-}"
+  [ -n "$target_scope" ] || target_scope="${AIRC_HOME:-$HOME/.airc}"
+  python3 -c 'import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:12])' "$target_scope" 2>/dev/null \
+    || printf '%s' "$target_scope" | shasum 2>/dev/null | awk '{print substr($1,1,12)}'
+}
+
+airc_daemon_service_name_for_scope() {
+  local target_scope="${1:-}"
+  printf 'com.cambriantech.airc.%s\n' "$(airc_daemon_scope_id "$target_scope")"
+}
+
+airc_daemon_unit_name_for_scope() {
+  local target_scope="${1:-}"
+  printf 'airc-%s.service\n' "$(airc_daemon_scope_id "$target_scope")"
+}
+
+airc_daemon_run_entry_for_scope() {
+  local target_scope="${1:-}"
+  printf 'airc-monitor-%s\n' "$(airc_daemon_scope_id "$target_scope")"
+}
+
 # ── airc_daemon_is_installed — yes/no probe across all supported OSes ──
 #
 # Returns:
@@ -42,14 +64,14 @@ airc_daemon_is_installed() {
   local os; os=$(detect_platform)
   case "$os" in
     darwin)
-      [ -f "$HOME/Library/LaunchAgents/com.cambriantech.airc.plist" ] && return 0 ;;
+      ls "$HOME"/Library/LaunchAgents/com.cambriantech.airc*.plist >/dev/null 2>&1 && return 0 ;;
     linux|wsl)
-      [ -f "$HOME/.config/systemd/user/airc.service" ] && return 0 ;;
+      ls "$HOME"/.config/systemd/user/airc*.service >/dev/null 2>&1 && return 0 ;;
     windows)
       # Same query cmd_daemon.sh:_daemon_installed uses. //v is the
       # MSYS-friendly form of /v (the leading // gets stripped down to
       # / by the MSYS path-mangling shim).
-      reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" //v airc-monitor >/dev/null 2>&1 && return 0 ;;
+      reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" 2>/dev/null | grep -q 'airc-monitor' && return 0 ;;
   esac
   return 1
 }
@@ -88,23 +110,29 @@ airc_daemon_is_installed_for_scope() {
   local os; os=$(detect_platform)
   case "$os" in
     darwin)
-      local plist_path="$HOME/Library/LaunchAgents/com.cambriantech.airc.plist"
-      [ -f "$plist_path" ] || return 1
-      local got
-      got=$(plutil -extract EnvironmentVariables.AIRC_HOME raw "$plist_path" 2>/dev/null)
-      [ "$got" = "$target_scope" ] && return 0
+      local service; service=$(airc_daemon_service_name_for_scope "$target_scope")
+      local plist_path
+      for plist_path in "$HOME/Library/LaunchAgents/${service}.plist" "$HOME/Library/LaunchAgents/com.cambriantech.airc.plist"; do
+        [ -f "$plist_path" ] || continue
+        local got
+        got=$(plutil -extract EnvironmentVariables.AIRC_HOME raw "$plist_path" 2>/dev/null)
+        [ "$got" = "$target_scope" ] && return 0
+      done
       return 1
       ;;
     linux|wsl)
-      local unit_path="$HOME/.config/systemd/user/airc.service"
-      [ -f "$unit_path" ] || return 1
+      local unit; unit=$(airc_daemon_unit_name_for_scope "$target_scope")
+      local unit_path
+      for unit_path in "$HOME/.config/systemd/user/$unit" "$HOME/.config/systemd/user/airc.service"; do
+        [ -f "$unit_path" ] || continue
       # Fixed-string match (Copilot #422 review caught regex injection):
       # target_scope contains '.' and other regex metacharacters
       # (paths like '/Users/.../.airc/.airc'); the prior ERE form
       # only escaped '/' which let '.airc' false-match. Two passes
       # cover both quoted and unquoted forms emitted by cmd_daemon.sh.
-      grep -qF "Environment=\"AIRC_HOME=${target_scope}\"" "$unit_path" && return 0
-      grep -qF "Environment=AIRC_HOME=${target_scope}"     "$unit_path" && return 0
+        grep -qF "Environment=\"AIRC_HOME=${target_scope}\"" "$unit_path" && return 0
+        grep -qF "Environment=AIRC_HOME=${target_scope}"     "$unit_path" && return 0
+      done
       return 1
       ;;
     windows)
@@ -112,9 +140,12 @@ airc_daemon_is_installed_for_scope() {
       # Extract registered launcher cmd line. Format from cmd_daemon.sh:
       # `cmd /c start "" /MIN "<scope_win>\airc-daemon.bat"`.
       local got_value
-      got_value=$(reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" //v airc-monitor 2>/dev/null \
+      local entry_name; entry_name=$(airc_daemon_run_entry_for_scope "$target_scope")
+      local values
+      values=$( { reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" //v "$entry_name" 2>/dev/null; \
+                  reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" //v airc-monitor 2>/dev/null; } \
                   | awk -F'    ' '/REG_SZ/ {print $NF}')
-      [ -n "$got_value" ] || return 1
+      [ -n "$values" ] || return 1
       # Need _to_win_path from platform_adapters.sh. Both install.sh and
       # the airc lib-dir resolver source platform_adapters before this
       # file. If somehow absent (atypical), fall back to a substring
@@ -129,16 +160,17 @@ airc_daemon_is_installed_for_scope() {
       local target_bat_unix="$target_scope/airc-daemon.bat"
       # Match either path representation in the registered cmd line.
       # Windows form is what cmd_daemon writes, but defense-in-depth.
-      case "$got_value" in
+      while IFS= read -r got_value; do
+        [ -z "$got_value" ] && continue
+        case "$got_value" in
         *"$target_bat_win"*)
           [ -f "$target_bat_unix" ] && return 0
-          return 1
           ;;
         *"$target_bat_unix"*)
           [ -f "$target_bat_unix" ] && return 0
-          return 1
           ;;
-      esac
+        esac
+      done <<< "$values"
       return 1
       ;;
   esac
@@ -159,10 +191,14 @@ airc_daemon_is_running_for_scope() {
   local os; os=$(detect_platform)
   case "$os" in
     darwin)
+      local service; service=$(airc_daemon_service_name_for_scope "$target_scope")
+      launchctl list 2>/dev/null | awk '{print $3}' | grep -qFx "$service" && return 0
       launchctl list 2>/dev/null | awk '{print $3}' | grep -qFx "com.cambriantech.airc" && return 0
       return 1
       ;;
     linux|wsl)
+      local unit; unit=$(airc_daemon_unit_name_for_scope "$target_scope")
+      systemctl --user is-active --quiet "$unit" 2>/dev/null && return 0
       systemctl --user is-active --quiet airc.service 2>/dev/null && return 0
       return 1
       ;;
