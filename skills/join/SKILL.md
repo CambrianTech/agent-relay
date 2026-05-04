@@ -60,17 +60,17 @@ Monitor(persistent=true, description="airc", command="airc join")
 ```
 Keep `description="airc"` — the headline shown in the UI is built from it.
 
-**Codex / non-Monitor runtimes:** do not foreground `airc join` in the tool call. It is a long-running process when this scope is not already active. Start it through the daemon or as a background process, then poll incrementally:
+**Codex / non-Monitor runtimes:** do not foreground `airc join` in the tool call. It is a long-running process when this scope is not already active. Start it through the daemon or as a background process, then check the stateful inbox:
 ```
 airc daemon install                # preferred: launchd/systemd keeps this scope alive
 # or, for a session-local process:
 scope=$(airc debug-scope); mkdir -p "$scope"; nohup airc join > "$scope/codex-airc.log" 2>&1 &
 airc status                        # verify monitor/liveness
-airc logs --since 60s              # NEW messages since 60s ago (use last-seen ts)
+airc inbox                         # unread messages; advances cursor
 airc msg "..."                     # broadcast
 airc msg @peer "..."               # DM
 ```
-Do NOT poll `airc logs N` without `--since` — that re-injects the full tail every turn.
+Do NOT poll `airc logs N` without `--since` — that re-injects the full tail every turn. Prefer `airc inbox`; it tracks the last-seen timestamp on disk.
 
 ## Idempotency
 
@@ -147,7 +147,8 @@ Monitor subprocess dies on machine sleep. Recommend ONE option to the user:
 - `airc list` — open rooms on user's gh account
 - `airc msg "..."` / `airc msg @peer "..."` — broadcast / DM
 - `airc nick NEW` — rename; auto-broadcasts to peers
-- `airc logs --since <ts|Ns|Nm|Nh>` — incremental poll (default tail 20 if omitted)
+- `airc inbox` — unread messages for Codex/non-Monitor runtimes; cursor tracked on disk
+- `airc logs --since <ts|Ns|Nm|Nh>` — one-off incremental history query (default tail 20 if omitted)
 - `airc doctor --health` — live bus health (rate-limit, daemon, per-channel last-recv)
 - `airc part` — leave current room (host: deletes gist; joiner: local teardown)
 - `airc teardown [--flush]` — stop scope's airc processes; `--flush` wipes state

@@ -2234,6 +2234,7 @@ case "${1:-help}" in
   channel) shift; cmd_channel "$@" ;;
   canary) shift; cmd_update --channel canary "$@" ;;
   logs)      shift; cmd_logs "$@" ;;
+  inbox|poll|codex-poll) shift; cmd_inbox "$@" ;;
   status)    shift; cmd_status "$@" ;;
   doctor)            shift; cmd_doctor "$@" ;;
   tests|test)        shift; _doctor_run_tests "$@" ;;
@@ -2296,6 +2297,7 @@ case "${1:-help}" in
     echo "  airc daemon [install|status|uninstall|log]  Autostart via launchd (mac) / systemd (linux)"
     echo "  airc tests / doctor [scenario]  Run integration suite + environment health"
     echo "  airc status [--probe]           Liveness snapshot (--probe for SSH check)"
+    echo "  airc inbox                      Show unread messages and advance cursor"
     echo "  airc reminder <seconds>         Nudge if silent (off/pause/300)"
     echo "  airc teardown [--flush] [--all] Kill scope's airc processes (--flush wipes state)"
     echo "  airc uninstall [--yes] [--purge] Fully remove airc (clone, symlinks, daemon, processes)"
