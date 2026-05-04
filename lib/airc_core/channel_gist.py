@@ -673,6 +673,26 @@ def resolve(channel: str, create_if_missing: bool = False, require_invite: bool 
     return None
 
 
+def host_preflight(channel: str) -> tuple[str, Optional[str]]:
+    """Return the host bootstrap decision for a channel.
+
+    - ("existing", gid): use this canonical gist.
+    - ("blocked", None): discovery was unavailable; do not create.
+    - ("create", None): discovery was trusted and no gist exists.
+
+    Host bootstrap writes a richer invite envelope than create_new(), so
+    bash still owns the actual gist create. This helper owns the safety
+    decision so a failed GitHub listing cannot be mistaken for an empty
+    account.
+    """
+    existing = find_existing(channel)
+    if existing:
+        return "existing", existing
+    if gh_backoff.backoff_active() or _LAST_GIST_LIST_UNAVAILABLE:
+        return "blocked", None
+    return "create", None
+
+
 # ── CLI entry — bash invokes this from cmd_connect / cmd_subscribe ──
 
 def _cli() -> int:
@@ -689,6 +709,9 @@ def _cli() -> int:
     f.add_argument("--channel", required=True)
     f.add_argument("--require-invite", action="store_true")
 
+    hp = sub.add_parser("host-preflight", help="Print existing gist id, or exit 2 when discovery is unavailable")
+    hp.add_argument("--channel", required=True)
+
     args = parser.parse_args()
 
     if args.cmd == "resolve":
@@ -702,6 +725,14 @@ def _cli() -> int:
         if gid:
             print(gid)
             return 0
+        return 1
+    if args.cmd == "host-preflight":
+        decision, gid = host_preflight(args.channel)
+        if decision == "existing" and gid:
+            print(gid)
+            return 0
+        if decision == "blocked":
+            return 2
         return 1
     return 1
 
