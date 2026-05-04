@@ -69,10 +69,17 @@ ensure_channel_subscribed_with_gist() {
     return 1
   fi
 
-  # 2. Resolve-or-create the canonical gist on this gh account.
+  # 2. Resolve-or-create the canonical gist on this gh account. If this
+  # scope already knows the channel→gist mapping, trust that first: a
+  # daemon restart must not block on GitHub discovery just to re-subscribe
+  # to a room that is already in config.
   local _gid
-  _gid=$("$AIRC_PYTHON" -m airc_core.channel_gist resolve \
-         --channel "$channel" --create-if-missing 2>"$_err")
+  _gid=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist \
+         --config "$CONFIG" --channel "$channel" 2>/dev/null || true)
+  if [ -z "$_gid" ]; then
+    _gid=$("$AIRC_PYTHON" -m airc_core.channel_gist resolve \
+           --channel "$channel" --create-if-missing 2>"$_err")
+  fi
   if [ -z "$_gid" ]; then
     echo "  ⚠ Could not resolve gist for #${channel}:" >&2
     [ -s "$_err" ] && sed 's/^/      /' "$_err" >&2

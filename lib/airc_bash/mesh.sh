@@ -54,6 +54,14 @@ _mesh_find() {
     channel=$("$AIRC_PYTHON" -m airc_core.config default_channel --config "$CONFIG" 2>/dev/null || true)
   fi
   [ -z "$channel" ] && channel="general"
+  if [ -n "${CONFIG:-}" ] && [ -f "$CONFIG" ]; then
+    local configured
+    configured=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist --config "$CONFIG" --channel "$channel" 2>/dev/null || true)
+    if [ -n "$configured" ]; then
+      printf '%s\n' "$configured"
+      return 0
+    fi
+  fi
   "$AIRC_PYTHON" -m airc_core.channel_gist find --channel "$channel" --require-invite 2>/dev/null || true
 }
 
@@ -68,6 +76,14 @@ _mesh_find_any() {
     channel=$("$AIRC_PYTHON" -m airc_core.config default_channel --config "$CONFIG" 2>/dev/null || true)
   fi
   [ -z "$channel" ] && channel="general"
+  if [ -n "${CONFIG:-}" ] && [ -f "$CONFIG" ]; then
+    local configured
+    configured=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist --config "$CONFIG" --channel "$channel" 2>/dev/null || true)
+    if [ -n "$configured" ]; then
+      printf '%s\n' "$configured"
+      return 0
+    fi
+  fi
   "$AIRC_PYTHON" -m airc_core.channel_gist find --channel "$channel" 2>/dev/null || true
 }
 
