@@ -287,8 +287,37 @@ scaffold_identity() {
     # sets this env at startup; tests calling python directly need
     # the same setup.
     local _lib_dir; _lib_dir=$(cd "$(dirname "$AIRC")/lib" 2>/dev/null && pwd)
+    # Walk the same venv-then-system fallback airc itself uses for
+    # AIRC_PYTHON — bootstrap-ed25519 needs the cryptography module,
+    # which install.sh installs into .venv but isn't always present in
+    # the harness's bare python3. Pre-fix: ${AIRC_PYTHON:-python3}
+    # silently fell back to system python with `2>/dev/null` swallowing
+    # the resulting ImportError, so private.pem was never written and
+    # any later signing op failed with [Errno 2] ENOENT — caller got
+    # an opaque "ed25519 sign failed" instead of "cryptography missing."
+    # Per CLAUDE.md "never swallow errors" (Joel 2026-05-04 directive
+    # via Codex relay): probe for a working python, let stderr through,
+    # fail loudly if none available.
+    local _py=""
+    for _candidate in \
+        "${AIRC_PYTHON:-}" \
+        "$HOME/.airc-src/.venv/bin/python" \
+        "$HOME/.airc-src/.venv/bin/python3" \
+        "$(cd "$(dirname "$AIRC")" && pwd)/.venv/bin/python" \
+        "$(cd "$(dirname "$AIRC")" && pwd)/.venv/bin/python3" \
+        "$(command -v python3 || true)"; do
+      [ -n "$_candidate" ] && [ -x "$_candidate" ] || continue
+      if "$_candidate" -c "import cryptography" 2>/dev/null; then
+        _py="$_candidate"
+        break
+      fi
+    done
+    if [ -z "$_py" ]; then
+      echo "scaffold_identity: no python with cryptography importable; install.sh's .venv covers this in production" >&2
+      return 1
+    fi
     PYTHONPATH="${_lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
-      "${AIRC_PYTHON:-python3}" -m airc_core.identity bootstrap-ed25519 --dir "$identity_dir" 2>/dev/null
+      "$_py" -m airc_core.identity bootstrap-ed25519 --dir "$identity_dir"
   fi
 }
 
@@ -1951,9 +1980,18 @@ JSON
     && pass "stderr correctly distinguishes absent vs stale pidfile" \
     || fail "stderr doesn't say 'absent' for missing pidfile"
 
-  # Negative control: with a live PID in the pidfile, send should NOT die
-  # on this check. Use $$ — the test harness's own PID, definitely alive.
-  echo $$ > "$home/airc.pid"
+  # Negative control: with an airc-SHAPED live PID in the pidfile, send
+  # should NOT die on this check. Pre-fix used $$ (the test harness's
+  # own PID) — fine under bare kill -0 semantics, but #447 hardened the
+  # check to also verify cmdline shape (PID-reuse defense after sleep/
+  # wake), which CORRECTLY rejects `bash test/integration.sh` as
+  # not-airc-shaped. Now spawn a fake whose argv[0] matches the
+  # /airc[[:space:]]+(connect|join)/ regex via `exec -a`. The actual
+  # binary is sleep, but ps -o command= shows "airc connect …" and
+  # _monitor_alive_with_bearer_fallback accepts it.
+  ( exec -a "airc connect" sleep 60 ) &
+  local fake_airc_pid=$!
+  echo "$fake_airc_pid" > "$home/airc.pid"
   AIRC_HOME="$home" "$AIRC" msg "live monitor probe ascii" >"$out" 2>"$err"
   rc=$?
   [ "$rc" = "0" ] \
@@ -1962,6 +2000,7 @@ JSON
   grep -q 'live monitor probe ascii' "$home/messages.jsonl" \
     && pass "live-pid scope: message appended to local log as expected" \
     || fail "live-pid scope: message NOT in log despite rc=0 (log=$(cat "$home/messages.jsonl" 2>/dev/null))"
+  kill "$fake_airc_pid" 2>/dev/null || true
 
   rm -f "$out" "$err"
   rm -rf /tmp/airc-it-sdmd
@@ -3826,9 +3865,35 @@ scenario_e2e_encryption() {
   # test — if this passes, end-to-end encryption works through real
   # paired SSH (the same path coworkers will use).
   #
-  # Skip-guards on the dev venv being available. CI without the venv
-  # falls through cleanly and the rest of the suite runs.
+  # Architectural debt — SKIPPED with explicit reason rather than
+  # silent fall-through.
+  #
+  # Pre-fix: gated on a `.venv-dev` next to $AIRC that install.sh does
+  # not create (install.sh creates `.venv` inside its install dest,
+  # typically $HOME/.airc-src). Result: silently skipping every CI run
+  # despite the suite saying it ran. When the gate is fixed, the test
+  # ITSELF fails because it was written when SSH was a registered
+  # bearer — Phase E / post-3c removed the SSH bearer entirely
+  # (bearer_resolver.available_kinds is gh + LocalBearer only); this
+  # test's send path errors with "no registered bearer can serve
+  # peer_meta={…host_target: 'user@host'…}" and the wire falls back
+  # to plaintext gh-substrate, breaking the "wire is ciphertext"
+  # assertion.
+  #
+  # The fix is a real rewrite — verify envelope encryption end-to-end
+  # via the gh-substrate path (the only one that exists now), not the
+  # legacy SSH-pair path. Until that lands, skipping with the real
+  # reason is honest (per CLAUDE.md "never swallow errors") — the
+  # previous `.venv-dev`-not-found gate was silently hiding this.
+  #
+  # Joel's directive 2026-05-04: "could remedy rather than flaking
+  # out." This is the loud-skip step en route to the rewrite.
   section "e2e encryption: wire is ciphertext, receiver decrypts to plaintext"
+  echo "  (skipped — test uses removed SSH-bearer transport path; needs rewrite to verify envelope encryption via gh substrate. Tracking: airc Phase E test debt.)"
+  return
+
+  # ── Below is the original SSH-bearer-based test, kept for context
+  # ── on the rewrite (preserved verbatim).
 
   local _venv="$(cd "$(dirname "$AIRC")" && pwd)/.venv-dev"
   if [ ! -x "$_venv/bin/python" ] && [ ! -x "$_venv/bin/python3" ]; then
