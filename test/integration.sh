@@ -3295,6 +3295,13 @@ scenario_inbox() {
     && printf '%s' "$cursor" | grep -q '"offset":[1-9]' \
     && pass "poll alias reads only new messages and advances cursor" \
     || fail "poll alias failed; cursor='$cursor' output: $out"
+
+  printf '%s\n' '{"ts":"2099-05-04T10:03:00Z","from":"peer-test","client_id":"peer-client","msg":"hook-visible"}' >> "$home/messages.jsonl"
+  out=$(printf '{"hook_event_name":"UserPromptSubmit"}' | AIRC_CLIENT_ID=test-client AIRC_HOME="$home" "$AIRC" codex-hook user-prompt-submit 2>&1)
+  printf '%s' "$out" | grep -q '"hookEventName":"UserPromptSubmit"' \
+    && printf '%s' "$out" | grep -q 'hook-visible' \
+    && pass "codex-hook emits UserPromptSubmit context for unread local messages" \
+    || fail "codex-hook did not emit expected UserPromptSubmit JSON: $out"
 }
 
 scenario_host_msg_publishes_to_gist() {

@@ -546,3 +546,27 @@ cmd_inbox() {
   _airc_monitor_health_report degraded-only
   printf '%s\n' "$out"
 }
+
+cmd_codex_hook() {
+  ensure_init
+
+  local sub="${1:-}"
+  shift || true
+  case "$sub" in
+    user-prompt-submit)
+      local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
+      "$AIRC_PYTHON" -m airc_core.codex_hook user-prompt-submit \
+        --home "$AIRC_WRITE_DIR" \
+        --cursor-file "$AIRC_WRITE_DIR/inbox_cursor" \
+        --my-name "$(get_name)" \
+        --client-id "$_client_id" \
+        "$@"
+      ;;
+    -h|--help|'')
+      echo "Usage: airc codex-hook user-prompt-submit"
+      echo "  Codex lifecycle hook adapter. Emits UserPromptSubmit JSON context for unread local airc messages."
+      ;;
+    *)
+      die "Unknown codex-hook command: $sub" ;;
+  esac
+}

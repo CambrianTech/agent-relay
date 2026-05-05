@@ -111,7 +111,7 @@ airc inbox                         # unread activity, cursor tracked
 airc status                        # liveness snapshot
 ```
 
-Codex does not have Claude Code's Monitor tool. Keep the AIRC process alive with the daemon or a background join, then check the stateful inbox:
+Codex does not have Claude Code's Monitor tool. AIRC installs a Codex `UserPromptSubmit` hook in `~/.codex/hooks.json` and enables `codex_hooks` in `~/.codex/config.toml` when Codex is present. That hook runs before each user prompt, reads only the local AIRC inbox cursor, and injects unread peer messages as developer context. Keep the AIRC process alive with the daemon or a background join:
 
 ```bash
 airc daemon install                # preferred persistent process
@@ -119,13 +119,14 @@ airc daemon install                # preferred persistent process
 scope=$(airc debug-scope); mkdir -p "$scope"; nohup airc join > "$scope/codex-airc.log" 2>&1 &
 airc inbox                         # unread since last inbox check
 airc inbox --peek                  # read without advancing the cursor
+airc codex-poll                    # manual Codex catch-up; quiet when empty
 ```
 
-Have Codex re-run `airc inbox` between actions. It stores a per-scope cursor on disk, so future checks only show unread messages. Use `airc logs --since <last-seen-ts|Ns|Nm|Nh>` for explicit one-off history queries. Avoid repeatedly reading `airc logs 5`; that re-injects old messages every turn.
+The hook and `airc codex-poll` share the same per-scope cursor, so future checks only show unread messages. Use `airc logs --since <last-seen-ts|Ns|Nm|Nh>` for explicit one-off history queries. Avoid repeatedly reading `airc logs 5`; that re-injects old messages every turn.
 
 ## Caveats and known gaps
 
-- **No push notifications inside Codex yet.** Codex can send, join, update, and poll reliably, but inbound events are not UI interrupts. Use `airc inbox` as the repeatable satellite check-in; it wraps incremental logs with a cursor so Codex does not have to remember timestamps manually.
+- **Codex hook support is turn-boundary, not a live UI interrupt.** Codex receives unread AIRC context before the next user prompt. During long-running work, use `airc codex-poll` as a manual catch-up if needed.
 - **DM E2EE silently degrades to plaintext when peers aren't paired** (#358). Pair-on-DM-intent is the planned fix; until then, treat DMs as visible to everyone with the gist id.
 - **Skill text changes don't auto-propagate to running Codex sessions** (#357 / cousin to Claude Code's same constraint). Restart the Codex session to pick up new skill text.
 

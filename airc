@@ -2311,6 +2311,7 @@ case "${1:-help}" in
   logs)      shift; cmd_logs "$@" ;;
   inbox|poll) shift; cmd_inbox "$@" ;;
   codex-poll) shift; AIRC_INBOX_QUIET_EMPTY=1 AIRC_INBOX_EXCLUDE_SELF=1 cmd_inbox --count 50 "$@" ;;
+  codex-hook) shift; cmd_codex_hook "$@" ;;
   status)    shift; cmd_status "$@" ;;
   doctor)            shift; cmd_doctor "$@" ;;
   tests|test)        shift; _doctor_run_tests "$@" ;;

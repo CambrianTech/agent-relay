@@ -785,6 +785,46 @@ if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
   _install_airc_codex_developer_instructions
 fi
 
+# ── Codex lifecycle hook for local AIRC inbox injection ────────────────
+# Newer Codex CLI builds can run deterministic hooks at turn boundaries.
+# Install a UserPromptSubmit hook so unread airc messages become
+# developer context before each user prompt reaches the model. This is
+# the closest Codex equivalent to Claude Code's Monitor notifications:
+# no GitHub calls, no log-tail polling in the model, and no dependence
+# on the agent remembering the turn contract.
+
+_install_airc_codex_hooks() {
+  [ "${AIRC_SKIP_CODEX_HOOKS:-0}" = "1" ] && return 0
+  [ -f "$HOME/.codex/config.toml" ] || return 0
+
+  local _python="${_airc_venv_python_bin:-}"
+  if [ -z "$_python" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+      _python=python3
+    elif command -v python >/dev/null 2>&1; then
+      _python=python
+    else
+      warn "Could not install Codex AIRC hook: python not found"
+      return 0
+    fi
+  fi
+
+  local out
+  if out=$(PYTHONPATH="$CLONE_DIR/lib${PYTHONPATH:+:$PYTHONPATH}" "$_python" -m airc_core.codex_install --codex-home "$HOME/.codex" install-hooks 2>&1); then
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out" | while IFS= read -r line; do
+        ok "Codex AIRC hook: $line"
+      done
+    fi
+  else
+    warn "Could not install Codex AIRC hook: $out"
+  fi
+}
+
+if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
+  _install_airc_codex_hooks
+fi
+
 # ── Codex GH_TOKEN env injection ───────────────────────────────────────
 # Codex's sandbox can't reliably reach the macOS Keychain to validate
 # gh's stored token. Result: gh auth status flakes between ✓ and X
