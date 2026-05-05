@@ -52,6 +52,22 @@ cmd_daemon() {
   local action="${1:-status}"
   shift 2>/dev/null || true
   case "$action" in
+    -h|--help|help|status|log|logs)
+      echo "airc daemon is deprecated. Use 'airc join' to connect and 'airc quit' to disconnect."
+      echo "If a legacy background registration exists, remove it with: airc daemon uninstall"
+      return 0 ;;
+    uninstall|remove)
+      cmd_daemon_uninstall "$@"
+      return $? ;;
+    install|restart|start|stop|*)
+      die "airc daemon is deprecated. Use 'airc join' to connect. Background service registration is disabled." ;;
+  esac
+}
+
+cmd_daemon_legacy() {
+  local action="${1:-status}"
+  shift 2>/dev/null || true
+  case "$action" in
     -h|--help|help)
       echo "Usage: airc daemon [install|uninstall|restart|status|log]"
       echo "  install     register OS auto-restart (launchd/systemd/schtasks)"

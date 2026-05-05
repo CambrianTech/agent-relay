@@ -1243,7 +1243,7 @@ _monitor_multi_channel() {
     # Re-read channel_map from config at top of each outer cycle so
     # an in-flight config change (e.g. _mesh_rediscover_loop swapping
     # the host gist after rotation) takes effect on the next bearer
-    # respawn, no full daemon restart required. Falls back to the
+    # respawn, no full process restart required. Falls back to the
     # parameter passed at startup if the re-read returns empty
     # (transient config-write race or missing list_channel_gists
     # support on older airc_core).
@@ -1433,18 +1433,8 @@ _monitor_multi_channel() {
       consecutive_timeouts=0
     fi
     if [ "$consecutive_timeouts" -ge "$ESCALATE_AFTER" ]; then
-      local _daemon_present=0
-      if command -v airc_daemon_is_running_for_scope >/dev/null 2>&1 \
-         && airc_daemon_is_running_for_scope "$AIRC_WRITE_DIR" 2>/dev/null; then
-        _daemon_present=1
-      fi
       echo ""
-      if [ "$_daemon_present" = "1" ]; then
-        echo "airc: mesh disconnected ($consecutive_timeouts cycles); daemon restart will self-heal"
-      else
-        echo "airc: mesh disconnected ($consecutive_timeouts cycles); NO DAEMON running, restart with: airc join"
-        echo "airc:   (for auto-recovery: airc daemon restart || airc daemon install)"
-      fi
+      echo "airc: mesh disconnected ($consecutive_timeouts cycles); restart with: airc join"
       exit 99
     fi
     sleep 3
@@ -1557,20 +1547,9 @@ monitor() {
       if [ "$consecutive_timeouts" -ge "$ESCALATE_AFTER" ]; then
         local saved_room=""
         [ -f "$AIRC_WRITE_DIR/room_name" ] && saved_room=$(cat "$AIRC_WRITE_DIR/room_name" 2>/dev/null)
-        local _daemon_present=0
-        if command -v airc_daemon_is_running_for_scope >/dev/null 2>&1 \
-           && airc_daemon_is_running_for_scope "$AIRC_WRITE_DIR" 2>/dev/null; then
-          _daemon_present=1
-        fi
         echo ""
-        if [ "$_daemon_present" = "1" ]; then
-          echo "airc: mesh disconnected — #${saved_room:-?} dead $consecutive_timeouts cycles; daemon restart will self-heal"
-          echo "  ⚠  Exiting airc join — daemon restart will trigger self-heal" >&2
-        else
-          echo "airc: mesh disconnected — #${saved_room:-?} dead $consecutive_timeouts cycles; NO DAEMON running, restart with: airc join"
-          echo "airc:   (for auto-recovery: airc daemon restart || airc daemon install)"
-          echo "  ⚠  Exiting airc join — NO DAEMON running; rerun 'airc join' to reconnect" >&2
-        fi
+        echo "airc: mesh disconnected — #${saved_room:-?} dead $consecutive_timeouts cycles; restart with: airc join"
+        echo "  ⚠  Exiting airc join — rerun 'airc join' to reconnect" >&2
         exit 99
       fi
       sleep 3

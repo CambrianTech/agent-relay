@@ -60,6 +60,7 @@ class AutoPongTests(unittest.TestCase):
         # Capture stdout to keep test output clean.
         with mock.patch.object(mf.sys, "stdin", io.StringIO(body)), \
              mock.patch.object(mf.sys, "stdout", io.StringIO()), \
+             mock.patch.object(mf, "current_client_id", return_value="test-client"), \
              mock.patch("subprocess.Popen", _FakePopen):
             mf.run("alice", self._peers)
 

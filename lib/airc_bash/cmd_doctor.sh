@@ -481,28 +481,18 @@ _doctor_health() {
     fi
   fi
 
-  # ── Daemon installed/running-for-this-scope check. Pre-fix probed for a
-  # `daemon.pid` file that the daemon launcher never writes anywhere
-  # (Copilot caught this on PR #422 review — `--health` always reported
-  # "not installed" even when the daemon was running). Use the canonical
-  # detector (`airc_daemon_is_installed_for_scope`) which checks the
-  # registered launchd plist / systemd unit / HKCU Run entry, then a
-  # separate running probe. Installed-on-disk is not liveness: Joel hit
-  # a scope with a valid plist, no launchctl job loaded, and stale
-  # bearer state. That must be loud.
+  # ── Legacy daemon registration check. Daemon is deprecated; surface
+  # stale installed units only so users can remove them. Do not suggest
+  # installing a new background service.
   if command -v airc_daemon_is_installed_for_scope >/dev/null 2>&1 \
      && airc_daemon_is_installed_for_scope "$AIRC_WRITE_DIR" 2>/dev/null; then
     if command -v airc_daemon_is_running_for_scope >/dev/null 2>&1 \
        && airc_daemon_is_running_for_scope "$AIRC_WRITE_DIR" 2>/dev/null; then
-      printf "  [ok] daemon loaded for this scope\n"
+      printf "  [WARN] legacy daemon loaded for this scope (deprecated; use airc join)\n"
     else
-      printf "  [BLOCKED] daemon installed for this scope but NOT loaded/running\n"
-      printf "           Fix: airc join  (repairs this scope's daemon/monitor)\n"
-      issues=$((issues+1))
+      printf "  [WARN] legacy daemon installed for this scope but not loaded (deprecated)\n"
     fi
-  else
-    printf "  [info] daemon not installed (substrate runs in-shell only)\n"
-    printf "         Optional: airc daemon install  (survives sleep/crash, see README → Optional layers)\n"
+    printf "         Remove: airc daemon uninstall\n"
   fi
 
   # ── Per-channel bearer health. bearer_state.<channel>.json's last_recv_ts
