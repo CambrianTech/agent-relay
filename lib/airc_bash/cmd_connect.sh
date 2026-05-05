@@ -766,7 +766,7 @@ cmd_connect() {
   # local message stream. This is not an OS daemon; it is the same
   # project-scope airc process `airc quit`/`airc teardown` manage.
   if [ "$attach" = "1" ] && [ "${AIRC_NO_ATTACH:-0}" != "1" ]; then
-    _join_spawn_transport_for_attach "${_orig_args[@]}"
+    _join_spawn_transport_for_attach ${_orig_args[@]+"${_orig_args[@]}"}
     return $?
   fi
 
