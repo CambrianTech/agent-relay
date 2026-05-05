@@ -218,37 +218,6 @@ _join_spawn_transport_for_attach() {
       *) _spawn_args+=("$_arg") ;;
     esac
   done
-  # Detach the transport from the launcher shell's session so SIGHUP from
-  # parent exit doesn't cascade. On Windows + Claude Code Monitor (where
-  # the launcher is `wsl bash -lc 'airc join --attach'`), the wsl/bash
-  # wrapper exits ~immediately after spawning the background subshell;
-  # without HUP-protection every `( ... ) &` child in the join tree (the
-  # accept-loop, reminder-timer, mesh-rediscover, bearer_cli recv loops)
-  # gets SIGHUP'd by the kernel as the controlling-terminal session
-  # leader dies. From outside it looks like "airc join started, wrote
-  # pidfile, then went silent" — exactly the trace pattern in #511
-  # update 6 / Windows retest on 65adceb (transport-log mtime stops at
-  # the moment the launcher returned, no fresh writes).
-  #
-  # Approach: ignore SIGHUP in the subshell BEFORE exec'ing airc-self.
-  # POSIX semantics: a process started with SIGHUP set to SIG_IGN keeps
-  # SIG_IGN across exec() AND across fork() — every grandchild
-  # (handshake accept_one, bearer_cli recv loops, reminder timer,
-  # rediscover loop) inherits the same disposition unless it explicitly
-  # installs its own handler. Python's runtime resets SIG_DFL for many
-  # signals but PRESERVES SIG_IGN for SIGHUP unless code overrides it,
-  # so the python sidecars survive too.
-  #
-  # This keeps the watchdog at the bottom of the function intact:
-  # `kill -0 "$_transport_pid"` still tracks the wrapper subshell, and
-  # `_monitor_alive_with_bearer_fallback` reads airc.pid which airc
-  # writes after spawn. Both stay valid because the subshell does
-  # survive the parent shell's exit now.
-  #
-  # Mac's existing path doesn't hit this because Mac's launcher is a
-  # foreground bash that holds children alive until the user closes the
-  # tab — the subshell never receives SIGHUP. The trap is harmless
-  # there.
   # Detach the transport into its own session+pgroup so SIGHUP from the
   # launcher's session leader exit doesn't cascade. On Windows + Claude
   # Code Monitor (`wsl bash -lc 'airc join --attach'`) the launcher
