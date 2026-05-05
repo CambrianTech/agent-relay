@@ -2027,6 +2027,18 @@ PY
   grep -q 'live monitor probe ascii' "$home/messages.jsonl" \
     && pass "live-pid scope: message appended to local log as expected" \
     || fail "live-pid scope: message NOT in log despite rc=0 (log=$(cat "$home/messages.jsonl" 2>/dev/null))"
+  python3 - <<PY
+import json, sys
+for line in open("$home/messages.jsonl"):
+    obj = json.loads(line)
+    if obj.get("msg") == "live monitor probe ascii":
+        if obj.get("client_id") and obj.get("sig"):
+            sys.exit(0)
+sys.exit(1)
+PY
+  [ "$?" = "0" ] \
+    && pass "client_id send line is valid JSON with sig" \
+    || fail "client_id send line is malformed JSON or missing fields: $(tail -1 "$home/messages.jsonl" 2>/dev/null)"
   kill "$fake_airc_pid" 2>/dev/null || true
 
   rm -f "$out" "$err"
