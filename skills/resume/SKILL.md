@@ -14,7 +14,7 @@ Run this yourself — don't ask the user.
 
 Claude Code:
 ```
-Monitor(persistent=true, description="airc", command="airc join")
+Monitor(persistent=true, description="airc", command="airc join --attach")
 ```
 
 Codex / non-Monitor runtimes:
