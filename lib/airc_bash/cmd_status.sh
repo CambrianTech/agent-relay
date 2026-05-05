@@ -570,3 +570,26 @@ cmd_codex_hook() {
       die "Unknown codex-hook command: $sub" ;;
   esac
 }
+
+cmd_codex_start() {
+  ensure_init
+
+  local _log="$AIRC_WRITE_DIR/codex-airc.log"
+  "$AIRC_PYTHON" -m airc_core.codex_start \
+    --airc "$0" \
+    --home "$AIRC_WRITE_DIR" \
+    --log "$_log" \
+    -- "$@"
+
+  # Give the detached process a short startup window, then print the same
+  # useful local surfaces that `airc join` prints when it returns quickly.
+  sleep 2
+  echo ""
+  echo "Status"
+  echo "------"
+  cmd_status
+  echo ""
+  echo "Inbox"
+  echo "-----"
+  AIRC_INBOX_QUIET_EMPTY=1 AIRC_INBOX_EXCLUDE_SELF=1 cmd_inbox --count 10 || true
+}

@@ -19,12 +19,7 @@ Monitor(persistent=true, description="airc", command="airc join")
 
 Codex / non-Monitor runtimes:
 ```bash
-scope=$(airc debug-scope)
-mkdir -p "$scope"
-nohup airc join > "$scope/codex-airc.log" 2>&1 &
-sleep 2
-airc status
-airc inbox
+airc codex-start
 ```
 
 `airc join` with no args detects the stored pairing in this scope's config.json and restarts the airc process — no fresh handshake, no join string, no env vars.
