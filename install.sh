@@ -558,13 +558,15 @@ _install_airc_skills_into() {
   # this list omits it.)
   local old
   for old in "$skills_target"/relay-* "$skills_target"/monitor "$skills_target"/setup \
-             "$skills_target"/connect "$skills_target"/send "$skills_target"/rename "$skills_target"/disconnect; do
+             "$skills_target"/connect "$skills_target"/send "$skills_target"/rename "$skills_target"/disconnect \
+             "$skills_target"/inbox; do
     [ -L "$old" ] && rm "$old" 2>/dev/null
   done
 
   local skill_dir skill_name target
   for skill_dir in "$CLONE_DIR"/skills/*/; do
     [ -d "$skill_dir" ] || continue
+    [ -f "$skill_dir/SKILL.md" ] || continue
     skill_name="$(basename "$skill_dir")"
     target="$skills_target/$skill_name"
     # If the target is a real directory (from a pre-rename hand-install
