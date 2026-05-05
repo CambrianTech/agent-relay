@@ -2040,6 +2040,31 @@ PY
     && pass "client_id send line is valid JSON with sig" \
     || fail "client_id send line is malformed JSON or missing fields: $(tail -1 "$home/messages.jsonl" 2>/dev/null)"
   kill "$fake_airc_pid" 2>/dev/null || true
+  wait "$fake_airc_pid" 2>/dev/null || true
+
+  # #511 regression: on Windows/WSL via Claude Code Monitor, ps can show
+  # a pidfile-owned live wrapper as just "/path/to/airc" without preserving
+  # the join/connect argument. That still proves liveness when the PID came
+  # from this scope's pidfile and kill -0 succeeds. Also cover multi-PID
+  # host pidfiles where stale siblings surround the live wrapper.
+  ( exec -a "/home/joel/.local/bin/airc" sleep 60 ) &
+  fake_airc_pid=$!
+  printf '99999 %s\n88888\n' "$fake_airc_pid" > "$home/airc.pid"
+  AIRC_CLIENT_ID="test-client-wsl-monitor" AIRC_HOME="$home" "$AIRC" msg "wsl wrapper live monitor probe" >"$out" 2>"$err"
+  rc=$?
+  [ "$rc" = "0" ] \
+    && pass "WSL-style pidfile-owned airc wrapper satisfies monitor liveness" \
+    || fail "WSL-style airc wrapper incorrectly rejected (rc=$rc, stderr=$(cat "$err"))"
+  grep -q 'wsl wrapper live monitor probe' "$home/messages.jsonl" \
+    && pass "WSL-style live wrapper: message appended to local log" \
+    || fail "WSL-style live wrapper: message NOT in log (log=$(cat "$home/messages.jsonl" 2>/dev/null))"
+  local status_out
+  status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
+  echo "$status_out" | grep -qE "airc process:\s+AIRC background process running for scope \\(PID $fake_airc_pid\\)" \
+    && pass "status reports the verified live PID from a multi-PID pidfile" \
+    || fail "status did not report verified live PID $fake_airc_pid (got: $status_out)"
+  kill "$fake_airc_pid" 2>/dev/null || true
+  wait "$fake_airc_pid" 2>/dev/null || true
 
   rm -f "$out" "$err"
   rm -rf /tmp/airc-it-sdmd
