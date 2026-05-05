@@ -275,6 +275,21 @@ class MirrorDedupeTests(unittest.TestCase):
         self.assertNotIn("self echo", out)
         self.assertEqual(local_log.read_text(encoding="utf-8").count("already-local"), 1)
 
+    def test_own_client_message_is_mirrored_but_not_displayed(self):
+        msg = {
+            "from": "alice",
+            "to": "all",
+            "ts": "2026-05-05T05:42:03Z",
+            "channel": "general",
+            "msg": "own audit only",
+            "client_id": "test-client",
+            "sig": "own-client-sig",
+        }
+        out = self._run([msg])
+        self.assertNotIn("own audit only", out)
+        local_log = Path(self._scope) / "messages.jsonl"
+        self.assertEqual(local_log.read_text(encoding="utf-8").count("own-client-sig"), 1)
+
 
 class DisplayFilterLoudDropTests(unittest.TestCase):
     """#399 follow-up to #401: when monitor_formatter's display filter

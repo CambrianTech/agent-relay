@@ -25,6 +25,7 @@ import sys
 import time
 
 from airc_core.client_id import current_client_id
+from airc_core.log_append import append_unique_sig
 
 # Inactivity watchdog: if no inbound line arrives in WATCHDOG_SEC,
 # exit with a distinct code so the caller's while-loop reconnects.
@@ -484,13 +485,6 @@ def run(my_name: str, peers_dir: str) -> int:
             # is the stable envelope identity, so if it is already in the
             # local audit log, skip both mirror and display.
             continue
-        # Filter only this runtime's own sends. Multiple agents can share
-        # one .airc scope and therefore one nick; filtering by `from`
-        # hides same-scope collaborators. New sends may carry client_id
-        # from CODEX_THREAD_ID / CLAUDE_* / AIRC_CLIENT_ID; old messages
-        # without client_id are displayed rather than silently dropped.
-        if client_id and m.get("client_id") == client_id:
-            continue
         # Mirror inbound to local messages.jsonl. Post-3c (gh substrate)
         # the gist is the canonical source of truth for ALL peers — the
         # "host" no longer has a privileged local log that everyone tails
@@ -502,12 +496,20 @@ def run(my_name: str, peers_dir: str) -> int:
         # [PONG:uuid] and timed out forever) and any other reader of
         # the local audit trail.
         try:
-            with open(local_log, "a") as f:
-                f.write(line + "\n")
+            result = append_unique_sig(local_log, line)
             if isinstance(sig, str) and sig:
                 seen_sigs.add(sig)
+            if result == "skipped":
+                continue
         except Exception:
             pass
+        # Filter only this runtime's own sends from display, not from the
+        # audit log. Multiple agents can share one .airc scope and therefore
+        # one nick; filtering by `from` hides same-scope collaborators. New
+        # sends may carry client_id from CODEX_THREAD_ID / CLAUDE_* /
+        # AIRC_CLIENT_ID; old messages without client_id are displayed.
+        if client_id and m.get("client_id") == client_id:
+            continue
         # Rotate every ~100 mirrored lines. Without this, local logs
         # grow forever (Joel's audit 2026-04-28).
         if (offset_counter % 100) == 0:
