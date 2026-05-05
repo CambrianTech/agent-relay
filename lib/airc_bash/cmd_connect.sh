@@ -313,14 +313,11 @@ cmd_connect() {
   done
   set -- "${positional[@]+"${positional[@]}"}"
 
-  # Defense against cached older Claude skills: some running sessions
-  # still invoke plain `airc join` inside a Monitor even after the
-  # on-disk skill was updated to `airc join --attach`. In daemon-repair
-  # paths plain join returns after bootstrapping the daemon, which makes
-  # the visible Monitor task end. If the parent chain is Claude Code,
-  # treat the invocation as UI attach mode. Codex/non-Monitor runtimes
-  # keep the documented quick-return behavior unless they explicitly set
-  # AIRC_ATTACH=1.
+  # Plain `airc join` is the public UX. If the parent chain is Claude
+  # Code, treat it as UI attach mode so a Monitor invocation remains a
+  # visible event stream when transport is already alive. Codex/non-
+  # Monitor runtimes keep the quick-return behavior unless they
+  # explicitly set AIRC_ATTACH=1.
   if [ "$attach" = "0" ]; then
     if [ "${AIRC_ATTACH:-0}" = "1" ] || _join_parent_chain_looks_like_claude_monitor; then
       attach=1
@@ -606,7 +603,7 @@ cmd_connect() {
       echo ""
       echo "   Right launchers:"
       echo "     • Claude Code skill:   /airc:join <invite>"
-      echo "     • Monitor tool:        Monitor(persistent=true, description=\"airc\", command=\"airc join --attach <invite>\")"
+      echo "     • Monitor tool:        Monitor(persistent=true, description=\"airc\", command=\"airc join <invite>\")"
       echo "     • Interactive shell:   just type \`airc join <invite>\` at a TTY"
       echo ""
       echo "   Bypass for legitimate background use (systemd + log tail,"

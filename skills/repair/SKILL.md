@@ -45,7 +45,7 @@ Wipes identity, peer records, saved pairing, messages. State is gone.
 
 Claude Code:
 ```
-Monitor(persistent=true, description="airc", command="airc join --attach $INVITE")
+Monitor(persistent=true, description="airc", command="airc join $INVITE")
 ```
 
 Codex / non-Monitor runtimes:
