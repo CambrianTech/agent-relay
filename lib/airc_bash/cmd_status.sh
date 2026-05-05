@@ -162,9 +162,9 @@ if mode == "degraded-only" and degraded == 0:
     sys.exit(0)
 
 if degraded:
-    print(f"  monitor health: DEGRADED ({degraded}/{len(rows)} channel(s) need attention)")
+    print(f"  transport health: DEGRADED ({degraded}/{len(rows)} channel(s) need attention)")
 else:
-    print(f"  monitor health: ok ({len(rows)} channel(s) fresh)")
+    print(f"  transport health: ok ({len(rows)} channel(s) fresh)")
 for level, ch, suffix, detail in rows:
     if mode == "degraded-only" and level != "DEGRADED":
         continue
@@ -244,16 +244,16 @@ cmd_status() {
       # "alive per formatter process only" (kill -0 blind against the
       # pidfile, but the scope's monitor_formatter is visible by argv).
       if kill -0 "$first_alive" 2>/dev/null; then
-        monitor_state="running for scope (PID $first_alive)"
+        monitor_state="AIRC background process running for scope (PID $first_alive)"
       else
         local _fmt_pid; _fmt_pid=$(_airc_scope_monitor_formatter_pids "$AIRC_WRITE_DIR" | head -1)
-        monitor_state="running for scope (formatter PID ${_fmt_pid:-?}; pidfile not visible/alive)"
+        monitor_state="AIRC formatter running for scope (formatter PID ${_fmt_pid:-?}; pidfile not visible/alive)"
       fi
     fi
   elif [ -f "$pidfile" ]; then
     monitor_state="stale pidfile (no live PIDs — run 'airc join' to self-heal)"
   fi
-  echo "  monitor:     $monitor_state"
+  echo "  airc process: $monitor_state"
   _airc_monitor_health_report all
 
   # Host reachability. Only meaningful for joiners; opt-in via --probe to keep

@@ -56,9 +56,9 @@ Don't default-stamp project chatter onto the lobby. It drowns out cross-room sig
 
 **Claude Code:** wrap in Monitor for streaming events:
 ```
-Monitor(persistent=true, description="airc", command="airc join")
+Monitor(persistent=true, description="airc", command="airc join --attach")
 ```
-Keep `description="airc"` — the headline shown in the UI is built from it.
+Keep `description="airc"` — the headline shown in the UI is built from it. `--attach` creates a real Claude Monitor stream when a background/daemon AIRC process already owns transport for the scope.
 
 **Codex / non-Monitor runtimes:** do not foreground `airc join` in the tool call unless you expect it to return quickly. It is a long-running process when this scope is not already active. Start it through the daemon or as a background process; when `airc join` does return, it prints status and inbox itself:
 ```
@@ -77,10 +77,10 @@ Do NOT poll `airc logs N` without `--since` — that re-injects the full tail ev
 ## Authoritative liveness signal
 
 `airc status` is local-only ground truth. If it shows:
-- `monitor: running` AND
+- `airc process: ... running` AND
 - `bearer: <Ns> ago via gh` (joiner) OR `bearer: n/a` (host)
 
-→ scope IS in the mesh. Override gh-auth probe noise, empty-peers warnings, or "monitor already running" complaints. Trust `airc status`.
+→ scope IS in the mesh. Override gh-auth probe noise, empty-peers warnings, or "already joined" complaints. Trust `airc status`.
 
 ## Identity bootstrap (issue #34)
 
@@ -135,7 +135,7 @@ Monitor subprocess dies on machine sleep. Recommend ONE option to the user:
 | `GitHub rate-limited — retry in 5-15 min (token is fine)` | Tell user verbatim. Do NOT re-probe. |
 | `permission denied` on gist read | Token missing `gist` scope: `gh auth refresh -s gist` |
 | `Resume aborted — re-pair required` | `airc teardown --flush && airc join <invite>` (error reconstructs the invite) |
-| `awaiting first event` >2min after first peer joined | `airc join` (repairs this scope's monitor) |
+| `awaiting first event` >2min after first peer joined | `airc join` (repairs this scope's AIRC process) |
 | Broadcast lands locally but peers don't see it | `gh api gists/<gist-id> --jq '.files["messages.jsonl"].content'` — if absent, check `airc logs --since 5m` for `[QUEUED]` markers |
 | Port collision on host | `AIRC_PORT=7548 airc join` (rare; TCP pair-handshake only) |
 

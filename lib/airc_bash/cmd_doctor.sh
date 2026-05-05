@@ -566,7 +566,7 @@ _doctor_health() {
           warns=$((warns+1))
         else
           printf "  [BLOCKED] #%s — last bearer recv %ds ago (>30min — bearer is wedged)\n" "$channel" "$age"
-          printf "           Fix: airc join  (repairs this scope's monitor)\n"
+          printf "           Fix: airc join  (repairs this scope's AIRC process)\n"
           issues=$((issues+1))
         fi
       fi
