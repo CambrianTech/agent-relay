@@ -50,12 +50,7 @@ Monitor(persistent=true, description="airc", command="airc join $INVITE")
 
 Codex / non-Monitor runtimes:
 ```bash
-scope=$(airc debug-scope)
-mkdir -p "$scope"
-nohup airc join "$INVITE" > "$scope/codex-airc.log" 2>&1 &
-sleep 2
-airc status
-airc inbox
+airc codex-start "$INVITE"
 ```
 
 Fresh handshake, fresh identity keys get pushed to the host's authorized_keys, clean pair.
