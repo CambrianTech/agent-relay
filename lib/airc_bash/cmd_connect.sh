@@ -201,8 +201,26 @@ _join_spawn_transport_for_attach() {
   echo ""
   echo "  Starting scope-local AIRC transport in the background."
   echo "  This terminal will attach to the local message stream."
+  # Strip --attach / -attach from the forwarded argv. The child runs with
+  # AIRC_NO_ATTACH=1 (set below), so the flag is redundant; worse, leaving
+  # it in causes the child's parser to treat --attach as the positional
+  # `target` whenever cmd_connect's flag-loop bails early — observed on
+  # Windows + Claude Code Monitor where `airc status` then reports
+  # `identity: --attach (host)`. The host name and gist label both inherit
+  # that, breaking inbox routing. The child's own AIRC_NO_ATTACH=1
+  # already prevents the recursion loop, so dropping the flag here is safe
+  # in every code path.
+  local _spawn_args=()
+  local _arg
+  for _arg in "$@"; do
+    case "$_arg" in
+      --attach|-attach) ;;
+      *) _spawn_args+=("$_arg") ;;
+    esac
+  done
   (
-    AIRC_NO_ATTACH=1 AIRC_BACKGROUND_OK=1 "$AIRC_SELF" join "$@"
+    AIRC_NO_ATTACH=1 AIRC_BACKGROUND_OK=1 "$AIRC_SELF" join \
+      ${_spawn_args[@]+"${_spawn_args[@]}"}
   ) >>"$_log" 2>&1 &
   local _transport_pid=$!
   echo "  transport PID: $_transport_pid"
