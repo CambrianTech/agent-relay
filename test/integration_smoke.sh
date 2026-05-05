@@ -587,10 +587,10 @@ cleanup_homes_pre() {
 }
 
 scenario_status_agrees_with_send() {
-  # Today's bug Joel called out: 'airc status' said monitor: not running
+  # Today's bug Joel called out: 'airc status' said airc process not running
   # while 'airc msg' worked + landed in gist. The two diagnostics
   # disagreed, which is exactly the silent-broken class CLAUDE.md
-  # forbids. If sends work, status MUST report monitor running.
+  # forbids. If sends work, status MUST report the airc process running.
   section "status_agrees_with_send: if msg lands in gist, status must say running"
   require_gh || return
 
@@ -613,10 +613,10 @@ scenario_status_agrees_with_send() {
   [ "$landed" = "1" ] || { fail "msg didn't land in gist — substrate broken, can't test status"; return; }
 
   local status_out; status_out=$(AIRC_HOME="$A_HOME/state" "$AIRC" status 2>&1)
-  if printf '%s' "$status_out" | grep -qE "monitor: *running"; then
-    pass "msg landed AND status says monitor running (diagnostics agree)"
+  if printf '%s' "$status_out" | grep -qE "airc process:.*running"; then
+    pass "msg landed AND status says airc process running (diagnostics agree)"
   else
-    fail "msg LANDED but status reports monitor not running — diagnostics lie"
+    fail "msg LANDED but status reports airc process not running — diagnostics lie"
     printf '%s' "$status_out" | sed 's/^/    /'
   fi
 }

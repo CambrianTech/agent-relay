@@ -815,7 +815,7 @@ json.dump(c, open(p, 'w'))
 }
 
 scenario_status() {
-  section "status: liveness view reflects identity, monitor, queue, last-activity"
+  section "status: liveness view reflects identity, airc process, queue, last-activity"
   requires_local_pair_bearer_or_skip "status" || return
   cleanup_all
 
@@ -824,7 +824,7 @@ scenario_status() {
   spawn_joiner /tmp/airc-it-s-j sjoiner "$join" || { fail "sjoiner join failed"; return; }
   sleep 2
 
-  # Host status: should show "hosting on port <NNNN>" + monitor running.
+  # Host status: should show "hosting on port <NNNN>" + AIRC process running.
   # Don't pin the port literal — AIRC_PORT=7549 might auto-bump if 7549
   # is taken by an earlier test's not-yet-reaped python listener; the
   # test was previously flaky on that. Accept any 4+-digit port.
@@ -832,8 +832,8 @@ scenario_status() {
   h_out=$(AIRC_HOME=/tmp/airc-it-s-h/state "$AIRC" status 2>&1)
   echo "$h_out" | grep -qE 'hosting on port [0-9]+' && pass "host status: identity line shows 'hosting on port <NNNN>'" \
                                                     || fail "host status missing port (got: $h_out)"
-  echo "$h_out" | grep -Eq 'monitor:\s+running' && pass "host status: monitor shown running" \
-                                                || fail "host status: monitor not shown running"
+  echo "$h_out" | grep -Eq 'airc process:\s+.*running' && pass "host status: airc process shown running" \
+                                                       || fail "host status: airc process not shown running"
   echo "$h_out" | grep -q 'queue:.*empty' && pass "host status: queue empty (no pending)" \
                                           || fail "host status: queue line wrong"
   # Phase 2c (#270): host has no inbound bearer — surface that explicitly
@@ -1976,10 +1976,10 @@ JSON
     && pass "stderr names the offending scope dir" \
     || fail "stderr doesn't surface scope path (user can't tell where their cwd resolved)"
 
-  # Fresh bearer_state is NOT monitor liveness. In a shared project dir,
+  # Fresh bearer_state is NOT process liveness. In a shared project dir,
   # another tab or leftover bearer can keep channel health fresh while
   # this scope's visible Monitor is absent. `status` and `msg` must not
-  # turn that into "monitor running".
+  # turn that into "airc process running".
   "${AIRC_PYTHON:-python3}" - <<PY
 import json, time
 with open("$home/bearer_state.general.json", "w") as f:
@@ -1987,9 +1987,9 @@ with open("$home/bearer_state.general.json", "w") as f:
 PY
   local status_out
   status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
-  echo "$status_out" | grep -qE 'monitor:\s+stale pidfile|monitor:\s+not running' \
-    && pass "fresh bearer_state does not make status claim monitor running" \
-    || fail "fresh bearer_state falsely reported monitor running (got: $status_out)"
+  echo "$status_out" | grep -qE 'airc process:\s+stale pidfile|airc process:\s+not running' \
+    && pass "fresh bearer_state does not make status claim airc process running" \
+    || fail "fresh bearer_state falsely reported airc process running (got: $status_out)"
   AIRC_HOME="$home" "$AIRC" msg "fresh bearer state is still void" >"$out" 2>"$err"
   rc=$?
   [ "$rc" -ne 0 ] \
@@ -2040,7 +2040,7 @@ PY
 # fresh bearer_state is channel health only, a formatter for THIS scope
 # counts as a scope monitor, and a formatter for a sibling scope does not.
 scenario_monitor_liveness_process_evidence() {
-  section "monitor_liveness_process_evidence: bearer freshness is not monitor liveness"
+  section "monitor_liveness_process_evidence: bearer freshness is not AIRC process liveness"
   cleanup_all
 
   local home=/tmp/airc-it-mlpe/state
@@ -2059,15 +2059,15 @@ PY
 
   local status_out
   status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
-  echo "$status_out" | grep -qE 'monitor:\s+stale pidfile|monitor:\s+not running' \
-    && pass "fresh bearer_state alone does not satisfy monitor liveness" \
-    || fail "fresh bearer_state falsely satisfied monitor liveness (got: $status_out)"
+  echo "$status_out" | grep -qE 'airc process:\s+stale pidfile|airc process:\s+not running' \
+    && pass "fresh bearer_state alone does not satisfy AIRC process liveness" \
+    || fail "fresh bearer_state falsely satisfied AIRC process liveness (got: $status_out)"
 
   ( exec -a "python -u -X utf8 -m airc_core.monitor_formatter --peers-dir $other/peers --my-name foreign" sleep 60 ) &
   local foreign_pid=$!
   sleep 1
   status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
-  echo "$status_out" | grep -qE 'monitor:\s+stale pidfile|monitor:\s+not running' \
+  echo "$status_out" | grep -qE 'airc process:\s+stale pidfile|airc process:\s+not running' \
     && pass "formatter for sibling scope does not satisfy this scope" \
     || fail "foreign formatter falsely satisfied this scope (got: $status_out)"
   kill "$foreign_pid" 2>/dev/null || true
@@ -2079,7 +2079,7 @@ PY
   for i in $(seq 1 10); do
     sleep 1
     status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
-    echo "$status_out" | grep -qE "monitor:\s+running for scope .*formatter PID $local_pid" && { seen=1; break; }
+    echo "$status_out" | grep -qE "airc process:\s+AIRC formatter running for scope .*formatter PID $local_pid" && { seen=1; break; }
   done
   [ "$seen" = "1" ] \
     && pass "scope-owned monitor_formatter satisfies scope monitor liveness" \

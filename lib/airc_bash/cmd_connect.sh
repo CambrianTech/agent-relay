@@ -133,6 +133,13 @@ _join_show_status_and_inbox() {
   cmd_inbox --count 50 2>&1 | sed 's/^/  /' || true
 }
 
+_join_attach_local_stream() {
+  echo ""
+  echo "  Attaching this terminal to the local AIRC stream."
+  echo "  Background AIRC owns transport; this process only displays new peer messages."
+  exec "$AIRC_PYTHON" -u -m airc_core.log_tail --home "$AIRC_WRITE_DIR" --my-name "$(get_name)"
+}
+
 cmd_connect() {
   # Flag parsing. Issue #37 — host display shapes:
   #   default (gh installed + authed): gist ID + humanhash mnemonic + long invite
@@ -167,6 +174,7 @@ cmd_connect() {
   local room_name="general"
   local room_explicit=0  # set to 1 when user passes --room explicitly
   local use_room=1   # default ON — auto-#general substrate
+  local attach=0
 
   # AIRC_ROOM_INTENT: re-exec env var preserving the user's --room
   # across a stale-host-takeover exec. Pre-fix this was lost on every
@@ -275,6 +283,11 @@ cmd_connect() {
         # an internal toggle for code that already reads it.
         export AIRC_NO_TAILSCALE=1
         shift ;;
+      --attach|-attach)
+        # UI attach mode: if a daemon/background airc process already
+        # serves this scope, keep that single transport owner and attach
+        # this terminal/Claude Monitor to the local messages log.
+        attach=1; shift ;;
       *) positional+=("$1"); shift ;;
     esac
   done
@@ -314,7 +327,7 @@ cmd_connect() {
       fi
     fi
     if [ "$_add_subscription" = "1" ]; then
-      echo "  airc join: monitor already running; subscribing to additional room #${room_name}..."
+      echo "  airc join: AIRC process already running; subscribing to additional room #${room_name}..."
       # Add #room_name to subscribed_channels + resolve its gist
       # (create if missing). The bearer for this channel will be
       # picked up on the next _monitor_multi_channel cycle (which
@@ -334,13 +347,14 @@ cmd_connect() {
         echo "  Bearer may not pick up new room until next cycle. Try: airc list to verify gist."
       fi
       _join_show_status_and_inbox
+      [ "$attach" = "1" ] && _join_attach_local_stream
       return 0
     fi
 
     # A live monitor is not automatically a correct monitor. If this
     # scope is still mapped to a non-canonical duplicate gist, the
     # short-circuit would strand the tab on a solo island forever:
-    # `airc join` says "already running" even though discovery would
+    # `airc join` says "already joined" even though discovery would
     # now converge on the durable room gist. Repair that locally by
     # stopping only this scope's recorded monitor PIDs, updating the
     # stale channel_gists entries, and falling through to normal
@@ -366,7 +380,7 @@ cmd_connect() {
     fi
     if [ "$_repair_running_monitor" = "1" ]; then
       local _repair_pids; _repair_pids=$(cat "$_early_pidfile" 2>/dev/null | tr '\n' ' ')
-      echo "  airc join: restarting this scope's monitor to leave the solo island."
+      echo "  airc join: restarting this scope's AIRC process to leave the solo island."
       for _p in $_repair_pids; do
         kill "$_p" 2>/dev/null || true
         for _c in $(proc_children "$_p" 2>/dev/null); do
@@ -377,8 +391,9 @@ cmd_connect() {
       sleep 1
     else
     local _early_pids; _early_pids=$(cat "$_early_pidfile" 2>/dev/null | tr '\n' ' ')
-    echo "  airc join: already joined in this scope (monitor PIDs: $_early_pids)."
+    echo "  airc join: already joined in this scope (AIRC PIDs: $_early_pids)."
     _join_show_status_and_inbox
+    [ "$attach" = "1" ] && _join_attach_local_stream
     return 0
     fi
   fi
@@ -402,6 +417,7 @@ cmd_connect() {
       if [ "$(_monitor_alive_with_bearer_fallback "$_early_pidfile")" = "yes" ]; then
         echo "  ✓ airc join repaired the daemon for this scope."
         _join_show_status_and_inbox
+        [ "$attach" = "1" ] && _join_attach_local_stream
         return 0
       fi
     done
@@ -412,7 +428,7 @@ cmd_connect() {
   # (token revoked / 2FA flow expired / brew upgrade replaced gh
   # without re-auth) and EVERY downstream gh API call then fails
   # silently — bearer.send returns auth_failure, bearer recv polls
-  # forever getting nothing, peers see "monitor running, no traffic"
+  # forever getting nothing, peers see "AIRC process running, no traffic"
   # which is the exact freeze pattern Joel kept hitting. Catch this
   # at connect time so the user gets a clear error instead of a
   # mystery timeout.
@@ -621,8 +637,9 @@ cmd_connect() {
       fi
     done
     if [ "$any_alive" = "1" ]; then
-      echo "  airc join: already joined in this scope (monitor PIDs:$alive_pids)."
+      echo "  airc join: already joined in this scope (AIRC PIDs:$alive_pids)."
       _join_show_status_and_inbox
+      [ "$attach" = "1" ] && _join_attach_local_stream
       return 0
     fi
     # Stale pidfile (no live airc processes — either dead, or PIDs were
