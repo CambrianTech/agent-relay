@@ -226,6 +226,12 @@ cmd_send() {
     && die "empty message body (use 'airc msg <text>' or omit the empty quotes)"
   ensure_init
 
+  _airc_append_local_signed() {
+    if ! printf '%s\n' "$1" | "$AIRC_PYTHON" -m airc_core.log_append append --path "$MESSAGES" >/dev/null; then
+      echo "$1" >> "$MESSAGES"
+    fi
+  }
+
   local my_name ts_val
   my_name=$(get_name)
   ts_val=$(timestamp)
@@ -275,7 +281,7 @@ cmd_send() {
     # audit log of what they sent — the alternative would force `airc
     # logs` to decrypt own outbound, which is silly). Wire form may be
     # encrypted below if the recipient has a stored x25519_pub.
-    echo "$full_msg" >> "$MESSAGES"
+    _airc_append_local_signed "$full_msg"
 
     # Phase E.3: wrap the wire envelope with envelope-layer encryption
     # if we have the recipient's X25519 pubkey on file. Empty pubkey =
@@ -490,7 +496,7 @@ cmd_send() {
       # multi-scope state) would give the rename feature a worse UX
       # than no-propagation had.
       if [ "$internal" = "1" ]; then
-        echo "$full_msg" >> "$MESSAGES"
+        _airc_append_local_signed "$full_msg"
         date +%s > "$AIRC_WRITE_DIR/last_sent" 2>/dev/null
         rm -f "$AIRC_WRITE_DIR/reminded" 2>/dev/null
         return 0
@@ -562,7 +568,10 @@ cmd_send() {
           # this happened unconditionally before the publish attempt, so
           # the user's own monitor would echo their message back even when
           # joiners never saw it — false success surface (#381 RCA).
-          echo "$full_msg" >> "$MESSAGES"
+          # GhBearer.send already writes to the local bus. The monitor mirrors
+          # that signed envelope into messages.jsonl; appending here races with
+          # the mirror and creates duplicate local audit rows.
+          :
           ;;
         auth_failure)
           # Hard failure mirror of joiner branch above. Don't queue —
@@ -659,7 +668,7 @@ cmd_send() {
       esac
     else
       echo "  ⚠ No room_gist_id set ($AIRC_WRITE_DIR/room_gist_id missing) — host send is local-only." >&2
-      echo "$full_msg" >> "$MESSAGES"
+      _airc_append_local_signed "$full_msg"
     fi
   fi
 

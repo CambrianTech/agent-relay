@@ -1399,7 +1399,7 @@ _monitor_multi_channel() {
             fi
           fi
         done
-        _pids=("${_alive[@]}")
+        _pids=(${_alive[@]+"${_alive[@]}"})
 
         # Live channel-map refresh. `airc join --room X` can add a
         # channel while the monitor is already healthy; pre-fix the
@@ -1430,7 +1430,7 @@ _monitor_multi_channel() {
             fi
             _kept+=("$entry")
           done
-          _pids=("${_kept[@]}")
+          _pids=(${_kept[@]+"${_kept[@]}"})
 
           # Build the set of gists currently served by live bearers,
           # so the add-loop doesn't double-spawn for a gist that's
