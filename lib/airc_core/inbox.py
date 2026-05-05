@@ -119,7 +119,7 @@ def cmd_read(args: argparse.Namespace) -> int:
                 except Exception:
                     last_offset = next_offset
                     continue
-                if args.exclude_self and line.get("from") == args.my_name:
+                if args.exclude_self and args.client_id and line.get("client_id") == args.client_id:
                     last_offset = next_offset
                     continue
                 if since_dt is not None:
@@ -152,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
     read.add_argument("--quiet-empty", action="store_true")
     read.add_argument("--exclude-self", action="store_true")
     read.add_argument("--my-name", default="")
+    read.add_argument("--client-id", default="")
     reset = sub.add_parser("reset")
     reset.add_argument("--home", required=True)
     reset.add_argument("--cursor-file", required=True)

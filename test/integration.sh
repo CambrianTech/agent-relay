@@ -3264,11 +3264,16 @@ scenario_inbox() {
     && pass "codex-poll is quiet when empty" \
     || fail "codex-poll should be quiet when empty, got: $out"
 
-  printf '%s\n' '{"ts":"2099-05-04T10:01:30Z","from":"inbox-test","msg":"self-only"}' >> "$home/messages.jsonl"
-  printf '%s\n' '{"ts":"2099-05-04T10:01:31Z","from":"peer-test","msg":"peer-only"}' >> "$home/messages.jsonl"
-  out=$(AIRC_HOME="$home" "$AIRC" codex-poll 2>&1)
-  printf '%s' "$out" | grep -q 'peer-only' && ! printf '%s' "$out" | grep -q 'self-only' \
-    && pass "codex-poll excludes self and prints peer messages" \
+  printf '%s\n' '{"ts":"2099-05-04T10:01:30Z","from":"inbox-test","client_id":"test-client","msg":"self-only"}' >> "$home/messages.jsonl"
+  printf '%s\n' '{"ts":"2099-05-04T10:01:31Z","from":"inbox-test","client_id":"other-client","msg":"same-nick-peer"}' >> "$home/messages.jsonl"
+  printf '%s\n' '{"ts":"2099-05-04T10:01:32Z","from":"inbox-test","msg":"legacy-same-name-visible"}' >> "$home/messages.jsonl"
+  printf '%s\n' '{"ts":"2099-05-04T10:01:33Z","from":"peer-test","client_id":"peer-client","msg":"peer-only"}' >> "$home/messages.jsonl"
+  out=$(AIRC_CLIENT_ID=test-client AIRC_HOME="$home" "$AIRC" codex-poll 2>&1)
+  printf '%s' "$out" | grep -q 'peer-only' \
+    && printf '%s' "$out" | grep -q 'same-nick-peer' \
+    && printf '%s' "$out" | grep -q 'legacy-same-name-visible' \
+    && ! printf '%s' "$out" | grep -q 'self-only' \
+    && pass "codex-poll excludes same-client self and prints same-nick peers" \
     || fail "codex-poll self-filter wrong: $out"
 
   printf '%s\n' '{"ts":"2099-05-04T10:02:00Z","from":"gamma","msg":"third unread"}' >> "$home/messages.jsonl"

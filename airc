@@ -598,6 +598,10 @@ get_config_val()   { "$AIRC_PYTHON" -m airc_core.config get --config "$CONFIG" "
 set_config_val()   { "$AIRC_PYTHON" -m airc_core.config set --config "$CONFIG" --key "$1" --value "$2"; }
 unset_config_keys() { "$AIRC_PYTHON" -m airc_core.config unset_keys --config "$CONFIG" "$@"; }
 
+airc_client_id() {
+  "$AIRC_PYTHON" -m airc_core.client_id 2>/dev/null
+}
+
 # Same as get_config_val but reads from an arbitrary config.json path.
 # Used by _whois_in_scope (#134 cross-scope walk) and other places
 # that need to read sibling-scope state without changing $CONFIG.
@@ -1635,7 +1639,12 @@ monitor_formatter() {
   # while airc's own monitor_formatter (no -X utf8) drops events.
   # Same fix here closes the gap at the SOURCE rather than relying on
   # each operator to add their own tail-pipeline.
-  "$AIRC_PYTHON" -u -X utf8 -m airc_core.monitor_formatter --peers-dir "$PEERS_DIR" --my-name "$my_name"
+  local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
+  if [ -n "$_client_id" ]; then
+    AIRC_CLIENT_ID="$_client_id" "$AIRC_PYTHON" -u -X utf8 -m airc_core.monitor_formatter --peers-dir "$PEERS_DIR" --my-name "$my_name"
+  else
+    "$AIRC_PYTHON" -u -X utf8 -m airc_core.monitor_formatter --peers-dir "$PEERS_DIR" --my-name "$my_name"
+  fi
 }
 
 # Drain pending.jsonl when the host is reachable again. Runs in background

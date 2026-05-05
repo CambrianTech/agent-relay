@@ -229,9 +229,14 @@ cmd_send() {
   local my_name ts_val
   my_name=$(get_name)
   ts_val=$(timestamp)
+  local client_id; client_id=$(airc_client_id 2>/dev/null || true)
 
   local escaped_msg
   escaped_msg=$(printf '%s' "$msg" | "$AIRC_PYTHON" -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])")
+  local escaped_client_id=""
+  if [ -n "$client_id" ]; then
+    escaped_client_id=$(printf '%s' "$client_id" | "$AIRC_PYTHON" -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])")
+  fi
 
   # Channel: stamp every outbound envelope with the active channel so the
   # monitor display can route by channel uniformly (Phase 2 mesh
@@ -253,9 +258,12 @@ cmd_send() {
   fi
   [ -z "$active_channel" ] && active_channel="general"
 
-  local payload="{\"from\":\"$my_name\",\"to\":\"$peer_name\",\"ts\":\"$ts_val\",\"channel\":\"$active_channel\",\"msg\":\"$escaped_msg\"}"
+  local payload="{\"from\":\"$my_name\",\"to\":\"$peer_name\",\"ts\":\"$ts_val\",\"channel\":\"$active_channel\",\"msg\":\"$escaped_msg\""
+  [ -n "$escaped_client_id" ] && payload="${payload},\"client_id\":\"$escaped_client_id\""
+  payload="${payload}}"
   local sig; sig=$(sign_message "$payload")
-  local full_msg="{\"from\":\"$my_name\",\"to\":\"$peer_name\",\"ts\":\"$ts_val\",\"channel\":\"$active_channel\",\"msg\":\"$escaped_msg\",\"sig\":\"$sig\"}"
+  local full_msg="${payload%}}"
+  full_msg="${full_msg},\"sig\":\"$sig\"}"
 
   local host_target
   host_target=$(get_config_val host_target "")

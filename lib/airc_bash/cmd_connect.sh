@@ -137,7 +137,12 @@ _join_attach_local_stream() {
   echo ""
   echo "  Attaching this terminal to the local AIRC stream."
   echo "  Background AIRC owns transport; this process only displays new peer messages."
-  exec "$AIRC_PYTHON" -u -m airc_core.log_tail --home "$AIRC_WRITE_DIR" --my-name "$(get_name)"
+  local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
+  if [ -n "$_client_id" ]; then
+    AIRC_CLIENT_ID="$_client_id" exec "$AIRC_PYTHON" -u -m airc_core.log_tail --home "$AIRC_WRITE_DIR" --my-name "$(get_name)"
+  else
+    exec "$AIRC_PYTHON" -u -m airc_core.log_tail --home "$AIRC_WRITE_DIR" --my-name "$(get_name)"
+  fi
 }
 
 _join_parent_chain_looks_like_claude_monitor() {
