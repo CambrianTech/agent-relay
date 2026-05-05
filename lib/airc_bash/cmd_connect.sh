@@ -141,6 +141,23 @@ _join_transport_health_ok() {
     --quiet >/dev/null 2>&1
 }
 
+_join_transport_in_startup_grace() {
+  local health_out="${1:-}"
+  local pidfile="${2:-$AIRC_WRITE_DIR/airc.pid}"
+  [ -f "$pidfile" ] || return 1
+  local mtime now age grace
+  mtime=$(file_mtime "$pidfile" 2>/dev/null || echo 0)
+  now=$(date +%s)
+  case "$mtime" in ''|*[!0-9]*) return 1 ;; esac
+  age=$((now - mtime))
+  grace="${AIRC_STARTUP_GRACE_SEC:-45}"
+  [ "$age" -ge 0 ] 2>/dev/null || return 1
+  [ "$age" -le "$grace" ] 2>/dev/null || return 1
+  printf '%s\n' "$health_out" | grep -q 'starting; no heartbeat yet' || return 1
+  printf '%s\n' "$health_out" | grep -Eq 'stale heartbeat|stale bearer pid' && return 1
+  return 0
+}
+
 _join_restart_scope_processes() {
   local _pids=""
   if [ -f "$AIRC_WRITE_DIR/airc.pid" ]; then
@@ -488,19 +505,30 @@ cmd_connect() {
       echo "  airc join: restarting this scope's AIRC process to leave the solo island."
       _join_restart_scope_processes
       sleep 1
-    elif ! _join_transport_health_ok; then
-      echo "  airc join: AIRC process exists but transport is degraded; restarting this scope's AIRC process."
-      "$AIRC_PYTHON" -m airc_core.transport_health check \
-        --home "$AIRC_WRITE_DIR" \
-        --config "$CONFIG" 2>/dev/null | sed 's/^/    /' || true
-      _join_restart_scope_processes
-      sleep 1
     else
-    local _early_pids; _early_pids=$(cat "$_early_pidfile" 2>/dev/null | tr '\n' ' ')
-    echo "  airc join: already joined in this scope (AIRC PIDs: $_early_pids)."
-    _join_show_status_and_inbox
-    [ "$attach" = "1" ] && _join_attach_local_stream
-    return 0
+      local _health_out _health_rc=0
+      _health_out=$("$AIRC_PYTHON" -m airc_core.transport_health check \
+        --home "$AIRC_WRITE_DIR" \
+        --config "$CONFIG" 2>/dev/null) || _health_rc=$?
+      if [ "$_health_rc" != "0" ] && _join_transport_in_startup_grace "$_health_out" "$_early_pidfile"; then
+        local _early_pids; _early_pids=$(cat "$_early_pidfile" 2>/dev/null | tr '\n' ' ')
+        echo "  airc join: AIRC process is still starting in this scope (AIRC PIDs: $_early_pids)."
+        printf '%s\n' "$_health_out" | sed 's/^/    /' || true
+        _join_show_status_and_inbox
+        [ "$attach" = "1" ] && _join_attach_local_stream
+        return 0
+      elif [ "$_health_rc" != "0" ]; then
+        echo "  airc join: AIRC process exists but transport is degraded; restarting this scope's AIRC process."
+        printf '%s\n' "$_health_out" | sed 's/^/    /' || true
+        _join_restart_scope_processes
+        sleep 1
+      else
+        local _early_pids; _early_pids=$(cat "$_early_pidfile" 2>/dev/null | tr '\n' ' ')
+        echo "  airc join: already joined in this scope (AIRC PIDs: $_early_pids)."
+        _join_show_status_and_inbox
+        [ "$attach" = "1" ] && _join_attach_local_stream
+        return 0
+      fi
     fi
   fi
   # Stale or absent pidfile — leave for the canonical cleanup block
