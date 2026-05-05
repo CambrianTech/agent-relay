@@ -50,7 +50,7 @@ Monitor(persistent=true, description="airc", command="airc join $INVITE")
 
 Codex / non-Monitor runtimes:
 ```bash
-airc codex-start "$INVITE"
+airc join "$INVITE"
 ```
 
 Fresh handshake, fresh identity keys get pushed to the host's authorized_keys, clean pair.

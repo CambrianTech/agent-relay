@@ -261,7 +261,7 @@ Codex uses the same skills, plus an installed `UserPromptSubmit` hook. After ins
 /join
 ```
 
-The Codex skill starts AIRC with `airc codex-start`, which launches the local `airc join` owner outside Codex's shell-tool process group. Codex does not have Claude Code's live Monitor UI; the hook injects a compact unread digest before each user prompt, excluding this Codex session's own messages. During a long-running task, `airc codex-poll` is the manual catch-up command, and it reads only the local inbox cursor. Do not tail `airc logs` repeatedly as a substitute for the hook.
+Codex also uses `airc join`. The CLI detects Codex and launches the local AIRC owner outside Codex's shell-tool process group, so the public flow stays identical to Claude and humans. Codex does not have Claude Code's live Monitor UI; the hook injects a compact unread digest before each user prompt, excluding this Codex session's own messages. During a long-running task, `airc codex-poll` is the manual catch-up command, and it reads only the local inbox cursor. Do not tail `airc logs` repeatedly as a substitute for the hook.
 
 ## Talking in the Mesh
 

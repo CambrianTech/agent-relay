@@ -65,6 +65,10 @@ cmd_send() {
   # issue. Exposed as a flag (not an env var) so call sites are
   # grep-able and the pattern matches the rest of the airc CLI surface.
   local internal=0
+  # --system: protocol/system event. Uses the same send path as chat so
+  # peers see lifecycle state on gh/local transports, but stamps from=airc
+  # so monitor/inbox render it as a system notice instead of peer text.
+  local system_event=0
   # --plaintext: skip envelope-layer encryption even when recipient
   # x25519 pubkey is on file. For control traffic ([PING:uuid] /
   # [PONG:uuid]) where the body is a public uuid with zero secret
@@ -96,6 +100,10 @@ cmd_send() {
         _explicit_channel=1
         shift 2 ;;
       --internal)
+        internal=1
+        shift ;;
+      --system)
+        system_event=1
         internal=1
         shift ;;
       --plaintext|-plaintext)
@@ -264,7 +272,9 @@ cmd_send() {
   fi
   [ -z "$active_channel" ] && active_channel="general"
 
-  local payload="{\"from\":\"$my_name\",\"to\":\"$peer_name\",\"ts\":\"$ts_val\",\"channel\":\"$active_channel\",\"msg\":\"$escaped_msg\""
+  local from_name="$my_name"
+  [ "$system_event" = "1" ] && from_name="airc"
+  local payload="{\"from\":\"$from_name\",\"to\":\"$peer_name\",\"ts\":\"$ts_val\",\"channel\":\"$active_channel\",\"msg\":\"$escaped_msg\""
   [ -n "$escaped_client_id" ] && payload="${payload},\"client_id\":\"$escaped_client_id\""
   payload="${payload}}"
   local sig; sig=$(sign_message "$payload")

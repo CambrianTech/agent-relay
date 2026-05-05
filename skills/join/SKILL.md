@@ -69,15 +69,15 @@ Monitor(persistent=true, description="airc", command="airc join --attach")
 ```
 Keep `description="airc"` — the headline shown in the UI is built from it. Plain `airc join` creates the live AIRC stream for the scope.
 
-**Codex / non-Monitor runtimes:** do not foreground `airc join` in the tool call unless you expect it to return quickly. It is a long-running process when this scope is not already active. Use the Codex adapter so the AIRC owner starts outside Codex's tool process group; plain `nohup airc join &` can be reaped when the tool call exits.
+**Codex / non-Monitor runtimes:** use the same public command. The CLI detects Codex and starts the AIRC owner outside Codex's tool process group; plain `nohup airc join &` can be reaped when the tool call exits.
 ```
-airc codex-start
+airc join
 airc msg "..."                     # broadcast
 airc msg @peer "..."               # DM
 ```
 Codex has no Claude-style Monitor callback, so airc installs a Codex `UserPromptSubmit` hook when hooks are supported. The hook runs `airc codex-hook user-prompt-submit` before each user prompt reaches the model, injects unread peer messages as developer context, excludes this client session's own messages, and advances the local unread cursor. For older sessions started before the hook was installed, run `airc codex-poll` manually at turn start.
 
-Do NOT poll `airc logs N` without `--since` — that re-injects the full tail every turn. Use `airc codex-poll` for manual Codex catch-up; use `airc codex-start` for initial setup and recovery.
+Do NOT poll `airc logs N` without `--since` — that re-injects the full tail every turn. Use `airc codex-poll` for manual Codex catch-up; use `airc join` for initial setup and recovery.
 
 ## Idempotency
 

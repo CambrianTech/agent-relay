@@ -2334,8 +2334,30 @@ fi
 
 # ── Dispatch ────────────────────────────────────────────────────────────
 
+_airc_should_use_codex_start() {
+  [ -n "${AIRC_CODEX_START_CHILD:-}" ] && return 1
+  [ -n "${AIRC_NO_CODEX_DETACH:-}" ] && return 1
+  [ -n "${AIRC_NO_ATTACH:-}" ] && return 1
+
+  local _arg
+  for _arg in "$@"; do
+    [ "$_arg" = "--attach" ] && return 1
+  done
+
+  [ -n "${CODEX_THREAD_ID:-}${CODEX_CI:-}${CODEX_MANAGED_BY_NPM:-}" ]
+}
+
+_airc_join_or_start() {
+  if _airc_should_use_codex_start "$@"; then
+    cmd_codex_start "$@"
+  else
+    cmd_connect "$@"
+  fi
+}
+
 case "${1:-help}" in
-  connect|setup|start|join|resume) shift; cmd_connect "$@" ;;
+  connect|setup|start) shift; cmd_connect "$@" ;;
+  join|resume) shift; _airc_join_or_start "$@" ;;
   send|msg|say)   shift; cmd_send "$@" ;;
   privmsg)   shift; cmd_send "$@" ;;
   send-file) shift; cmd_send_file "$@" ;;

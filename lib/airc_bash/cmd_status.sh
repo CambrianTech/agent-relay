@@ -572,8 +572,6 @@ cmd_codex_hook() {
 }
 
 cmd_codex_start() {
-  ensure_init
-
   local _log="$AIRC_WRITE_DIR/codex-airc.log"
   "$AIRC_PYTHON" -m airc_core.codex_start \
     --airc "$0" \

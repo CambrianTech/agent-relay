@@ -3,7 +3,7 @@
 Codex shell tool calls may clean up background children when the command
 returns. A plain `nohup airc join &` can therefore look healthy for a few
 seconds and then vanish. This module owns the runtime-specific detach detail
-so the public skill can stay simple: `airc codex-start`.
+so the public skill can stay simple: `airc join`.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ def main(argv: list[str] | None = None) -> int:
 
     env = os.environ.copy()
     env["AIRC_HOME"] = str(home)
+    env["AIRC_CODEX_START_CHILD"] = "1"
 
     with open(os.devnull, "rb") as stdin, open(log_path, "ab", buffering=0) as out:
         proc = subprocess.Popen(
@@ -50,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
             start_new_session=True,
         )
 
-    print(f"airc codex-start: launched airc join for {home} (PID {proc.pid}, log {log_path})")
+    print(f"airc join: launched Codex-detached transport for {home} (PID {proc.pid}, log {log_path})")
     return 0
 
 
