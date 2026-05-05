@@ -218,12 +218,49 @@ _join_spawn_transport_for_attach() {
       *) _spawn_args+=("$_arg") ;;
     esac
   done
-  (
-    AIRC_NO_ATTACH=1 AIRC_BACKGROUND_OK=1 "$AIRC_SELF" join \
-      ${_spawn_args[@]+"${_spawn_args[@]}"}
-  ) >>"$_log" 2>&1 &
-  local _transport_pid=$!
-  echo "  transport PID: $_transport_pid"
+  # Detach the transport into its own session+pgroup so SIGHUP from the
+  # launcher's session leader exit doesn't cascade. On Windows + Claude
+  # Code Monitor (`wsl bash -lc 'airc join --attach'`) the launcher
+  # bash is the controlling-terminal session leader; when it returns,
+  # kernel SIGHUPs the entire pgroup. `setsid -f` forks the transport
+  # into a new session AND a new pgroup AND disconnects it from the
+  # controlling terminal — the kill-all-on-launcher-exit semantics no
+  # longer apply.
+  #
+  # `setsid -f` returns immediately after fork (parent doesn't wait),
+  # so the captured `$!` is the bash subshell PID; the actual transport
+  # is the grandchild. We don't need that PID for the watchdog —
+  # `_monitor_alive_with_bearer_fallback` reads airc.pid (written by
+  # airc itself once spawned) which is the canonical aliveness signal.
+  # The kill-0 fallback used `_transport_pid` to detect catastrophic
+  # spawn failures; with setsid -f, the subshell exits cleanly after
+  # forking the grandchild, so kill-0 of subshell-PID is no longer a
+  # useful signal — the watchdog now relies entirely on airc.pid
+  # appearing within the timeout. AIRC_NO_DETACH=1 forces the inline
+  # form for harness tests that want process-tree reap semantics.
+  if [ "${AIRC_NO_DETACH:-0}" != "1" ] && command -v setsid >/dev/null 2>&1; then
+    setsid -f env AIRC_NO_ATTACH=1 AIRC_BACKGROUND_OK=1 \
+      "$AIRC_SELF" join \
+      ${_spawn_args[@]+"${_spawn_args[@]}"} \
+      >>"$_log" 2>&1
+  else
+    (
+      trap '' HUP
+      AIRC_NO_ATTACH=1 AIRC_BACKGROUND_OK=1 exec "$AIRC_SELF" join \
+        ${_spawn_args[@]+"${_spawn_args[@]}"}
+    ) >>"$_log" 2>&1 &
+  fi
+  # With setsid -f, $! is the parent shell pid which exited cleanly
+  # after forking the daemonized grandchild. The kill-0 watchdog can't
+  # use it. Set _transport_pid="" to disable that path; the airc.pid
+  # file written by the transport is the authoritative liveness check.
+  local _transport_pid=""
+  if [ "${AIRC_NO_DETACH:-0}" = "1" ] || ! command -v setsid >/dev/null 2>&1; then
+    _transport_pid=$!
+  fi
+  if [ -n "$_transport_pid" ]; then
+    echo "  transport PID: $_transport_pid"
+  fi
   echo "  transport log: $_log"
 
   local _pidfile="$AIRC_WRITE_DIR/airc.pid"
@@ -234,7 +271,7 @@ _join_spawn_transport_for_attach() {
       _join_attach_local_stream
       return 0
     fi
-    if ! kill -0 "$_transport_pid" 2>/dev/null; then
+    if [ -n "$_transport_pid" ] && ! kill -0 "$_transport_pid" 2>/dev/null; then
       echo "  airc join: transport exited before it became healthy." >&2
       if [ -s "$_log" ]; then
         echo "  last transport log lines:" >&2
@@ -420,6 +457,24 @@ cmd_connect() {
       *) positional+=("$1"); shift ;;
     esac
   done
+  # Belt for the suspenders: even if the case arm above failed to match
+  # `--attach` for a hidden-CR / NUL / encoding reason (only observed via
+  # Claude Code Monitor on Windows + WSL2 — the foreground bash path
+  # consumed it correctly), make sure it never lands in positional and
+  # poisons `target`. Symptom we're guarding against: `airc status`
+  # reporting `identity: --attach (host)` after the Monitor invocation,
+  # config.json's name field persisted as `--attach`. See #511.
+  if [ "${#positional[@]}" -gt 0 ]; then
+    local _kept_positional=()
+    local _p
+    for _p in "${positional[@]}"; do
+      case "$_p" in
+        --attach|-attach) attach=1 ;;
+        *) _kept_positional+=("$_p") ;;
+      esac
+    done
+    positional=("${_kept_positional[@]+"${_kept_positional[@]}"}")
+  fi
   set -- "${positional[@]+"${positional[@]}"}"
   [ "${AIRC_NO_ATTACH:-0}" = "1" ] && attach=0
 
