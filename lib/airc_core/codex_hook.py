@@ -71,7 +71,7 @@ def _parse_inbox(text: str) -> list[InboxMessage]:
     return messages
 
 
-def _summarize_text(value: str, max_len: int = 180) -> str:
+def _summarize_text(value: str, max_len: int = 120) -> str:
     one_line = " ".join(value.split())
     if len(one_line) <= max_len:
         return one_line
@@ -103,16 +103,16 @@ def _digest(context: str, max_items: int = 8) -> str:
             senders.append(msg.sender)
 
     lines = [
-        f"AIRC digest: {len(messages)} unread unique message(s)"
-        + (f" from {', '.join(senders[:4])}" if senders else "")
-        + (f" (+{len(senders) - 4} more senders)" if len(senders) > 4 else "")
-        + ".",
+        f"AIRC: {len(messages)} unread"
+        + (f" from {', '.join(senders[:3])}" if senders else "")
+        + (f" +{len(senders) - 3}" if len(senders) > 3 else "")
     ]
     if hidden:
-        lines.append(f"Showing latest {len(shown)}; {hidden} older unread message(s) were omitted from this hook digest.")
+        lines.append(f"latest {len(shown)} shown; {hidden} older omitted")
     for msg in shown:
-        lines.append(f"- {msg.ts} {msg.sender}: {_summarize_text(msg.msg)}")
-    lines.append("If the digest is insufficient for the current task, run: airc inbox --peek --count 50")
+        lines.append(f"- {msg.sender}: {_summarize_text(msg.msg)}")
+    if hidden:
+        lines.append("more: airc inbox --peek --count 50")
     return "\n".join(lines)
 
 
@@ -126,11 +126,7 @@ def cmd_user_prompt_submit(args: argparse.Namespace) -> int:
     payload = {
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
-            "additionalContext": (
-                "Unread AIRC messages arrived before this user turn. "
-                "Use this AI-oriented digest as current collaboration state.\n\n"
-                f"{context}"
-            ),
+            "additionalContext": context,
         }
     }
     print(json.dumps(payload, separators=(",", ":")))
