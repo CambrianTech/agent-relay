@@ -30,7 +30,7 @@ Captures `before` and `after` SHAs. Prints one of:
 
 3. **Re-arm a new Monitor with `airc join`**:
    ```
-   Monitor(persistent=true, description="airc", command="airc join --attach")
+   Monitor(persistent=true, description="airc", command="airc join")
    ```
    Same shape the `/join` skill uses. The new Monitor's airc binary loads from disk fresh — picks up the just-pulled code automatically.
 
