@@ -311,6 +311,24 @@ def run(my_name: str, peers_dir: str) -> int:
     local_log = os.path.join(scope_dir, "messages.jsonl")
     offset_path = os.path.join(scope_dir, "monitor_offset")
     client_id = current_client_id()
+    seen_sigs: set[str] = set()
+
+    def _load_seen_sigs(limit: int = 5000) -> None:
+        try:
+            with open(local_log, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()[-limit:]
+        except Exception:
+            return
+        for raw in lines:
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            sig = obj.get("sig")
+            if isinstance(sig, str) and sig:
+                seen_sigs.add(sig)
+
+    _load_seen_sigs()
 
     # Host vs joiner detection drives the watchdog gate below. host_target
     # empty = we are the host (we publish the room gist; joiners poll us);
@@ -457,6 +475,15 @@ def run(my_name: str, peers_dir: str) -> int:
             # readable content even though the wire was ciphertext.
             line = json.dumps(m)
         msg = m.get("msg", "")
+        sig = m.get("sig")
+        if isinstance(sig, str) and sig and sig in seen_sigs:
+            # Idempotent mirror boundary. Host-mode sends append locally
+            # immediately, then the host's own gist bearer can receive the
+            # exact same signed envelope back from the wire. Duplicate
+            # bearer processes can also replay the same line. The signature
+            # is the stable envelope identity, so if it is already in the
+            # local audit log, skip both mirror and display.
+            continue
         # Filter only this runtime's own sends. Multiple agents can share
         # one .airc scope and therefore one nick; filtering by `from`
         # hides same-scope collaborators. New sends may carry client_id
@@ -477,6 +504,8 @@ def run(my_name: str, peers_dir: str) -> int:
         try:
             with open(local_log, "a") as f:
                 f.write(line + "\n")
+            if isinstance(sig, str) and sig:
+                seen_sigs.add(sig)
         except Exception:
             pass
         # Rotate every ~100 mirrored lines. Without this, local logs
