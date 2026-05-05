@@ -649,7 +649,20 @@ get_name() {
 }
 
 get_config_val()   { "$AIRC_PYTHON" -m airc_core.config get --config "$CONFIG" "$1" "${2:-}" 2>/dev/null || echo "${2:-}"; }
-set_config_val()   { "$AIRC_PYTHON" -m airc_core.config set --config "$CONFIG" --key "$1" --value "$2"; }
+set_config_val()   {
+  # Empty $2 must reach argparse as the value of --value. The plain
+  # `--value "$2"` form fails on Windows when bash invocations cross
+  # wsl.exe / PowerShell boundaries that strip trailing empty positional
+  # args from the cmdline before WSL even sees them — argparse then
+  # bails with "argument --value: expected one argument" and the airc
+  # join path exits before spawning the bearer. The `--value=$2` form
+  # keeps the empty string fused to the option as a single argv token,
+  # which all known shell/wsl/PowerShell layers preserve verbatim.
+  # Repro on Windows 11 + WSL2 Ubuntu (issue #511 trace):
+  #   set_config_val host "$(get_host)"   # get_host -> ""
+  #   → exit 2 + "argument --value: expected one argument"
+  "$AIRC_PYTHON" -m airc_core.config set --config "$CONFIG" --key "$1" --value="${2-}"
+}
 unset_config_keys() { "$AIRC_PYTHON" -m airc_core.config unset_keys --config "$CONFIG" "$@"; }
 
 airc_client_id() {
