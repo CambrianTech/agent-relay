@@ -441,7 +441,7 @@ The Claude Code skills are auto-installed by `install.sh` so the AI can run airc
 | [doctor](skills/doctor/) | `/doctor [scenario]` | Environment health + integration suite (auto-fixes what it can) |
 | [tests](skills/tests/) | `/tests [scenario]` | Pure test runner (alias of doctor's test path) |
 
-The public surface is IRC-shaped: `join`, `msg`, `list`, `part`, `quit`, `nick`, `away`, `whois`, and `inbox`. Use `airc join` to create, join, resume, or repair a room for the current scope.
+The public surface is IRC-shaped: `join`, `msg`, `list`, `part`, `quit`, `nick`, `away`, and `whois`. Use `airc join` to create, join, resume, repair a room, and catch up unread messages for the current scope.
 
 ## Identity & State
 

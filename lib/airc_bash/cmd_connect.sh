@@ -122,6 +122,17 @@ ensure_channel_subscribed_with_gist() {
   return 0
 }
 
+_join_show_status_and_inbox() {
+  echo ""
+  echo "  Status"
+  echo "  ------"
+  cmd_status 2>&1 | sed 's/^/  /' || true
+  echo ""
+  echo "  Inbox"
+  echo "  -----"
+  cmd_inbox --count 50 2>&1 | sed 's/^/  /' || true
+}
+
 cmd_connect() {
   # Flag parsing. Issue #37 — host display shapes:
   #   default (gh installed + authed): gist ID + humanhash mnemonic + long invite
@@ -322,6 +333,7 @@ cmd_connect() {
         echo "  ⚠ Subscribed to #${room_name} but gist resolve failed: $_new_gist"
         echo "  Bearer may not pick up new room until next cycle. Try: airc list to verify gist."
       fi
+      _join_show_status_and_inbox
       return 0
     fi
 
@@ -366,8 +378,7 @@ cmd_connect() {
     else
     local _early_pids; _early_pids=$(cat "$_early_pidfile" 2>/dev/null | tr '\n' ' ')
     echo "  airc join: already joined in this scope (monitor PIDs: $_early_pids)."
-    echo "    Status: airc status"
-    echo "    Inbox:  airc inbox"
+    _join_show_status_and_inbox
     return 0
     fi
   fi
@@ -390,7 +401,7 @@ cmd_connect() {
       sleep 2
       if [ "$(_monitor_alive_with_bearer_fallback "$_early_pidfile")" = "yes" ]; then
         echo "  ✓ airc join repaired the daemon for this scope."
-        echo "    Check: airc status"
+        _join_show_status_and_inbox
         return 0
       fi
     done
@@ -610,10 +621,8 @@ cmd_connect() {
       fi
     done
     if [ "$any_alive" = "1" ]; then
-      echo "  airc join: this scope's monitor is already running (PIDs:$alive_pids)."
-      echo "    To stop it:        airc teardown"
-      echo "    To restart it:     airc join"
-      echo "    To check it:       airc status"
+      echo "  airc join: already joined in this scope (monitor PIDs:$alive_pids)."
+      _join_show_status_and_inbox
       return 0
     fi
     # Stale pidfile (no live airc processes — either dead, or PIDs were
