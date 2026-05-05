@@ -507,6 +507,36 @@ _airc_scope_monitor_formatter_pids() {
   done
 }
 
+_airc_cmdline_is_monitor_wrapper() {
+  local cmd="${1:-}"
+  # Primary shape: a visible airc join/connect command.
+  echo "$cmd" | grep -Eq '(^|[[:space:]])/[^[:space:]]*/airc[[:space:]]+(connect|join)([[:space:]]|$)|(^|[[:space:]])airc[[:space:]]+(connect|join)([[:space:]]|$)|eval .*airc[[:space:]]+(connect|join)' \
+    && return 0
+
+  # WSL/Claude Monitor can preserve only the script path in `ps` even
+  # though the PID came from this scope's airc.pid. Accept that narrower
+  # shape only after pidfile ownership + kill -0 have already been proven
+  # by the caller.
+  echo "$cmd" | grep -Eq '(^|[[:space:]])/[^[:space:]]*/airc([[:space:]]|$)|(^|[[:space:]])airc([[:space:]]|$)'
+}
+
+_airc_pidfile_live_monitor_pids() {
+  local pidfile="${1:-}"
+  [ -f "$pidfile" ] || return 0
+  local p raw
+  raw=$(cat "$pidfile" 2>/dev/null)
+  for p in $raw; do
+    case "$p" in ''|*[!0-9]*) continue ;; esac
+    if kill -0 "$p" 2>/dev/null; then
+      local _cmd
+      _cmd=$(proc_cmdline "$p" 2>/dev/null || true)
+      if _airc_cmdline_is_monitor_wrapper "$_cmd"; then
+        printf '%s\n' "$p"
+      fi
+    fi
+  done
+}
+
 _monitor_alive_with_bearer_fallback() {
   local pidfile="${1:-}"
   local scope_dir
@@ -523,27 +553,19 @@ _monitor_alive_with_bearer_fallback() {
   # Mesh effectively partitioned with no diagnosis path.
   #
   # Fix: a PID is only "ours" if `kill -0` says alive AND its cmdline shapes
-  # like an airc connect/join wrapper. Same regex shape as cmd_teardown's
-  # parent-chain reaper (#446) — keeps the two paths in lockstep on what
-  # "an airc process" means. PID reuse → cmdline doesn't match → treat as
-  # dead, fall through to Phase 2 (scope formatter process evidence).
+  # like an airc wrapper. Same shape as cmd_teardown's parent-chain reaper
+  # (#446), with one WSL/Claude Monitor allowance: if the PID came from this
+  # scope's pidfile, a visible /path/to/airc wrapper is enough even when `ps`
+  # drops the join/connect argument. PID reuse → cmdline doesn't match →
+  # treat as dead, fall through to Phase 2 (scope formatter process evidence).
   if [ -f "$pidfile" ]; then
-    local p raw
-    raw=$(cat "$pidfile" 2>/dev/null)
-    for p in $raw; do
-      case "$p" in ''|*[!0-9]*) continue ;; esac
-      if kill -0 "$p" 2>/dev/null; then
-        local _cmd
-        _cmd=$(proc_cmdline "$p" 2>/dev/null || true)
-        if echo "$_cmd" | grep -Eq '(^|[[:space:]])/[^[:space:]]*/airc[[:space:]]+(connect|join)([[:space:]]|$)|(^|[[:space:]])airc[[:space:]]+(connect|join)([[:space:]]|$)|eval .*airc[[:space:]]+(connect|join)'; then
-          echo "yes"
-          return 0
-        fi
-        # PID alive but not airc-shaped — OS reused this PID after our
-        # monitor died (sleep/wake, container restart, etc.). Skip; let
-        # Phase 2 scope formatter process evidence decide.
-      fi
-    done
+    if [ -n "$(_airc_pidfile_live_monitor_pids "$pidfile" | head -1)" ]; then
+      echo "yes"
+      return 0
+    fi
+    # PID alive but not airc-shaped — OS reused this PID after our
+    # monitor died (sleep/wake, container restart, etc.). Skip; let
+    # Phase 2 scope formatter process evidence decide.
   else
     # No pidfile = monitor was never started (or already torn down).
     # Bearer-state fallback would lie in this case (stale state file

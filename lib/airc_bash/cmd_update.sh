@@ -238,7 +238,7 @@ cmd_version() {
   branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
   dirty=""
   [ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ] && dirty=" (dirty)"
-  echo "  airc ${sha}${dirty} on ${branch}"
-  [ -n "$subject" ] && echo "  ${subject}"
-  echo "  install: $dir"
+  printf '  airc %s%s on %s\n' "${sha:-unknown}" "$dirty" "${branch:-unknown}"
+  [ -n "$subject" ] && printf '  %s\n' "$subject"
+  printf '  install: %s\n' "$dir"
 }
