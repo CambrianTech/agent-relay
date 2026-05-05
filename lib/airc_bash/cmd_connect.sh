@@ -464,30 +464,6 @@ cmd_connect() {
   # Stale or absent pidfile — leave for the canonical cleanup block
   # below to remove + proceed normally with the connect flow.
 
-  # User-facing recovery rule: `airc join` is the one command. If this
-  # scope has an installed daemon but no live monitor, bounce the daemon
-  # here and verify process evidence. Do not make the user remember
-  # `airc daemon restart`, and do not do this from inside the daemon
-  # process itself (AIRC_BACKGROUND_OK=1), or the daemon would restart
-  # itself before it has a chance to write pidfiles.
-  if [ -z "${AIRC_BACKGROUND_OK:-}" ] \
-     && command -v airc_daemon_is_installed_for_scope >/dev/null 2>&1 \
-     && airc_daemon_is_installed_for_scope "$AIRC_WRITE_DIR" 2>/dev/null; then
-    echo "  airc join: AIRC process is not running; repairing this scope's daemon..."
-    AIRC_HOME="$AIRC_WRITE_DIR" cmd_daemon restart >/dev/null 2>&1 || true
-    local _join_repair_i
-    for _join_repair_i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-      sleep 2
-      if [ "$(_monitor_alive_with_bearer_fallback "$_early_pidfile")" = "yes" ]; then
-        echo "  ✓ airc join repaired the daemon for this scope."
-        _join_show_status_and_inbox
-        [ "$attach" = "1" ] && _join_attach_local_stream
-        return 0
-      fi
-    done
-    echo "  ⚠ airc join could not verify daemon recovery; continuing in foreground." >&2
-  fi
-
   # Pre-flight: gh auth check. The gh keyring can silently invalidate
   # (token revoked / 2FA flow expired / brew upgrade replaced gh
   # without re-auth) and EVERY downstream gh API call then fails
@@ -1461,16 +1437,6 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
       echo "  Connected to '$peer_name' (SSH not verified — messages may need retry)"
     fi
 
-    # Daemon-install discoverability on the joiner success-path (#5 from
-    # b69f's 2026-05-02 daemon audit). Pre-fix the prompt only fired
-    # at install.sh time + the post-disconnect tip in the host branch
-    # (line ~1763). Daily 'airc join' users never saw it. Adding here
-    # so every successful joiner gets the visibility — non-blocking,
-    # silent on already-installed scopes (idempotent check).
-    if ! airc_daemon_is_installed; then
-      echo "  Tip: 'airc daemon install' keeps this mesh alive across Claude session ends + sleep/wake."
-    fi
-
     # Write PID file so `airc teardown` can find us later.
     echo $$ > "$AIRC_WRITE_DIR/airc.pid"
     # Clean exit on tab close / signal: reap the ssh tail subprocess so the
@@ -1950,11 +1916,8 @@ JSON
                     rm -f "$_hb_state_dir/host_gist_id" "$_hb_state_dir/room_gist_id" 2>/dev/null
                     printf 'heartbeat failure: %s\n' "$_classified" > "$_hb_state_dir/airc.restart-request" 2>/dev/null || true
                     # SIGTERM the parent — its EXIT trap will reap
-                    # children + clean up. With daemon installed,
-                    # launchd/systemd respawns; without daemon, the
-                    # parent's reconnect loop catches the EXIT and the
-                    # user gets a clean "host evicted" log line in
-                    # messages.jsonl.
+                    # children + clean up. The user-facing recovery is
+                    # to run `airc join` again in the same scope.
                     kill -TERM "$_hb_parent_pid" 2>/dev/null
                     exit 0
                   fi
@@ -2013,21 +1976,6 @@ JSON
             echo "    airc join $_invite_long"
             echo ""
             echo "  (Room gist: $_gist_url — persistent; deleted on 'airc part'.)"
-            # First-time-host daemon hint (#382). The reconnect-loop in the
-            # airc top-level already prints the "(for auto-recovery: airc
-            # daemon install)" tip — but only AFTER the mesh has gone down.
-            # Surface it earlier here, on first host-bootstrap, so the user
-            # can flip auto-restart on while their mesh is still healthy.
-            # Only fires when the daemon isn't already installed (idempotent
-            # re-runs / re-hosts stay silent). Uses the centralized
-            # cross-platform detector (lib_daemon_detect.sh) so this fires
-            # correctly on darwin / linux / wsl / windows. Pre-fix this
-            # block only checked Darwin/Linux file paths and never fired
-            # on Windows where the daemon lives in HKCU\...\Run (Copilot
-            # review on PR #388 caught this gap).
-            if ! airc_daemon_is_installed; then
-              echo "  Tip: 'airc daemon install' keeps this mesh alive across machine sleep."
-            fi
           else
             echo "  On the other machine (pick whichever is easiest to share):"
             echo ""

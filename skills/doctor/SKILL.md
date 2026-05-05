@@ -16,7 +16,7 @@ Audience: Claude Code, Codex, future agent runtimes. Goal: leave the user with a
 |---|---|
 | `airc doctor` | env probe (gh, ssh, python, tailscale) — fast, local |
 | `airc doctor --join` | pre-flight before `airc join` (also probes cached host) |
-| `airc doctor --health` | LIVE bus health (rate-limit headroom, daemon, per-channel bearer last-recv) |
+| `airc doctor --health` | LIVE bus health (rate-limit headroom, process, per-channel bearer last-recv) |
 | `airc doctor --fix` | repair recoverable issues (currently: gh auth re-login) |
 | `airc doctor --tests [scenario]` | full integration suite (~245 assertions, 32 scenarios) |
 
@@ -26,7 +26,7 @@ Aliases for `--tests`: `airc tests`, `airc test`.
 
 When something feels wrong, in this order:
 
-1. **`airc doctor --health`** — live bus state. Fast. Catches silent-blackout (rate-limited, daemon crashed, bearer wedged). Green → bus is fine, issue is upstream.
+1. **`airc doctor --health`** — live bus state. Fast. Catches silent-blackout (rate-limited, join process stopped, bearer wedged). Green → bus is fine, issue is upstream.
 2. **`airc doctor`** — env regression check. Gh missing, sshd down, python broken.
 3. **`airc inbox --peek`** — most-recent unread context without advancing the cursor.
 4. **`airc doctor --tests`** — only if 1-3 are green and the bug is reproducible.
@@ -39,12 +39,11 @@ When something feels wrong, in this order:
 | `[info] gh core rate-limit: <N>/5000` (<1000) | Reduced headroom | None; bearer auto-throttles per #416 |
 | `[WARN] gh core rate-limit: <N>/5000` (<100) | Bus may stall soon | Wait for window reset; peers resume automatically |
 | `[BLOCKED] gh API not reachable` | Network or token | Run `airc doctor` for env probe |
-| `[ok] daemon running (pid N)` | Persistence layer up | None |
-| `[WARN] daemon installed but DOWN` | Stale launchd/systemd state | `airc join` |
-| `[info] daemon not installed` | Optional layer | Auto-suggest if user is on a laptop |
+| `[ok] airc process running` | Join process up | None |
+| `[WARN] airc process not running` | Disconnected scope | `airc join` |
 | `[ok] #<channel> — last bearer recv <Ns>` (<60s) | Healthy | None |
 | `[info] #<channel> — last bearer recv <Ns>` (<5min) | Idle | None |
-| `[WARN] #<channel> — last bearer recv <Ns>` (5-30min stale) | Check daemon + rate-limit | Surface to user |
+| `[WARN] #<channel> — last bearer recv <Ns>` (5-30min stale) | Check join process + rate-limit | Surface to user |
 | `[BLOCKED] #<channel> — last bearer recv <Ns>` (>30min wedged) | Bearer wedged | `airc join` |
 
 ## env probe (`airc doctor`)

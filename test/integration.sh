@@ -2019,7 +2019,7 @@ PY
   ( exec -a "airc connect" sleep 60 ) &
   local fake_airc_pid=$!
   echo "$fake_airc_pid" > "$home/airc.pid"
-  AIRC_HOME="$home" "$AIRC" msg "live monitor probe ascii" >"$out" 2>"$err"
+  AIRC_CLIENT_ID="test-client-live-monitor" AIRC_HOME="$home" "$AIRC" msg "live monitor probe ascii" >"$out" 2>"$err"
   rc=$?
   [ "$rc" = "0" ] \
     && pass "live-pid scope: send returns 0 (no false positive on liveness check)" \
