@@ -572,7 +572,7 @@ cmd_connect() {
       echo ""
       echo "   Right launchers:"
       echo "     • Claude Code skill:   /airc:join <invite>"
-      echo "     • Monitor tool:        Monitor(persistent=true, command=\"airc join <invite>\")"
+      echo "     • Monitor tool:        Monitor(persistent=true, description=\"airc\", command=\"airc join --attach <invite>\")"
       echo "     • Interactive shell:   just type \`airc join <invite>\` at a TTY"
       echo ""
       echo "   Bypass for legitimate background use (systemd + log tail,"

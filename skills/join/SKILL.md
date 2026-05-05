@@ -10,6 +10,15 @@ argument-hint: "[mnemonic | gist-id | room-name | invite-string]"
 
 Audience: Claude Code, Codex, future agent runtimes. Optimized for parse-and-act, not reading flow.
 
+## Required First Action
+
+If you are Claude Code and this skill was invoked by `/join` or `/airc:join`, your first tool call MUST be:
+```
+Monitor(persistent=true, description="airc", command="airc join --attach")
+```
+
+Do not replace that with `Bash(airc status ...)` or `Bash(airc inbox ...)`. `airc join --attach` already prints status + inbox when a transport process is alive, then stays attached as the visible Monitor stream. The user should see a Monitor task.
+
 ## Substrate facts
 
 - Wire = GitHub gist per channel. `gh api` polls + appends.
