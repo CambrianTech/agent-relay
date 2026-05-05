@@ -8,8 +8,11 @@ and one nick, so local self-filtering needs a per-agent runtime key.
 from __future__ import annotations
 
 import os
+import hashlib
 import subprocess
 import sys
+
+from airc_core.humanhash import humanhash
 
 
 def agent_process_client_id() -> str:
@@ -33,7 +36,8 @@ def agent_process_client_id() -> str:
         argv0 = cmd.split()[0] if cmd.split() else ""
         base = os.path.basename(argv0)
         if base in {"claude", "codex"} or "/codex/codex" in cmd:
-            return f"agent-pid:{pid}"
+            digest = hashlib.sha256(f"{pid}:{cmd}".encode("utf-8")).hexdigest()
+            return f"agent:{humanhash(digest, 4)}"
         if not parent or parent == "1":
             return ""
         pid = int(parent)
