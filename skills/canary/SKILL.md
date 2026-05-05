@@ -63,12 +63,7 @@ Monitor(persistent=true, description="airc", command="airc join")
 Codex / non-Monitor runtimes:
 ```bash
 airc teardown
-scope=$(airc debug-scope)
-mkdir -p "$scope"
-nohup airc join > "$scope/codex-airc.log" 2>&1 &
-sleep 2
-airc status
-airc inbox
+airc codex-start
 ```
 
 ## When to use this skill
