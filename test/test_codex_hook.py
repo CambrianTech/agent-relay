@@ -56,9 +56,43 @@ class CodexHookTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             payload = json.loads(out.getvalue())
             context = payload["hookSpecificOutput"]["additionalContext"]
+            self.assertIn("AIRC digest: 1 unread unique message", context)
             self.assertIn("peer: hello", context)
             self.assertNotIn("me: self", context)
             self.assertTrue(cursor.exists())
+
+    def test_user_prompt_hook_dedupes_and_limits_digest(self):
+        tmp, home, cursor = self._scope()
+        with tmp:
+            (home / "messages.jsonl").write_text(
+                self._line("peer", "2099-05-04T20:00:01Z", "duplicate", "peer-client")
+                + self._line("peer", "2099-05-04T20:00:02Z", "duplicate", "peer-client")
+                + self._line("peer", "2099-05-04T20:00:03Z", "newest", "peer-client"),
+                encoding="utf-8",
+            )
+            out = io.StringIO()
+            with patch("sys.stdin", io.StringIO("{}")):
+                with redirect_stdout(out):
+                    rc = codex_hook.main(
+                        [
+                            "user-prompt-submit",
+                            "--home",
+                            str(home),
+                            "--cursor-file",
+                            str(cursor),
+                            "--client-id",
+                            "self-client",
+                            "--max-items",
+                            "1",
+                        ]
+                    )
+            self.assertEqual(rc, 0)
+            context = json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"]
+            self.assertIn("AIRC digest: 2 unread unique message", context)
+            self.assertIn("Showing latest 1", context)
+            self.assertIn("newest", context)
+            self.assertNotIn("duplicate", context)
+            self.assertIn("If the digest is insufficient", context)
 
     def test_user_prompt_hook_is_silent_when_empty(self):
         tmp, home, cursor = self._scope()
