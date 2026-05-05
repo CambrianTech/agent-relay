@@ -211,7 +211,7 @@ ensure_prereqs() {
     # Strict probe: presence on PATH AND a successful --version invocation.
     # Used selectively: python3 needs the strict variant because Windows
     # Store's python3.exe alias is on PATH but exits 49 with a Store-
-    # redirect (continuum-b69f, 2026-04-27). git/gh all
+    # redirect (2026-04-27). git/gh all
     # support --version cleanly. ssh-keygen does NOT have a version
     # flag at all (different from `ssh -V`); calling `ssh-keygen
     # --version` exits non-zero on every install, so the strict probe
@@ -427,7 +427,7 @@ else
   # First install. Honor AIRC_CHANNEL if set so users can land on canary
   # directly via `AIRC_CHANNEL=canary curl|bash` without a follow-up
   # `airc canary && airc update` dance. Default to main (the release
-  # branch) when AIRC_CHANNEL is unset. Caught by vhsm-d1f4 2026-04-28
+  # branch) when AIRC_CHANNEL is unset. Caught by QA 2026-04-28
   # during the #191 release-gate fresh-install verification: env var was
   # silently ignored, install landed on main.
   CHANNEL_TARGET="${AIRC_CHANNEL:-main}"
@@ -460,7 +460,7 @@ ln -sf "$CLONE_DIR/airc" "$BIN_DIR/relay"
 # made airc.ps1 a thin forwarder to bash, but that's moot if the
 # .ps1 isn't on PATH. cp (not ln -sf) — Windows symlinks are
 # privileged + flaky; copying is universal. Caught by
-# continuum-b69f 2026-04-29 (issue #249 PowerShell row).
+# 2026-04-29 (issue #249 PowerShell row).
 case "$(uname -s 2>/dev/null)" in
   MINGW*|MSYS*|CYGWIN*)
     [ -f "$CLONE_DIR/airc.cmd" ] && cp -f "$CLONE_DIR/airc.cmd" "$BIN_DIR/airc.cmd"
@@ -558,13 +558,15 @@ _install_airc_skills_into() {
   # this list omits it.)
   local old
   for old in "$skills_target"/relay-* "$skills_target"/monitor "$skills_target"/setup \
-             "$skills_target"/connect "$skills_target"/send "$skills_target"/rename "$skills_target"/disconnect; do
+             "$skills_target"/connect "$skills_target"/send "$skills_target"/rename "$skills_target"/disconnect \
+             "$skills_target"/inbox; do
     [ -L "$old" ] && rm "$old" 2>/dev/null
   done
 
   local skill_dir skill_name target
   for skill_dir in "$CLONE_DIR"/skills/*/; do
     [ -d "$skill_dir" ] || continue
+    [ -f "$skill_dir/SKILL.md" ] || continue
     skill_name="$(basename "$skill_dir")"
     target="$skills_target/$skill_name"
     # If the target is a real directory (from a pre-rename hand-install
@@ -729,6 +731,113 @@ if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
   _install_airc_codex_permission_profile
 fi
 
+# ── Codex model-visible AIRC turn contract ─────────────────────────────
+# Codex currently has no Claude-style Monitor tool. A daemon can keep
+# the transport alive, but the model will not notice inbound peer
+# traffic unless it polls local state during a turn. Install a small
+# model-visible instruction so future Codex sessions surface AIRC
+# traffic reliably without hitting GitHub: `airc codex-poll` reads the
+# local messages.jsonl cursor, suppresses empty output, and excludes
+# this identity's own messages.
+#
+# We only write this if the user has no existing developer_instructions
+# key. If they do, do not overwrite; they can copy the block manually or
+# opt into a profile. This keeps install.sh from clobbering unrelated
+# Codex configuration.
+
+_install_airc_codex_developer_instructions() {
+  local config="$HOME/.codex/config.toml"
+  local hooks_json="$HOME/.codex/hooks.json"
+  [ "${AIRC_SKIP_CODEX_INSTRUCTIONS:-0}" = "1" ] && return 0
+  [ -f "$config" ] || return 0
+
+  if grep -qE '^[[:space:]]*codex_hooks[[:space:]]*=[[:space:]]*true' "$config" 2>/dev/null \
+     && [ -f "$hooks_json" ] \
+     && grep -qF 'airc codex-hook user-prompt-submit' "$hooks_json" 2>/dev/null; then
+    if grep -qF 'AIRC-CODEX-INSTRUCTIONS-START' "$config" 2>/dev/null; then
+      local _tmp; _tmp=$(mktemp)
+      sed '/^# AIRC-CODEX-INSTRUCTIONS-START/,/^# AIRC-CODEX-INSTRUCTIONS-END/d' "$config" > "$_tmp"
+      mv "$_tmp" "$config"
+    fi
+    info "  Codex AIRC hook already installed; skipping legacy developer_instructions polling contract"
+    return 0
+  fi
+
+  if grep -qF 'AIRC-CODEX-INSTRUCTIONS-START' "$config" 2>/dev/null; then
+    local _tmp; _tmp=$(mktemp)
+    sed '/^# AIRC-CODEX-INSTRUCTIONS-START/,/^# AIRC-CODEX-INSTRUCTIONS-END/d' "$config" > "$_tmp"
+    mv "$_tmp" "$config"
+  fi
+
+  if grep -qE '^[[:space:]]*developer_instructions[[:space:]]*=' "$config" 2>/dev/null; then
+    info "  ~/.codex/config.toml already has developer_instructions; skipping airc Codex turn contract"
+    return 0
+  fi
+
+  local _tmp; _tmp=$(mktemp)
+  {
+    cat <<'TOML'
+# AIRC-CODEX-INSTRUCTIONS-START — managed by install.sh; remove this section through AIRC-CODEX-INSTRUCTIONS-END to opt out
+developer_instructions = """
+AIRC Codex runtime contract:
+- At the beginning of every user turn, before substantive work, if `airc` is available on PATH, run `airc codex-poll`.
+- `airc codex-poll` is local-only: it reads this scope's local message cursor, prints only unread peer messages, advances the cursor, and is silent when empty.
+- If `airc codex-poll` prints messages, briefly surface them to the user and account for them before continuing. If it is silent or says the scope is not initialized, continue normally.
+- Do not claim AIRC collaboration is healthy from process health alone. Distinguish transport/process liveness from whether this Codex session has actually polled and seen peer traffic.
+"""
+# AIRC-CODEX-INSTRUCTIONS-END
+
+TOML
+    cat "$config"
+  } > "$_tmp"
+  mv "$_tmp" "$config"
+  ok "Added Codex AIRC turn contract to ~/.codex/config.toml — restart Codex to activate automatic local inbox polling"
+}
+
+if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
+  _install_airc_codex_developer_instructions
+fi
+
+# ── Codex lifecycle hook for local AIRC inbox injection ────────────────
+# Newer Codex CLI builds can run deterministic hooks at turn boundaries.
+# Install a UserPromptSubmit hook so unread airc messages become
+# developer context before each user prompt reaches the model. This is
+# the closest Codex equivalent to Claude Code's Monitor notifications:
+# no GitHub calls, no log-tail polling in the model, and no dependence
+# on the agent remembering the turn contract.
+
+_install_airc_codex_hooks() {
+  [ "${AIRC_SKIP_CODEX_HOOKS:-0}" = "1" ] && return 0
+  [ -f "$HOME/.codex/config.toml" ] || return 0
+
+  local _python="${_airc_venv_python_bin:-}"
+  if [ -z "$_python" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+      _python=python3
+    elif command -v python >/dev/null 2>&1; then
+      _python=python
+    else
+      warn "Could not install Codex AIRC hook: python not found"
+      return 0
+    fi
+  fi
+
+  local out
+  if out=$(PYTHONPATH="$CLONE_DIR/lib${PYTHONPATH:+:$PYTHONPATH}" "$_python" -m airc_core.codex_install --codex-home "$HOME/.codex" install-hooks 2>&1); then
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out" | while IFS= read -r line; do
+        ok "Codex AIRC hook: $line"
+      done
+    fi
+  else
+    warn "Could not install Codex AIRC hook: $out"
+  fi
+}
+
+if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
+  _install_airc_codex_hooks
+fi
+
 # ── Codex GH_TOKEN env injection ───────────────────────────────────────
 # Codex's sandbox can't reliably reach the macOS Keychain to validate
 # gh's stored token. Result: gh auth status flakes between ✓ and X
@@ -853,117 +962,15 @@ if command -v codex >/dev/null 2>&1 && [ -d "$HOME/.codex" ]; then
 fi
 
 
-# ── Optional: background daemon for sleep/wake/crash survival (#382) ───
+# ── Optional background daemon ─────────────────────────────────────────
 #
-# Issue: by default the mesh dies when peer laptops sleep — `airc connect`
-# is just a process, sleeps with the machine, never re-spawns on wake.
-# The remedy (`airc daemon install`) already exists but was only surfaced
-# AFTER the mesh had gone down (see the in-disconnect tip in the airc
-# top-level). By that time peers have missed however many hours of mesh
-# activity. This block surfaces the offer at install time, when the user
-# is already engaged in setup and can flip the auto-restart on with one
-# keystroke.
-#
-# Skip conditions:
-#   - daemon already installed (idempotent re-run)
-#   - non-TTY install (curl-bash piped without terminal)
-#   - AIRC_INSTALL_NO_DAEMON=1 (explicit opt-out for headless servers,
-#     CI runners, environments that manage daemons via their own
-#     config-management like Ansible/Chef/Nix)
-#   - AIRC_INSTALL_YES=1 (power-user one-liner: install the daemon
-#     without asking)
-# Source the centralized cross-platform daemon detector + its dependency
-# (detect_platform from platform_adapters.sh). Lets install.sh ask the
-# same "is the daemon installed?" question that cmd_daemon.sh + cmd_connect.sh
-# ask, so the answer is consistent across darwin / linux / wsl / windows.
-# Pre-fix install.sh had its own _daemon_already_installed() that only
-# covered Darwin/Linux file paths — Copilot review on PR #388 caught
-# that this would re-prompt on every install rerun on Windows Git Bash
-# even after `airc daemon install` had registered the HKCU Run-key.
-if [ -f "$CLONE_DIR/lib/airc_bash/platform_adapters.sh" ] \
-   && [ -f "$CLONE_DIR/lib/airc_bash/lib_daemon_detect.sh" ]; then
-  # shellcheck source=lib/airc_bash/platform_adapters.sh
-  source "$CLONE_DIR/lib/airc_bash/platform_adapters.sh"
-  # shellcheck source=lib/airc_bash/lib_daemon_detect.sh
-  source "$CLONE_DIR/lib/airc_bash/lib_daemon_detect.sh"
-else
-  # Defensive fallback so install doesn't die on a weird CLONE_DIR layout.
-  # The prompt block below tolerates the function being absent (treats
-  # "unknown daemon state" as "not installed → offer prompt").
-  # BOTH detect functions need stubs (Copilot #422 review): under
-  # `set -euo pipefail` a bare call to airc_daemon_is_installed_for_scope
-  # would `command not found` → install.sh exits non-zero instead of
-  # gracefully degrading. Both stubs return 1 ("not installed").
-  airc_daemon_is_installed()           { return 1; }
-  airc_daemon_is_installed_for_scope() { return 1; }
-fi
-
-# Order matters here. Four NON-prompt branches first, ordered so the
-# loudest user intent wins:
-#   1. AIRC_INSTALL_NO_DAEMON=1 — explicit opt-out trumps everything.
-#   2. AIRC_INSTALL_YES=1       — explicit auto-install (Copilot #388:
-#                                 must come BEFORE the non-TTY check
-#                                 so `curl … | AIRC_INSTALL_YES=1 bash`
-#                                 actually installs instead of falling
-#                                 into the non-TTY tip branch).
-#   3. daemon already installed  — idempotent re-run; nothing to do.
-#   4. Non-TTY                   — no human to prompt; surface tip text.
-#   5. TTY interactive prompt    — default path.
-# Scope the daemon will end up wired to. Mirrors cmd_daemon.sh::_daemon_scope
-# so the "is daemon installed for this scope?" check below matches what
-# `airc daemon install` would actually create. b69f 2026-05-02 caught the
-# scope-mismatch bug: any-daemon-registered → install.sh skipped → user
-# left with no daemon for the scope they were bootstrapping.
-INSTALL_DAEMON_SCOPE="${AIRC_HOME:-$(pwd -P)/.airc}"
-
-if [ "${AIRC_INSTALL_NO_DAEMON:-0}" = "1" ]; then
-  info "AIRC_INSTALL_NO_DAEMON=1 — skipping daemon install prompt"
-elif [ "${AIRC_INSTALL_YES:-0}" = "1" ]; then
-  if airc_daemon_is_installed_for_scope "$INSTALL_DAEMON_SCOPE"; then
-    info "AIRC_INSTALL_YES=1 — airc daemon already installed for this scope (no-op)"
-  else
-    if airc_daemon_is_installed; then
-      info "AIRC_INSTALL_YES=1 — daemon registered for a different scope; reinstalling for $INSTALL_DAEMON_SCOPE"
-    else
-      info "AIRC_INSTALL_YES=1 — installing airc daemon"
-    fi
-    if "$BIN_DIR/airc" daemon install; then
-      ok "airc daemon installed"
-    else
-      warn "airc daemon install returned non-zero (continuing — re-run manually if needed)"
-    fi
-  fi
-elif airc_daemon_is_installed_for_scope "$INSTALL_DAEMON_SCOPE"; then
-  info "airc daemon already installed for this scope (skipping prompt)"
-elif [ ! -t 0 ] || [ ! -t 1 ]; then
-  # Non-TTY install can't prompt. Surface the option so the user sees it
-  # in their install transcript and can run it later — the help string
-  # mirrors the post-disconnect tip in airc's reconnect path.
-  info "Tip: run 'airc daemon install' to keep the mesh alive across machine sleep/wake/crash"
-else
-  if airc_daemon_is_installed; then
-    printf '\n  \033[1;32m==>\033[0m airc daemon is registered, but for a different scope.\n'
-    printf '      Reinstall and wire it to %s?\n' "$INSTALL_DAEMON_SCOPE"
-    printf '      Re-registers the launcher to point at this scope; safe to do.\n'
-  else
-    printf '\n  \033[1;32m==>\033[0m Install the airc background daemon?\n'
-    printf '      Keeps the mesh alive across machine sleep/wake/crash without\n'
-    printf '      requiring you to re-run `airc connect` after every wake. Adds\n'
-    printf '      a launchd / systemd / HKCU-Run entry that auto-restarts the host.\n'
-  fi
-  printf '      Skip next time by setting AIRC_INSTALL_NO_DAEMON=1.\n'
-  printf '      [Y/n] '
-  read -r _daemon_reply || _daemon_reply=""
-  case "${_daemon_reply}" in
-    n|N|no|No|NO)
-      info "Skipped daemon install. Run 'airc daemon install' later if you change your mind." ;;
-    *)
-      if "$BIN_DIR/airc" daemon install; then
-        ok "airc daemon installed"
-      else
-        warn "airc daemon install returned non-zero — re-run manually:  airc daemon install"
-      fi ;;
-  esac
+# Deliberately not installed or prompted from install.sh. The public
+# product surface is `airc join`; the daemon is only an explicit
+# supervisor for unattended machines that need `airc join` restarted at
+# login/sleep/wake. Keeping curl/install side-effect-light avoids macOS
+# Login Items surprises and keeps first-run setup easy to trust.
+if [ "${AIRC_INSTALL_YES:-0}" = "1" ]; then
+  info "AIRC_INSTALL_YES=1 no longer installs the daemon automatically; run 'airc daemon install' explicitly if wanted."
 fi
 
 # ── Done ────────────────────────────────────────────────────────────────

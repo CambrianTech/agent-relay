@@ -139,6 +139,15 @@ if [ -f "$codex_config" ]; then
     mv "$_tmp" "$codex_config"
     ok "Removed airc command-rules pre-approval from $codex_config"
   fi
+  if [ -x "$CLONE_DIR/.venv/bin/python" ]; then
+    if out=$(PYTHONPATH="$CLONE_DIR/lib${PYTHONPATH:+:$PYTHONPATH}" "$CLONE_DIR/.venv/bin/python" -m airc_core.codex_install --codex-home "$HOME/.codex" uninstall-hooks 2>&1); then
+      if [ -n "$out" ]; then
+        printf '%s\n' "$out" | while IFS= read -r line; do
+          ok "Codex AIRC hook: $line"
+        done
+      fi
+    fi
+  fi
 fi
 
 # 4. Binary forwarders on PATH.

@@ -32,7 +32,7 @@ cmd_send() {
   # model means a tab is in #project-room AND #general simultaneously,
   # but each room has its own scope. Without --room support here, sending
   # to a non-current room required `AIRC_HOME=$cwd/.airc.<room> airc msg`,
-  # which is nonobvious (vhsm-Claude attempted `airc msg --room general`
+  # which is nonobvious (an agent attempted `airc msg --room general`
   # on 2026-04-26, the unrecognized flag silently became part of the
   # message body — exactly the evidence-eating shape the project rejects).
   #
@@ -65,6 +65,10 @@ cmd_send() {
   # issue. Exposed as a flag (not an env var) so call sites are
   # grep-able and the pattern matches the rest of the airc CLI surface.
   local internal=0
+  # --system: protocol/system event. Uses the same send path as chat so
+  # peers see lifecycle state on gh/local transports, but stamps from=airc
+  # so monitor/inbox render it as a system notice instead of peer text.
+  local system_event=0
   # --plaintext: skip envelope-layer encryption even when recipient
   # x25519 pubkey is on file. For control traffic ([PING:uuid] /
   # [PONG:uuid]) where the body is a public uuid with zero secret
@@ -96,6 +100,10 @@ cmd_send() {
         _explicit_channel=1
         shift 2 ;;
       --internal)
+        internal=1
+        shift ;;
+      --system)
+        system_event=1
         internal=1
         shift ;;
       --plaintext|-plaintext)
@@ -166,7 +174,7 @@ cmd_send() {
     case "$1" in
       @*)
         local _p="${1#@}"
-        # Reject empty `@` (continuum-b741 + ideem-local-4bef caught
+        # Reject empty `@` (caught
         # 2026-04-29: `airc msg @ body` silently broadcast). Reject
         # double-@ `@@peer` while we're here (also caught: accepted as
         # DM to literal '@peer'). Reject numeric-only DMs as per the
@@ -219,19 +227,30 @@ cmd_send() {
     msg="$*"
   fi
   # Reject empty broadcast bodies — pre-fix `airc msg ""` printed the
-  # usage line but exited 0 (continuum-b741 caught 2026-04-29). The
+  # usage line but exited 0 (caught 2026-04-29). The
   # other "no message" path already dies above; this one is the
   # explicit-empty-string case that fell through.
   [ "$peer_name" = "all" ] && [ -z "$msg" ] \
     && die "empty message body (use 'airc msg <text>' or omit the empty quotes)"
   ensure_init
 
+  _airc_append_local_signed() {
+    if ! printf '%s\n' "$1" | "$AIRC_PYTHON" -m airc_core.log_append append --path "$MESSAGES" >/dev/null; then
+      echo "$1" >> "$MESSAGES"
+    fi
+  }
+
   local my_name ts_val
   my_name=$(get_name)
   ts_val=$(timestamp)
+  local client_id; client_id=$(airc_client_id 2>/dev/null || true)
 
   local escaped_msg
   escaped_msg=$(printf '%s' "$msg" | "$AIRC_PYTHON" -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])")
+  local escaped_client_id=""
+  if [ -n "$client_id" ]; then
+    escaped_client_id=$(printf '%s' "$client_id" | "$AIRC_PYTHON" -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])")
+  fi
 
   # Channel: stamp every outbound envelope with the active channel so the
   # monitor display can route by channel uniformly (Phase 2 mesh
@@ -253,9 +272,14 @@ cmd_send() {
   fi
   [ -z "$active_channel" ] && active_channel="general"
 
-  local payload="{\"from\":\"$my_name\",\"to\":\"$peer_name\",\"ts\":\"$ts_val\",\"channel\":\"$active_channel\",\"msg\":\"$escaped_msg\"}"
+  local from_name="$my_name"
+  [ "$system_event" = "1" ] && from_name="airc"
+  local payload="{\"from\":\"$from_name\",\"to\":\"$peer_name\",\"ts\":\"$ts_val\",\"channel\":\"$active_channel\",\"msg\":\"$escaped_msg\""
+  [ -n "$escaped_client_id" ] && payload="${payload},\"client_id\":\"$escaped_client_id\""
+  payload="${payload}}"
   local sig; sig=$(sign_message "$payload")
-  local full_msg="{\"from\":\"$my_name\",\"to\":\"$peer_name\",\"ts\":\"$ts_val\",\"channel\":\"$active_channel\",\"msg\":\"$escaped_msg\",\"sig\":\"$sig\"}"
+  local full_msg="${payload%?}"
+  full_msg="${full_msg},\"sig\":\"$sig\"}"
 
   local host_target
   host_target=$(get_config_val host_target "")
@@ -267,7 +291,7 @@ cmd_send() {
     # audit log of what they sent — the alternative would force `airc
     # logs` to decrypt own outbound, which is silly). Wire form may be
     # encrypted below if the recipient has a stored x25519_pub.
-    echo "$full_msg" >> "$MESSAGES"
+    _airc_append_local_signed "$full_msg"
 
     # Phase E.3: wrap the wire envelope with envelope-layer encryption
     # if we have the recipient's X25519 pubkey on file. Empty pubkey =
@@ -458,14 +482,13 @@ cmd_send() {
     #
     # Detect monitor liveness via the shared sandbox-robust helper
     # (_monitor_alive_with_bearer_fallback in airc top-level). Same
-    # contract as cmd_status post-#371. Phase 1 = kill -0 (canonical);
-    # phase 2 = bearer-state freshness (covers Codex's sandbox where
-    # kill -0 is process-tree-blind even when bearer-recv is provably
-    # writing to bearer_state.<channel>.json). Pre-fix this used the
-    # naked prune_pidfile_and_count helper which would ALSO actively
-    # delete the pidfile when phase 1 was wrong about death — silently
-    # corrupting state inside Codex's sandbox. The new helper is read-
-    # only + sandbox-aware. #370/#371/#372 root cause cluster.
+    # contract as cmd_status. Phase 1 = kill -0 (canonical); phase 2 =
+    # scope-owned monitor_formatter process evidence (covers Codex's
+    # sandbox without confusing fresh bearer_state with a Monitor).
+    # Pre-fix this used the naked prune_pidfile_and_count helper which
+    # would ALSO actively delete the pidfile when phase 1 was wrong
+    # about death — silently corrupting state inside Codex's sandbox.
+    # The helper is read-only + sandbox-aware.
     local _pidfile="$AIRC_WRITE_DIR/airc.pid"
     local _monitor_alive=0
     if [ "$(_monitor_alive_with_bearer_fallback "$_pidfile")" = "yes" ]; then
@@ -483,7 +506,7 @@ cmd_send() {
       # multi-scope state) would give the rename feature a worse UX
       # than no-propagation had.
       if [ "$internal" = "1" ]; then
-        echo "$full_msg" >> "$MESSAGES"
+        _airc_append_local_signed "$full_msg"
         date +%s > "$AIRC_WRITE_DIR/last_sent" 2>/dev/null
         rm -f "$AIRC_WRITE_DIR/reminded" 2>/dev/null
         return 0
@@ -496,7 +519,7 @@ cmd_send() {
       else
         echo "    pidfile:  absent (monitor never started in this scope)" >&2
       fi
-      echo "  Fix: run 'airc connect' to start (or resume) this scope's monitor, then retry." >&2
+      echo "  Fix: run 'airc join' to start (or resume) this scope's monitor, then retry." >&2
       echo "       OR cd into the scope you actually meant to send from." >&2
       die "monitor down — refusing to silently broadcast into a void"
     fi
@@ -555,7 +578,10 @@ cmd_send() {
           # this happened unconditionally before the publish attempt, so
           # the user's own monitor would echo their message back even when
           # joiners never saw it — false success surface (#381 RCA).
-          echo "$full_msg" >> "$MESSAGES"
+          # GhBearer.send already writes to the local bus. The monitor mirrors
+          # that signed envelope into messages.jsonl; appending here races with
+          # the mirror and creates duplicate local audit rows.
+          :
           ;;
         auth_failure)
           # Hard failure mirror of joiner branch above. Don't queue —
@@ -652,7 +678,7 @@ cmd_send() {
       esac
     else
       echo "  ⚠ No room_gist_id set ($AIRC_WRITE_DIR/room_gist_id missing) — host send is local-only." >&2
-      echo "$full_msg" >> "$MESSAGES"
+      _airc_append_local_signed "$full_msg"
     fi
   fi
 
@@ -671,6 +697,14 @@ cmd_send() {
       echo "  → #${active_channel} (broadcast)"
     else
       echo "  → @${peer_name} on #${active_channel}"
+    fi
+    local _peer_count=0
+    if [ -d "$PEERS_DIR" ]; then
+      _peer_count=$(find "$PEERS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | wc -l | tr -d ' ')
+    fi
+    if [ "${_peer_count:-0}" -eq 0 ] 2>/dev/null; then
+      "$AIRC_PYTHON" -m airc_core.collaboration send-warning \
+        --home "$AIRC_WRITE_DIR" --my-name "$(get_name)" 2>/dev/null || true
     fi
   fi
 }

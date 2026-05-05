@@ -39,13 +39,234 @@ nothing else.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import signal
+import subprocess
 import sys
+import time
+import threading
 from dataclasses import asdict
+from typing import Optional, Tuple, Union
 
 from .bearer_resolver import resolve
+
+
+# ── Per-(scope, gist) bearer lock ─────────────────────────────────────
+# Without this lock, scope teardown that leaks orphan bearers OR a
+# host-gist-rotation respawn that races with the old bearer can end up
+# with TWO bearer_cli processes polling the same gist. Both yield each
+# new line to their stdout. If their pipes
+# converge (the parent monitor's children share a downstream pipe, or
+# both feed an unprivileged log), each downstream message arrives twice.
+#
+# Repro Joel hit 2026-05-04: peer broadcast appeared TWICE in the
+# monitor stream with identical body + identical session nonce.
+# Diagnosed: 3 live bearer_cli processes for #general across leaked
+# test scopes + the live monitor's own respawned child.
+#
+# Pattern matches cmd_connect's #97 self-heal: pidfile + cmdline-shape
+# verification (kill -0 alone is unsafe — OS reuses PIDs after wake).
+
+_LOCK_DISABLED = "disabled"
+_LOCK_HELD = "held"
+RecvLockResult = Union[Tuple[str, int], str]
+_STATE_FILE_LOCK = threading.RLock()
+
+
+def _pid_alive(pid: int) -> bool:
+    """True iff pid is a live process. Same `os.kill(pid, 0)` probe
+    cmd_connect / handshake use; no signal sent.
+
+    PermissionError (EPERM) means the PID exists but is owned by another
+    user — still counts as alive. ProcessLookupError (ESRCH) means dead.
+    Other OSError means we can't tell — be conservative, assume alive.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+
+
+def _bearer_cmdline_matches(pid: int, expected_gist: str) -> Optional[bool]:
+    """Return True/False when process shape is known, None when unknown."""
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    cmdline = (out.stdout or "").strip()
+    if "bearer_cli" not in cmdline or " recv " not in f" {cmdline} ":
+        return False
+    if expected_gist:
+        return f"--room-gist-id {expected_gist}" in cmdline
+    return True
+
+
+def _is_our_bearer(pid: int, expected_gist: str) -> bool:
+    """True iff PID's cmdline matches bearer_cli recv for `expected_gist`.
+
+    Cross-platform via `ps -p <pid> -o command=`. The PID alone is unsafe
+    (OS reuses PIDs after sleep/wake — Joel hit this in #97). Verify the
+    process is actually a bearer_cli recv AND for our gist; otherwise
+    treat the pidfile as stale.
+    """
+    return _bearer_cmdline_matches(pid, expected_gist) is True
+
+
+def _read_lock_owner(pidfile: str) -> Tuple[int, str]:
+    try:
+        with open(pidfile, "r") as f:
+            data = f.read().strip()
+    except OSError:
+        return (0, "")
+    parts = data.split("\t", 1)
+    try:
+        pid = int(parts[0]) if parts and parts[0] else 0
+    except ValueError:
+        pid = 0
+    gist = parts[1] if len(parts) > 1 else ""
+    return (pid, gist)
+
+
+def _recv_lock_pidfile(state_file: str, gist_id: str) -> str:
+    """Return the pidfile path for a recv lock.
+
+    Natural key is the wire, not the channel label. Two subscribed
+    channels may legitimately point at the same gist during host
+    bootstrap, gist rotation, or same-room aliases; only one bearer
+    should poll that gist in a scope. The envelope's channel field and
+    monitor_formatter handle display/routing downstream.
+    """
+    if gist_id:
+        lock_dir = os.path.dirname(state_file) or "."
+        safe = "".join(c if c.isalnum() else "_" for c in gist_id)
+        return os.path.join(lock_dir, f"bearer_gist.{safe}.pid")
+    if state_file.endswith(".json"):
+        return state_file[: -len(".json")] + ".pid"
+    return state_file + ".pid"
+
+
+def _claim_recv_lock(args) -> RecvLockResult:
+    """Per-(scope, gist) bearer-recv lock.
+
+    Returns (pidfile_path, my_pid) on successful claim — caller registers
+    atexit cleanup. Returns _LOCK_HELD if another live bearer already
+    serves this stream — caller should exit 0 cleanly. Returns
+    _LOCK_DISABLED when no lock can/should be used, and caller should
+    continue without the duplicate-emission guarantee.
+
+    Pidfile path is derived from --state-file's directory and
+    --room-gist-id (e.g. bearer_gist.<gist>.pid). Without --state-file,
+    no lock is taken (legacy / test invocations that don't use
+    state-file stay unaffected). Without --room-gist-id, the legacy
+    state-file-derived path is used.
+
+    Stale-pidfile recovery:
+      - PID dead → stale; take over.
+      - PID alive but cmdline isn't a bearer_cli recv for OUR gist →
+        stale; take over. (Covers OS-PID-reuse after sleep/wake AND the
+        "old bearer is for a rotated-away gist" case.)
+      - PID alive AND cmdline is a bearer_cli recv for our gist →
+        another bearer is healthy; exit cleanly.
+    """
+    state_file = getattr(args, "state_file", None)
+    if not state_file:
+        return _LOCK_DISABLED
+
+    my_gist = getattr(args, "room_gist_id", None) or ""
+    pidfile = _recv_lock_pidfile(state_file, my_gist)
+    my_pid = os.getpid()
+
+    lock_payload = f"{my_pid}\t{my_gist}\n".encode("utf-8")
+    for _ in range(3):
+        try:
+            fd = os.open(pidfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            try:
+                os.write(fd, lock_payload)
+            finally:
+                os.close(fd)
+            return (pidfile, my_pid)
+        except FileExistsError:
+            # Format: "<pid>\t<gist_id>". gist_id may be empty for non-gh bearers.
+            other_pid, _other_gist = _read_lock_owner(pidfile)
+            if other_pid <= 0:
+                # A competing process may have won O_EXCL but not yet
+                # written the payload. Treat empty/partial owner records as
+                # in-progress, not stale, or we defeat the lock.
+                time.sleep(0.05)
+                continue
+            if other_pid != my_pid and _pid_alive(other_pid):
+                cmd_match = _bearer_cmdline_matches(other_pid, my_gist)
+                if cmd_match is True or (cmd_match is None and _other_gist == my_gist):
+                    print(
+                        f"bearer_cli recv: another bearer for gist {my_gist or '(none)'} "
+                        f"already running (PID {other_pid}); exiting cleanly to avoid "
+                        f"duplicate emission",
+                        file=sys.stderr, flush=True,
+                    )
+                    return _LOCK_HELD
+                if cmd_match is None:
+                    print(
+                        f"bearer_cli recv: pidfile {pidfile} is held by live PID {other_pid} "
+                        f"but cmdline could not be verified; treating lock as held",
+                        file=sys.stderr, flush=True,
+                    )
+                    return _LOCK_HELD
+            # else: stale (dead pid, OS-reused with known non-bearer shape,
+            # or old gist with known non-matching shape) → remove then retry
+            # O_EXCL claim. If another process wins the race, the next loop
+            # sees its pidfile and exits or retries accordingly.
+            try:
+                os.unlink(pidfile)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                print(
+                    f"bearer_cli recv: could not remove stale pidfile {pidfile}: {e}; "
+                    f"proceeding without lock (duplicate emission possible)",
+                    file=sys.stderr, flush=True,
+                )
+                return _LOCK_DISABLED
+        except OSError as e:
+            # Loud, not silent — we'd rather know we couldn't lock than
+            # silently disable the dedup guarantee.
+            print(
+                f"bearer_cli recv: could not write pidfile {pidfile}: {e}; "
+                f"proceeding without lock (duplicate emission possible)",
+                file=sys.stderr, flush=True,
+            )
+            return _LOCK_DISABLED
+
+    print(
+        f"bearer_cli recv: pidfile {pidfile} stayed in an in-progress state; "
+        f"treating lock as held to avoid duplicate emission",
+        file=sys.stderr, flush=True,
+    )
+    return _LOCK_HELD
+
+
+def _release_lock(pidfile: str, my_pid: int) -> None:
+    """Remove the pidfile only if it still has OUR pid (don't stomp a
+    pidfile that some other bearer rewrote after we ran)."""
+    owner, _gist = _read_lock_owner(pidfile)
+    if owner == my_pid:
+        try:
+            os.unlink(pidfile)
+        except OSError:
+            pass
 
 
 def cmd_send(args) -> int:
@@ -99,6 +320,19 @@ def cmd_recv(args) -> int:
         the bash monitor's watchdog interprets that and decides whether
         to relaunch us.
     """
+    # Per-(scope, channel, gist) bearer lock. Prevents duplicate
+    # stream-emission when scope teardown leaks orphan bearers OR a
+    # host-gist-rotation respawn races with the old bearer (Joel's
+    # 2026-05-04 dup-message diagnosis). Without --state-file, no lock
+    # is taken — legacy / test invocations are unaffected.
+    lock = _claim_recv_lock(args)
+    if lock == _LOCK_HELD:
+        # Another live bearer is already serving this stream.
+        # Exit cleanly so the parent monitor's watchdog doesn't escalate.
+        return 0
+    if isinstance(lock, tuple):
+        atexit.register(_release_lock, lock[0], lock[1])
+
     peer_meta = {
         "host_target": args.host_target,
         "remote_home": args.remote_home,
@@ -184,6 +418,8 @@ def cmd_recv(args) -> int:
                     except (BrokenPipeError, ValueError):
                         # Downstream gone or stdout closed; stop trying.
                         return
+                if state_file:
+                    _touch_state_heartbeat(state_file, _ti.time())
                 next_tick = now + _heartbeat_sec
             # Wake every 100ms so close() takes effect promptly.
             _stop_heartbeat.wait(0.1)
@@ -215,6 +451,7 @@ def cmd_recv(args) -> int:
                     "events_total": events_total,
                     "diag": live.bearer_diag,
                 })
+                _touch_state_heartbeat(state_file, time.time())
     except KeyboardInterrupt:
         pass
     finally:
@@ -237,20 +474,39 @@ def _write_state_file(path: str, state: dict) -> None:
     """
     import os
     import tempfile
-    try:
-        d = os.path.dirname(path) or "."
-        fd, tmp = tempfile.mkstemp(prefix=".bearer_state-", dir=d)
+    with _STATE_FILE_LOCK:
         try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(state, f)
-            os.replace(tmp, path)
-        except Exception:
+            d = os.path.dirname(path) or "."
+            fd, tmp = tempfile.mkstemp(prefix=".bearer_state-", dir=d)
             try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-    except OSError:
-        pass
+                with os.fdopen(fd, "w") as f:
+                    json.dump(state, f)
+                os.replace(tmp, path)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+
+def _touch_state_heartbeat(path: str, ts: float) -> None:
+    """Record bearer-loop heartbeat without pretending a peer message arrived.
+
+    last_recv_ts remains the timestamp of the last real envelope. The
+    heartbeat timestamp lets `airc status` distinguish an idle but live
+    bearer from a dead channel, which is the signal users and agents need
+    when a monitor silently wedges.
+    """
+    with _STATE_FILE_LOCK:
+        try:
+            with open(path) as f:
+                state = json.load(f)
+        except Exception:
+            state = {}
+        state["last_heartbeat_ts"] = ts
+        _write_state_file(path, state)
 
 
 def _build_parser() -> argparse.ArgumentParser:

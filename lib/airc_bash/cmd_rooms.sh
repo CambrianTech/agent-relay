@@ -82,8 +82,8 @@ cmd_rooms() {
   local count; count=$(printf '%s' "$raw" | grep -c . || true)
   if [ "$count" = "0" ]; then
     echo "  No open airc rooms or invites on your gh account."
-    echo "  Host the default room:  airc connect"
-    echo "  Host a named room:      airc connect --room <name>"
+    echo "  Host the default room:  airc join"
+    echo "  Host a named room:      airc join --room <name>"
     return 0
   fi
   # First pass: count how many are stale vs fresh, so we can show an
@@ -144,8 +144,8 @@ cmd_rooms() {
     echo "  pruned $pruned stale gist(s)."
     return 0
   fi
-  echo "  Join (auto-resolves on same gh account): airc connect"
-  echo "  Join by id (cross-account share):        airc connect <id>"
+  echo "  Join (auto-resolves on same gh account): airc join"
+  echo "  Join by id (cross-account share):        airc join <id>"
   echo ""
 }
 
@@ -215,7 +215,7 @@ cmd_part() {
 
   ensure_init
 
-  # CRITICAL bug fix 2026-05-02 (B8 from continuum-b69f): pre-fix
+  # CRITICAL bug fix 2026-05-02: pre-fix
   # `airc part QANAME` IGNORED the room arg and parted the scope's
   # DEFAULT room — deleting #general's gist when user thought they
   # were parting a test room. Mesh-splitting catastrophe: every peer
@@ -244,6 +244,7 @@ cmd_part() {
     if [ -z "$_ch_gist" ]; then
       die "Not subscribed to #${arg_room} (no channel_gists mapping). Use 'airc list' to see open rooms; 'airc status' for your subscriptions."
     fi
+    cmd_send --internal --system --channel "$arg_room" "$(get_name) left #${arg_room}" >/dev/null 2>&1 || true
     # Delete the gist ONLY if we're hosting it — i.e., it appears
     # under our gh account. Try delete; ignore failure (someone else's
     # gist isn't ours to delete; gh will reject with 404/403).
@@ -263,6 +264,7 @@ cmd_part() {
   # ── Scope-default part (no arg, or arg matches default) ──
   if [ -z "$host_target" ]; then
     # ── Host path ──
+    [ "$room_name" != "(unnamed)" ] && cmd_send --internal --system --channel "$room_name" "$(get_name) left #${room_name}" >/dev/null 2>&1 || true
     if [ -f "$gist_id_file" ]; then
       local gid; gid=$(cat "$gist_id_file")
       if command -v gh >/dev/null 2>&1; then
@@ -283,6 +285,7 @@ cmd_part() {
   else
     # ── Joiner path ──
     echo "  Joiner of #${room_name} parting — host's gist stays open for others."
+    [ "$room_name" != "(unnamed)" ] && cmd_send --internal --system --channel "$room_name" "$(get_name) left #${room_name}" >/dev/null 2>&1 || true
     # Clear our cached gist_id too, matching the comment on the joiner-
     # side cache write site (PR #92 Copilot feedback). Without this, a
     # parted joiner that later reconnects via the same scope would
@@ -374,15 +377,92 @@ share a link if the file is hosted elsewhere."
   echo "Sent $filename ($filesize bytes)"
 }
 
+_cmd_invite_human() {
+  # Convenience method: print a self-contained shell paste-block a HUMAN
+  # coworker can paste into their terminal. Works even if they don't
+  # have airc yet (step 1 = install one-liner; safe to re-run if they
+  # already have it). Uses the substrate's primary gist ID — NOT the
+  # mnemonic — so it works for coworkers on a different gh account
+  # (mnemonic resolution is same-gh-account-only; raw gist-id is the
+  # cross-account-safe form).
+  #
+  # Output is itself shell-pasteable: comment lines + commands.
+  #
+  # The heredoc uses an UNQUOTED delimiter (`<<PASTE`) so we can expand
+  # ${primary_chan} and ${primary_gid} from the host's state. The
+  # `$(whoami)` in the "say hi" line is explicitly ESCAPED as
+  # `\$(whoami)` so it survives host-side expansion and runs on the
+  # receiver's shell at paste time. Don't switch to a quoted delimiter
+  # without also restoring the channel + gist substitutions some other
+  # way — they're load-bearing for the paste-block.
+  # (Copilot's review of #454 flagged the previous comment as
+  # mis-describing this; comment now matches actual behavior.)
+  local primary_chan primary_gid
+  primary_chan=$("$AIRC_PYTHON" -m airc_core.config default_channel --config "$CONFIG" 2>/dev/null || true)
+  if [ -n "$primary_chan" ]; then
+    primary_gid=$("$AIRC_PYTHON" -c "
+import json, sys
+try:
+    c = json.load(open('$CONFIG'))
+    print(c.get('channel_gists', {}).get('$primary_chan', ''))
+except Exception:
+    pass
+" 2>/dev/null)
+  fi
+  # Fallback: legacy room_gist_id file (pre-channel-gists installs).
+  if [ -z "$primary_gid" ] && [ -f "$AIRC_WRITE_DIR/room_gist_id" ]; then
+    primary_gid=$(cat "$AIRC_WRITE_DIR/room_gist_id" 2>/dev/null)
+    [ -z "$primary_chan" ] && primary_chan="(default)"
+  fi
+
+  if [ -z "$primary_gid" ]; then
+    echo "  ERROR: no published room gist found in this scope." >&2
+    echo "  Run 'airc join' first so a room exists to invite into." >&2
+    return 1
+  fi
+
+  cat <<PASTE
+# ── airc invite for a coworker ────────────────────────────────────────
+# Paste the entire block below to your friend (Slack/email/etc.) — they
+# paste it into their terminal and it onboards them end-to-end. Works
+# even if they don't have airc installed yet.
+#
+# Room: #${primary_chan}     Gist: ${primary_gid}
+
+# 1) Install airc (skip if already installed — safe to re-run).
+curl -fsSL https://raw.githubusercontent.com/CambrianTech/airc/main/install.sh | bash
+
+# 2) Join my room.
+~/.local/bin/airc join ${primary_gid}
+
+# 3) Say hi so we know you made it.
+~/.local/bin/airc msg "hello, I'm \$(whoami)"
+
+# 4) When you're done, leave cleanly.
+#    ~/.local/bin/airc part
+PASTE
+}
+
 cmd_invite() {
+  local mode="auto"
   case "${1:-}" in
     -h|--help)
       echo "Usage:"
-      echo "  airc invite             print cross-account share invite (one-time pairing string)"
-      echo "  airc share / join-string  aliases"
+      echo "  airc invite                 print cross-account share invite (one-time pairing string)"
+      echo "  airc invite --human         print a self-contained paste-block for a coworker"
+      echo "                              (includes install one-liner; works even if they don't have airc yet)"
+      echo "  airc share / join-string    aliases"
       return 0 ;;
+    --human|--share-block|--for-friend)
+      mode="human" ;;
   esac
   ensure_init
+
+  if [ "$mode" = "human" ]; then
+    _cmd_invite_human
+    return $?
+  fi
+
   local host_target pubkey_b64 join_string
   host_target=$(get_config_val host_target "")
 
@@ -395,7 +475,7 @@ cmd_invite() {
     host_port=$(get_config_val host_port 7547)
     host_ssh_pub=$(get_config_val host_ssh_pub "")
     if [ -z "$host_name" ] || [ -z "$host_ssh_pub" ]; then
-      die "Host info missing from config. Re-pair with 'airc teardown' then 'airc connect <join-string>'."
+      die "Host info missing from config. Re-pair with 'airc join <join-string>'."
     fi
     pubkey_b64=$(printf '%s\n' "$host_ssh_pub" | base64 | tr -d '\n')
     local port_suffix=""
@@ -424,8 +504,8 @@ cmd_invite() {
   echo ""
   echo "    $join_string"
   echo ""
-  echo "  Receiver runs:  airc connect <paste-the-above>"
-  echo "  Same-account peers can use:  airc rooms (then 'airc connect' auto-resolves the mesh gist)."
+  echo "  Receiver runs:  airc join <paste-the-above>"
+  echo "  Same-account peers can use:  airc rooms (then 'airc join' auto-resolves the mesh gist)."
 }
 
 cmd_peers() {
@@ -490,12 +570,38 @@ else:
   # is what was missing when "5 peers earlier today, 1 now" looked
   # identical to "5 peers, all silent for 30 min" in the listing —
   # silent records persist on disk regardless of liveness.
-  "$AIRC_PYTHON" -c "
+  if ! find "$PEERS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | grep -q .; then
+    "$AIRC_PYTHON" -m airc_core.collaboration peers-fallback \
+      --home "$AIRC_WRITE_DIR" --my-name "$(get_name)" && return
+    echo "  No peers yet."
+    return
+  fi
+
+  AIRC_PEERS_MY_NAME="$(get_name)" "$AIRC_PYTHON" -c "
 import json, os, sys, time, calendar
 
 primary_scope = os.path.expanduser('$AIRC_WRITE_DIR')
 peers_dir = os.path.join(primary_scope, 'peers')
 messages_log = os.path.join(primary_scope, 'messages.jsonl')
+
+def _epoch(ts_str):
+    if not ts_str:
+        return None
+    try:
+        t = time.strptime(ts_str.replace('Z',''), '%Y-%m-%dT%H:%M:%S')
+        return calendar.timegm(t)
+    except Exception:
+        return None
+
+now = int(time.time())
+def _fmt_age(ts):
+    if ts is None:
+        return 'never'
+    age = max(0, now - ts)
+    if age < 60:    return f'{age}s ago'
+    if age < 3600:  return f'{age // 60}m ago'
+    if age < 86400: return f'{age // 3600}h ago'
+    return f'{age // 86400}d ago'
 
 if not os.path.isdir(peers_dir):
     print('  No peers yet.')
@@ -527,14 +633,6 @@ if not peers_by_id:
 # default), so the scan cost is bounded and we get the most recent
 # ts naturally as the loop terminates.
 last_seen = {}
-def _epoch(ts_str):
-    if not ts_str:
-        return None
-    try:
-        t = time.strptime(ts_str.replace('Z',''), '%Y-%m-%dT%H:%M:%S')
-        return calendar.timegm(t)
-    except Exception:
-        return None
 try:
     with open(messages_log) as f:
         for line in f:
@@ -552,18 +650,12 @@ try:
 except OSError:
     pass
 
-now = int(time.time())
-def _fmt_age(ts):
-    if ts is None:
-        return 'never'
-    age = max(0, now - ts)
-    if age < 60:    return f'{age}s ago'
-    if age < 3600:  return f'{age // 60}m ago'
-    if age < 86400: return f'{age // 3600}h ago'
-    return f'{age // 86400}d ago'
-
 # Render. Each peer once, with room annotations + last-seen marker.
 # Silent >1h gets a (silent) flag so the eye catches it immediately.
+#
+# Track which paired-record names we've already rendered so the
+# broadcast-peer pass below doesn't double-list them.
+rendered = set()
 for (name, host), rooms in sorted(peers_by_id.items()):
     seen = set(); ordered = []
     for r in rooms:
@@ -578,5 +670,24 @@ for (name, host), rooms in sorted(peers_by_id.items()):
     elif last_ts is None:
         silent_flag = ' (no recorded activity)'
     print(f'  {name} → {host}   [{tags}]   last seen {age_str}{silent_flag}')
+    rendered.add(name)
+
+# Also surface broadcast-only peers (no DM-paired record). Pre-fix,
+# stale paired records masked recent peers entirely — codex on Mac saw
+# 'vhsm-d1f4' (an old paired host) but not 'continuum-8e97' even after
+# multiple broadcast messages within the recent window. Mirror the
+# behaviour of the empty-peers-dir fallback path so listings remain
+# consistent regardless of whether stale records exist.
+my_name = os.environ.get('AIRC_PEERS_MY_NAME', '')
+RECENT_WINDOW = 600
+broadcast_only = []
+for who, ts in last_seen.items():
+    if who in rendered: continue
+    if who == my_name or who == 'airc': continue
+    if now - ts >= RECENT_WINDOW: continue
+    broadcast_only.append((who, ts))
+broadcast_only.sort(key=lambda kv: kv[1], reverse=True)
+for who, ts in broadcast_only:
+    print(f'  {who} → broadcast room   [(from signed messages.jsonl)]   last seen {_fmt_age(ts)}')
 "
 }

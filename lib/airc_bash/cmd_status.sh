@@ -13,6 +13,173 @@
 #
 # Extracted from airc as part of #152 Phase 3 file split.
 
+_airc_monitor_health_report() {
+  # Args: all|degraded-only. Prints per-channel monitor truth from
+  # config + bearer_state.*.json + bearer_gist.*.pid. This deliberately
+  # fails closed: if a subscribed channel lacks fresh heartbeat evidence,
+  # say DEGRADED instead of "likely-alive".
+  local mode="${1:-all}"
+  AIRC_STATUS_CONFIG="$CONFIG" AIRC_STATUS_HOME="$AIRC_WRITE_DIR" AIRC_STATUS_MODE="$mode" "$AIRC_PYTHON" - <<'PY'
+import json, os, signal, sys, time
+
+config = os.environ.get("AIRC_STATUS_CONFIG", "")
+home = os.environ.get("AIRC_STATUS_HOME", "")
+mode = os.environ.get("AIRC_STATUS_MODE", "all")
+now = time.time()
+fresh_after = 90
+
+try:
+    cfg = json.load(open(config))
+except Exception:
+    cfg = {}
+
+subs = list(cfg.get("subscribed_channels") or [])
+gists = dict(cfg.get("channel_gists") or {})
+if not subs:
+    subs = list(gists.keys())
+if not subs:
+    sys.exit(0)
+
+def safe_gist(gist: str) -> str:
+    return "".join(c if c.isalnum() else "_" for c in gist)
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+state_cache = {}
+
+def load_state(ch: str):
+    if ch in state_cache:
+        return state_cache[ch]
+    path = os.path.join(home, f"bearer_state.{ch}.json")
+    try:
+        state_cache[ch] = (json.load(open(path)), None, path)
+    except FileNotFoundError:
+        state_cache[ch] = ({}, "no bearer_state file", path)
+    except Exception as e:
+        state_cache[ch] = ({}, f"unreadable bearer_state: {e}", path)
+    return state_cache[ch]
+
+def signal_for_gist(ch: str, gist: str, own_state: dict):
+    """Return freshest heartbeat/recv evidence for this channel's wire.
+
+    #452 made the recv lock per gist, not per channel label. If two
+    subscribed channels intentionally share one gist, only one bearer may
+    own that wire and therefore only one bearer_state.<channel>.json may
+    carry the heartbeat. Treat that sibling heartbeat as proof for the
+    shared wire while still reporting the subscribed channel label.
+    """
+    candidates = [(ch, own_state)]
+    if gist:
+        for other in subs:
+            if other == ch or gists.get(other) != gist:
+                continue
+            other_state, _, _ = load_state(other)
+            if other_state:
+                candidates.append((other, other_state))
+
+    best = None
+    for source, state in candidates:
+        hb = state.get("last_heartbeat_ts")
+        recv = state.get("last_recv_ts")
+        ts = hb if hb is not None else recv
+        if ts is None:
+            continue
+        try:
+            ts_f = float(ts)
+        except Exception:
+            continue
+        if best is None or ts_f > best[0]:
+            best = (ts_f, source)
+    return best
+
+rows = []
+degraded = 0
+for ch in subs:
+    gist = gists.get(ch, "")
+    issues = []
+    age = None
+    state = {}
+
+    if not gist:
+        issues.append("missing channel_gists mapping")
+
+    state, state_issue, state_path = load_state(ch)
+    signal = signal_for_gist(ch, gist, state)
+    signal_source = ch
+    if signal is not None:
+        signal_ts, signal_source = signal
+        try:
+            age = int(now - signal_ts)
+            if age > fresh_after:
+                issues.append(f"stale heartbeat {age}s")
+        except Exception:
+            issues.append("invalid heartbeat timestamp")
+    elif state:
+        try:
+            mtime_age = int(now - os.path.getmtime(state_path))
+        except OSError:
+            mtime_age = None
+        if mtime_age is not None and mtime_age <= fresh_after:
+            age = mtime_age
+            issues.append("starting; no heartbeat yet")
+        else:
+            issues.append("no heartbeat evidence")
+    elif state_issue:
+        issues.append(state_issue)
+
+    pidfile = os.path.join(home, f"bearer_gist.{safe_gist(gist)}.pid") if gist else os.path.join(home, f"bearer_state.{ch}.pid")
+    try:
+        raw = open(pidfile).read().strip().split("\t", 1)[0]
+        pid = int(raw) if raw else 0
+    except FileNotFoundError:
+        pid = 0
+        issues.append("no bearer pidfile")
+    except Exception:
+        pid = 0
+        issues.append("unreadable bearer pidfile")
+    if pid and not pid_alive(pid):
+        issues.append(f"stale bearer pid {pid}")
+
+    level = "DEGRADED" if issues else "ok"
+    if issues:
+        degraded += 1
+    suffix = f"{age}s" if age is not None else "no-signal"
+    detail = "; ".join(issues) if issues else "fresh heartbeat"
+    if not issues and signal_source != ch:
+        detail = f"fresh heartbeat via shared gist #{signal_source}"
+    rows.append((level, ch, suffix, detail))
+
+if mode == "degraded-only" and degraded == 0:
+    sys.exit(0)
+
+if degraded:
+    print(f"  transport health: DEGRADED ({degraded}/{len(rows)} channel(s) need attention)")
+else:
+    print(f"  transport health: ok ({len(rows)} channel(s) fresh)")
+for level, ch, suffix, detail in rows:
+    if mode == "degraded-only" and level != "DEGRADED":
+        continue
+    print(f"    #{ch}: {level} ({suffix}) — {detail}")
+PY
+}
+
+_airc_collaboration_health_report() {
+  # Local transport health is not the same as collaboration health. A
+  # self-healed host can have fresh bearer heartbeats while nobody else is
+  # paired to this mesh. Surface that split-brain shape explicitly.
+  "$AIRC_PYTHON" -m airc_core.collaboration status \
+    --home "$AIRC_WRITE_DIR" --my-name "$(get_name)"
+}
+
 cmd_status() {
   # Human-readable liveness view. Fast — no network calls by default; `--probe`
   # opts into a 3s SSH reachability check.
@@ -58,73 +225,36 @@ cmd_status() {
       echo "  channels:    #${_default}"
     fi
   fi
+  _airc_collaboration_health_report
 
-  # Monitor alive? Use the shared sandbox-robust helper
+  # Scope monitor alive? Use the shared sandbox-robust helper
   # (_monitor_alive_with_bearer_fallback in airc top-level). Phase 1 =
-  # kill -0 against airc.pid (canonical, fast); phase 2 = bearer-state
-  # freshness fallback (covers Codex sandbox kill -0 blindness — see
-  # #370/#371/#372). The helper is read-only (doesn't prune the pidfile
-  # the way the older prune_pidfile_and_count did, which would silently
-  # corrupt state when phase 1 was wrong).
+  # kill -0 against airc.pid (canonical, fast); phase 2 = scope-specific
+  # monitor_formatter process evidence (covers Codex sandbox kill -0
+  # blindness without treating bearer_state freshness as a Monitor).
+  # The helper is read-only (doesn't prune the pidfile the way the older
+  # prune_pidfile_and_count did, which would silently corrupt state when
+  # phase 1 was wrong).
   local monitor_state="not running"
   local pidfile="$AIRC_WRITE_DIR/airc.pid"
   if [ "$(_monitor_alive_with_bearer_fallback "$pidfile")" = "yes" ]; then
     if [ -f "$pidfile" ]; then
-      local first_alive; first_alive=$(awk '{print $1}' "$pidfile" 2>/dev/null)
+      local first_alive; first_alive=$(_airc_pidfile_first_live_monitor_pid "$pidfile")
       # Distinguish "alive per kill -0" (we have a verified PID) from
-      # "alive per bearer-state-only" (kill -0 blind, but bearer-recv
-      # child is provably writing to bearer_state). For the latter,
-      # surface the diagnostic so a Carl debugging "why does pid X
-      # show running when it's not in ps" has the answer.
-      if kill -0 "$first_alive" 2>/dev/null; then
-        monitor_state="running (PID $first_alive)"
+      # "alive per formatter process only" (kill -0 blind against the
+      # pidfile, but the scope's monitor_formatter is visible by argv).
+      if [ -n "$first_alive" ] && kill -0 "$first_alive" 2>/dev/null; then
+        monitor_state="AIRC background process running for scope (PID $first_alive)"
       else
-        # Walk bearer_state to find which channel is freshest, for the
-        # informational message. (The helper already proved freshness;
-        # we re-check just to extract the age + channel name.)
-        # Scope to subscribed_channels ONLY — same fix-shape as #428
-        # for --health. Pre-fix this globbed every bearer_state.*.json
-        # on disk INCLUDING stale files from prior subscriptions, so a
-        # parted #cambriantech room (last_recv_ts = 14kS ago) would
-        # show as the "freshest" stale value, making `airc status`
-        # report monitor age way off from actual liveness. QA caught
-        # this 2026-05-02 self-test.
-        local _bs_summary; _bs_summary=$("$AIRC_PYTHON" -c "
-import json, glob, time
-subs = set()
-try:
-    cfg = json.load(open('$CONFIG'))
-    for c in cfg.get('subscribed_channels') or []:
-        subs.add(c)
-except Exception:
-    pass
-fresh = []
-for path in glob.glob('$AIRC_WRITE_DIR/bearer_state.*.json'):
-    try:
-        s = json.load(open(path))
-    except Exception:
-        continue
-    ts = s.get('last_recv_ts')
-    if not ts:
-        continue
-    ch = path.split('bearer_state.', 1)[1].rsplit('.json', 1)[0]
-    # Skip channels we no longer subscribe to. Empty subs (legacy
-    # scope) falls back to all-files for backward compat.
-    if subs and ch not in subs:
-        continue
-    fresh.append((int(time.time() - float(ts)), ch))
-if fresh:
-    fresh.sort()
-    age, ch = fresh[0]
-    print(f'{age}s via #{ch}')
-" 2>/dev/null)
-        monitor_state="likely-alive (${_bs_summary:-bearer-state fresh}; kill -0 blind in this sandbox — see #370)"
+        local _fmt_pid; _fmt_pid=$(_airc_scope_monitor_formatter_pids "$AIRC_WRITE_DIR" | head -1)
+        monitor_state="AIRC formatter running for scope (formatter PID ${_fmt_pid:-?}; pidfile not visible/alive)"
       fi
     fi
   elif [ -f "$pidfile" ]; then
-    monitor_state="stale pidfile (no live PIDs — run 'airc connect' to self-heal)"
+    monitor_state="stale pidfile (no live PIDs — run 'airc join' to self-heal)"
   fi
-  echo "  monitor:     $monitor_state"
+  echo "  airc process: $monitor_state"
+  _airc_monitor_health_report all
 
   # Host reachability. Only meaningful for joiners; opt-in via --probe to keep
   # `airc status` fast by default (SSH connect can hang for seconds).
@@ -200,15 +330,25 @@ else:
   # The substrate is gh-as-bearer; when gh's keyring goes invalid,
   # everything stops working but nothing surfaces unless they look here.
   if command -v gh >/dev/null 2>&1; then
-    if gh auth status >/dev/null 2>&1; then
-      echo "  gh auth:     ok"
-    elif gh api rate_limit >/dev/null 2>&1; then
-      # Token works (rate_limit reachable); /user got 403'd by secondary
-      # rate limit and gh misreports it as 'token invalid'. Issue #341.
-      echo "  gh auth:     RATE-LIMITED (secondary; token is fine — wait 5-15 min)"
-    else
-      echo "  gh auth:     ✗ INVALID — run 'gh auth login -h github.com' to fix"
-    fi
+    # Use the centralized auth detector instead of raw `gh auth status`
+    # so status reads the OK cache and does not turn frequent health
+    # checks into /user traffic that trips GitHub's secondary limiter.
+    local _gh_state
+    _gh_state="$(airc_detect_gh_auth_state 2>/dev/null || echo invalid)"
+    case "$_gh_state" in
+      ok)
+        echo "  gh auth:     ok"
+        ;;
+      rate_limited)
+        echo "  gh auth:     RATE-LIMITED (secondary; token is fine — wait 5-15 min)"
+        ;;
+      env_token_invalid)
+        echo "  gh auth:     ✗ INVALID GH_TOKEN — unset/fix GH_TOKEN, then retry"
+        ;;
+      *)
+        echo "  gh auth:     ✗ INVALID — run 'gh auth login -h github.com' to fix"
+        ;;
+    esac
   else
     echo "  gh auth:     gh CLI not installed"
   fi
@@ -236,6 +376,7 @@ else:
   else
     echo "  reminder:    off"
   fi
+
 }
 
 cmd_logs() {
@@ -270,7 +411,7 @@ cmd_logs() {
   done
   set -- "${positional[@]+"${positional[@]}"}"
   local count="${1:-20}"
-  # Validate count: positive integer (ideem-local-4bef caught 2026-04-29:
+  # Validate count: positive integer (caught 2026-04-29:
   # 'airc logs 0' and 'airc logs notanumber' silently exited 0 with no
   # output). Tail with N=0 prints nothing; with non-numeric, tail errors
   # and we swallow it.
@@ -333,4 +474,120 @@ for line in sys.stdin:
     except Exception:
         pass
 "
+}
+
+cmd_inbox() {
+  ensure_init
+
+  local cursor_file="$AIRC_WRITE_DIR/inbox_cursor"
+  local since=""
+  local count="500"
+  local peek=0
+  local quiet_empty="${AIRC_INBOX_QUIET_EMPTY:-0}"
+  local exclude_self="${AIRC_INBOX_EXCLUDE_SELF:-0}"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --since)
+        [ -n "${2:-}" ] || die "--since requires an argument (ISO timestamp or relative like 60s/5m/1h)"
+        since="$2"; shift 2 ;;
+      --since=*)
+        since="${1#--since=}"; shift ;;
+      --count|-n)
+        [ -n "${2:-}" ] || die "--count requires a positive integer"
+        count="$2"; shift 2 ;;
+      --count=*)
+        count="${1#--count=}"; shift ;;
+      --peek)
+        peek=1; shift ;;
+      --quiet-empty)
+        quiet_empty=1; shift ;;
+      --exclude-self)
+        exclude_self=1; shift ;;
+      --reset)
+        "$AIRC_PYTHON" -m airc_core.inbox reset \
+          --home "$AIRC_WRITE_DIR" --cursor-file "$cursor_file"
+        return 0 ;;
+      -h|--help)
+        echo "Usage: airc inbox [--peek] [--reset] [--since <ts|Ns|Nm|Nh>] [--count N]"
+        echo "  Shows unread messages since this scope's last inbox check."
+        echo "  Advances a per-scope cursor unless --peek is set."
+        echo "  --quiet-empty suppresses the 'No new airc messages' line."
+        echo "  --exclude-self hides messages from this identity."
+        echo "  Alias: airc poll, airc codex-poll (quiet + exclude-self by default)"
+        return 0 ;;
+      *) die "Unknown inbox option: $1" ;;
+    esac
+  done
+
+  case "$count" in
+    ''|*[!0-9]*) die "inbox --count must be a positive integer (got '$count')" ;;
+    0)           die "inbox --count must be ≥ 1 (got '$count')" ;;
+  esac
+
+  if [ -z "$since" ]; then
+    since=""
+  fi
+
+  local out
+  local inbox_args=(read --home "$AIRC_WRITE_DIR" --cursor-file "$cursor_file" --count "$count")
+  [ -n "$since" ] && inbox_args+=(--since "$since")
+  [ "$peek" -eq 1 ] && inbox_args+=(--peek)
+  [ "$quiet_empty" = "1" ] && inbox_args+=(--quiet-empty)
+  if [ "$exclude_self" = "1" ]; then
+    local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
+    inbox_args+=(--exclude-self --my-name "$(get_name)" --client-id "$_client_id")
+  fi
+  if ! out=$("$AIRC_PYTHON" -m airc_core.inbox "${inbox_args[@]}" 2>&1); then
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+
+  _airc_monitor_health_report degraded-only
+  printf '%s\n' "$out"
+}
+
+cmd_codex_hook() {
+  ensure_init
+
+  local sub="${1:-}"
+  shift || true
+  case "$sub" in
+    user-prompt-submit)
+      local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
+      "$AIRC_PYTHON" -m airc_core.codex_hook user-prompt-submit \
+        --home "$AIRC_WRITE_DIR" \
+        --cursor-file "$AIRC_WRITE_DIR/inbox_cursor" \
+        --my-name "$(get_name)" \
+        --client-id "$_client_id" \
+        "$@"
+      ;;
+    -h|--help|'')
+      echo "Usage: airc codex-hook user-prompt-submit"
+      echo "  Codex lifecycle hook adapter. Emits UserPromptSubmit JSON context for unread local airc messages."
+      ;;
+    *)
+      die "Unknown codex-hook command: $sub" ;;
+  esac
+}
+
+cmd_codex_start() {
+  local _log="$AIRC_WRITE_DIR/codex-airc.log"
+  "$AIRC_PYTHON" -m airc_core.codex_start \
+    --airc "$0" \
+    --home "$AIRC_WRITE_DIR" \
+    --log "$_log" \
+    -- "$@"
+
+  # Give the detached process a short startup window, then print the same
+  # useful local surfaces that `airc join` prints when it returns quickly.
+  sleep 2
+  echo ""
+  echo "Status"
+  echo "------"
+  cmd_status
+  echo ""
+  echo "Inbox"
+  echo "-----"
+  AIRC_INBOX_QUIET_EMPTY=1 AIRC_INBOX_EXCLUDE_SELF=1 cmd_inbox --count 10 || true
 }

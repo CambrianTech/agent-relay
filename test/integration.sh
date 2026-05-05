@@ -172,7 +172,7 @@ requires_local_pair_bearer_or_skip() {
 # pks-test-NNNN / etc` entries — confusing during dogfood and slowly
 # filling gist quota. Skipped silently if gh isn't authed (CI without
 # gh) or has no gist scope. Filters by description-prefix to avoid
-# touching real rooms (#general / #useideem / #cambriantech etc).
+# touching real rooms (#general / #acme / #example etc).
 cleanup_test_gists() {
   command -v gh >/dev/null 2>&1 || return 0
   gh auth status >/dev/null 2>&1 || return 0
@@ -180,7 +180,7 @@ cleanup_test_gists() {
   # Test-scope room name prefixes — keep this list in sync with
   # scenarios that publish real gists. Anything not on this list is
   # left alone (real rooms or someone else's tests).
-  local _test_prefix_re='airc room: (sars-test-|pks-test-|pks-debug|debug-room|sidecar-test-|solo-test-|ronly-test-|new-room|myproject|hb-test-|bounce-test-|ttl-test-|test-irc-|useideem-test-|stalepid-)'
+  local _test_prefix_re='airc room: (sars-test-|pks-test-|pks-debug|debug-room|sidecar-test-|solo-test-|ronly-test-|new-room|myproject|hb-test-|bounce-test-|ttl-test-|test-irc-|acme-test-|stalepid-)'
   local _ids
   _ids=$(gh gist list --limit 50 2>/dev/null | awk -F'\t' -v re="$_test_prefix_re" '$2 ~ re { print $1 }')
   if [ -n "$_ids" ]; then
@@ -287,8 +287,37 @@ scaffold_identity() {
     # sets this env at startup; tests calling python directly need
     # the same setup.
     local _lib_dir; _lib_dir=$(cd "$(dirname "$AIRC")/lib" 2>/dev/null && pwd)
+    # Walk the same venv-then-system fallback airc itself uses for
+    # AIRC_PYTHON — bootstrap-ed25519 needs the cryptography module,
+    # which install.sh installs into .venv but isn't always present in
+    # the harness's bare python3. Pre-fix: ${AIRC_PYTHON:-python3}
+    # silently fell back to system python with `2>/dev/null` swallowing
+    # the resulting ImportError, so private.pem was never written and
+    # any later signing op failed with [Errno 2] ENOENT — caller got
+    # an opaque "ed25519 sign failed" instead of "cryptography missing."
+    # Per CLAUDE.md "never swallow errors" (Joel 2026-05-04 directive
+    # via Codex relay): probe for a working python, let stderr through,
+    # fail loudly if none available.
+    local _py=""
+    for _candidate in \
+        "${AIRC_PYTHON:-}" \
+        "$HOME/.airc-src/.venv/bin/python" \
+        "$HOME/.airc-src/.venv/bin/python3" \
+        "$(cd "$(dirname "$AIRC")" && pwd)/.venv/bin/python" \
+        "$(cd "$(dirname "$AIRC")" && pwd)/.venv/bin/python3" \
+        "$(command -v python3 || true)"; do
+      [ -n "$_candidate" ] && [ -x "$_candidate" ] || continue
+      if "$_candidate" -c "import cryptography" 2>/dev/null; then
+        _py="$_candidate"
+        break
+      fi
+    done
+    if [ -z "$_py" ]; then
+      echo "scaffold_identity: no python with cryptography importable; install.sh's .venv covers this in production" >&2
+      return 1
+    fi
     PYTHONPATH="${_lib_dir}${PYTHONPATH:+:$PYTHONPATH}" \
-      "${AIRC_PYTHON:-python3}" -m airc_core.identity bootstrap-ed25519 --dir "$identity_dir" 2>/dev/null
+      "$_py" -m airc_core.identity bootstrap-ed25519 --dir "$identity_dir"
   fi
 }
 
@@ -786,7 +815,7 @@ json.dump(c, open(p, 'w'))
 }
 
 scenario_status() {
-  section "status: liveness view reflects identity, monitor, queue, last-activity"
+  section "status: liveness view reflects identity, airc process, queue, last-activity"
   requires_local_pair_bearer_or_skip "status" || return
   cleanup_all
 
@@ -795,7 +824,7 @@ scenario_status() {
   spawn_joiner /tmp/airc-it-s-j sjoiner "$join" || { fail "sjoiner join failed"; return; }
   sleep 2
 
-  # Host status: should show "hosting on port <NNNN>" + monitor running.
+  # Host status: should show "hosting on port <NNNN>" + AIRC process running.
   # Don't pin the port literal — AIRC_PORT=7549 might auto-bump if 7549
   # is taken by an earlier test's not-yet-reaped python listener; the
   # test was previously flaky on that. Accept any 4+-digit port.
@@ -803,8 +832,8 @@ scenario_status() {
   h_out=$(AIRC_HOME=/tmp/airc-it-s-h/state "$AIRC" status 2>&1)
   echo "$h_out" | grep -qE 'hosting on port [0-9]+' && pass "host status: identity line shows 'hosting on port <NNNN>'" \
                                                     || fail "host status missing port (got: $h_out)"
-  echo "$h_out" | grep -Eq 'monitor:\s+running' && pass "host status: monitor shown running" \
-                                                || fail "host status: monitor not shown running"
+  echo "$h_out" | grep -Eq 'airc process:\s+.*running' && pass "host status: airc process shown running" \
+                                                       || fail "host status: airc process not shown running"
   echo "$h_out" | grep -q 'queue:.*empty' && pass "host status: queue empty (no pending)" \
                                           || fail "host status: queue line wrong"
   # Phase 2c (#270): host has no inbound bearer — surface that explicitly
@@ -1591,9 +1620,14 @@ scenario_heartbeat() {
   fi
 
   # ── kill -9 the host. Heartbeat thread dies with it; gist persists.
-  local host_pids
-  host_pids=$(cat /tmp/airc-it-h/state/airc.pid 2>/dev/null)
-  [ -n "$host_pids" ] || { fail "no host pid recorded"; cleanup_all; return; }
+  # Some fast-fail paths can publish heartbeat state before monitor pid
+  # bookkeeping completes; the parent PID is enough to model a laptop
+  # power-off. Include any recorded child PIDs when present.
+  local host_pids host_parent
+  host_pids=$(cat /tmp/airc-it-h/state/airc.pid 2>/dev/null || true)
+  host_parent=$(pgrep -f "AIRC_HOME=/tmp/airc-it-h/state.*connect --room $rname" 2>/dev/null | head -1 || true)
+  [ -n "$host_parent" ] && host_pids="$host_pids $host_parent"
+  [ -n "$(printf '%s' "$host_pids" | tr -d '[:space:]')" ] || { fail "no host process found"; gh gist delete "$gist_id" --yes 2>/dev/null; cleanup_all; return; }
   kill -9 $host_pids 2>/dev/null || true
   sleep 1
   pass "host kill -9'd ($host_pids)"
@@ -1611,7 +1645,7 @@ scenario_heartbeat() {
   # ── Spawn joiner beta with discovery ON. Joiner should:
   #    - resolve the gist
   #    - detect last_heartbeat is stale
-  #    - take over: delete stale gist, exec into host mode
+  #    - take over the SAME gist in place (room gist is durable identity)
   mkdir -p /tmp/airc-it-j
   ( cd /tmp/airc-it-j && AIRC_HOME=/tmp/airc-it-j/state AIRC_NAME=beta AIRC_PORT=7550 \
       AIRC_HEARTBEAT_STALE=$hb_stale AIRC_HEARTBEAT_SEC=$hb_sec \
@@ -1619,14 +1653,14 @@ scenario_heartbeat() {
 
   for i in 1 2 3 4 5 6 7 8 9 10; do
     sleep 1
-    grep -qE 'taking over|self-healing as new host' /tmp/airc-it-j/out.log 2>/dev/null && break
+    grep -qE 'taking over existing mesh|recovering existing room gist' /tmp/airc-it-j/out.log 2>/dev/null && break
   done
 
-  grep -qE 'taking over|self-healing as new host' /tmp/airc-it-j/out.log \
-    && pass "beta detected stale heartbeat + initiated takeover" \
+  grep -qE 'taking over existing mesh|recovering existing room gist' /tmp/airc-it-j/out.log \
+    && pass "beta detected stale heartbeat + initiated in-place takeover" \
     || { fail "beta did NOT detect stale heartbeat (log: $(tail -20 /tmp/airc-it-j/out.log))"; cleanup_all; return; }
 
-  # Wait for beta to publish a fresh gist as new host.
+  # Wait for beta to adopt the same room gist as new host.
   for i in 1 2 3 4 5 6 7 8 9 10; do
     sleep 1
     [ -f /tmp/airc-it-j/state/room_gist_id ] && break
@@ -1634,35 +1668,34 @@ scenario_heartbeat() {
 
   local new_gist_id
   new_gist_id=$(cat /tmp/airc-it-j/state/room_gist_id 2>/dev/null)
-  if [ -n "$new_gist_id" ] && [ "$new_gist_id" != "$gist_id" ]; then
-    pass "beta published fresh gist as new host ($new_gist_id, replaces $gist_id)"
+  if [ "$new_gist_id" = "$gist_id" ]; then
+    pass "beta adopted original gist as new host ($new_gist_id)"
   else
-    fail "beta did not publish a fresh gist (got: '$new_gist_id', original: '$gist_id')"
+    fail "beta did not adopt original gist (got: '$new_gist_id', original: '$gist_id')"
   fi
 
-  # Old gist must be gone (beta deleted it during takeover).
-  if gh api "gists/$gist_id" >/dev/null 2>&1; then
-    fail "stale gist $gist_id still exists after takeover"
-    gh gist delete "$gist_id" --yes 2>/dev/null
+  # Original gist must still exist and now advertise beta as host.
+  local recovered_name
+  recovered_name=$(gh api "gists/$gist_id" --jq ".files[\"airc-room-${rname}.json\"].content" 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("host",{}).get("name",""))' 2>/dev/null || true)
+  if [ "$recovered_name" = "beta" ]; then
+    pass "original gist preserved and host lease updated to beta"
   else
-    pass "stale gist $gist_id removed by takeover"
+    fail "original gist did not advertise beta after takeover (host='$recovered_name')"
   fi
 
-  # Cleanup: delete the new gist beta published.
-  if [ -n "$new_gist_id" ]; then
-    gh gist delete "$new_gist_id" --yes 2>/dev/null || true
-  fi
+  gh gist delete "$gist_id" --yes 2>/dev/null || true
   cleanup_all
 }
 
-# ── Scenario: bounce (teardown should not orphan the host's gist) ─────
-# host A → teardown → host A again. Each cycle must leave AT MOST ONE
-# gist for the room name on the gh account. Pre-fix, every bounce
-# accumulated an orphan because cmd_teardown's kill -9 skipped the
-# EXIT trap that would have deleted the gist (PR #110).
+# ── Scenario: bounce (teardown preserves durable room gist) ─────
+# host A → teardown → host A again. The room gist is channel identity,
+# not process lifetime. Teardown should stop local processes and leave
+# the gist for the next host to refresh in-place; `airc part` is the
+# explicit deletion path.
 # Skips if gh is unavailable.
 scenario_bounce() {
-  section "bounce: teardown deletes hosted gist (no orphan accumulation)"
+  section "bounce: teardown preserves and reuses hosted room gist"
   requires_gh_auth_or_skip "bounce" || return
 
   if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
@@ -1692,15 +1725,18 @@ scenario_bounce() {
   AIRC_HOME=/tmp/airc-it-h/state "$AIRC" teardown >/dev/null 2>&1
   sleep 2
 
-  # Verify gist deleted
+  # Verify gist persists. This is deliberate: if the hosting laptop is
+  # shut down, the next reachable peer must be able to refresh the same
+  # source-of-truth gist rather than create an island.
   if gh api "gists/$gid1" >/dev/null 2>&1; then
-    fail "teardown LEFT gist $gid1 on gh account (orphan)"
-    gh gist delete "$gid1" --yes 2>/dev/null  # cleanup our mess
+    pass "teardown preserved durable room gist $gid1"
   else
-    pass "teardown deleted gist $gid1 ✓"
+    fail "teardown deleted durable room gist $gid1"
+    cleanup_all
+    return
   fi
 
-  # Round 2: rehost same room, verify NO orphan from round 1.
+  # Round 2: rehost same room, verify it reuses the same gist.
   # Teardown leaves room_gist_id behind (it only wipes airc.pid +
   # host_gist_id), so we can't `[ -f room_gist_id ]` as a "round 2
   # ready" signal — that file already exists from round 1. Wait for
@@ -1716,15 +1752,15 @@ scenario_bounce() {
 
   local gid2; gid2=$(cat /tmp/airc-it-h/state/host_gist_id 2>/dev/null)
   [ -z "$gid2" ] && gid2=$(cat /tmp/airc-it-h/state/room_gist_id 2>/dev/null)
-  [ -n "$gid2" ] && [ "$gid2" != "$gid1" ] \
-    && pass "round 2: alpha re-hosted, fresh gist=$gid2" \
-    || fail "round 2: no fresh gist or same as orphan (gid1=$gid1 gid2=$gid2)"
+  [ "$gid2" = "$gid1" ] \
+    && pass "round 2: alpha re-hosted on same durable gist=$gid2" \
+    || fail "round 2: did not reuse durable gist (gid1=$gid1 gid2=$gid2)"
 
   local count
   count=$(gh gist list --limit 50 2>/dev/null | awk -F'\t' -v r="airc room: $rname" '$2==r' | wc -l | tr -d ' ')
   [ "$count" = "1" ] \
-    && pass "exactly one #${rname} gist on account after bounce ✓" \
-    || fail "expected 1 gist, found $count (orphan accumulation)"
+    && pass "exactly one #${rname} gist on account after bounce" \
+    || fail "expected 1 gist, found $count"
 
   # Cleanup
   AIRC_HOME=/tmp/airc-it-h/state "$AIRC" teardown >/dev/null 2>&1
@@ -1804,18 +1840,18 @@ scenario_two_tab_localhost() {
 }
 
 # ── Scenario: auto_scope (default room derived from git remote org) ─────
-# The /join skill contract: bare `airc join` from a useideem/* checkout
-# lands in #useideem; from a cambriantech/* checkout lands in #cambriantech.
+# The /join skill contract: bare `airc join` from an acme/* checkout
+# lands in #acme; from an example/* checkout lands in #example.
 # A previous PR (#104) gated this behind AIRC_AUTO_SCOPE_ROOM=1, which
 # left bare-launched agents stuck in #general regardless of cwd —
 # defeating the whole point. Re-enabled as default 2026-04-26 after a
-# session of dogfooding pain (two useideem tabs both hit #general
-# instead of converging on #useideem).
+# session of dogfooding pain (two same-org tabs both hit #general
+# instead of converging on the project room).
 #
 # Test plan: stand up a fake git repo with origin pointing to
-# `useideem/foo`, run `airc connect` in that cwd (gh-free, --no-gist),
-# verify the "Auto-scoped: #useideem (from git org; ...)" banner fires
-# and that room_name is "useideem". Then verify AIRC_NO_AUTO_ROOM=1
+# `acme/foo`, run `airc connect` in that cwd (gh-free, --no-gist),
+# verify the "Auto-scoped: #acme (from git org; ...)" banner fires
+# and that room_name is "acme". Then verify AIRC_NO_AUTO_ROOM=1
 # opts out cleanly (banner absent, falls back to #general).
 scenario_auto_scope() {
   section "auto_scope: bare connect derives room from git remote org"
@@ -1824,7 +1860,7 @@ scenario_auto_scope() {
 
   local repo=/tmp/airc-it-auto-repo
   rm -rf "$repo"; mkdir -p "$repo"
-  ( cd "$repo" && git init -q 2>/dev/null && git remote add origin https://github.com/useideem/foo.git ) \
+  ( cd "$repo" && git init -q 2>/dev/null && git remote add origin https://github.com/acme/foo.git ) \
     || { fail "git scaffold failed"; cleanup_all; return; }
 
   # Default ON: bare connect should auto-scope.
@@ -1837,13 +1873,13 @@ scenario_auto_scope() {
     grep -qE 'Hosting as|Auto-scoped' /tmp/airc-it-auto-h.log 2>/dev/null && break
   done
 
-  grep -qE 'Auto-scoped: #useideem \(from git org' /tmp/airc-it-auto-h.log \
-    && pass "auto-scope banner: 'Auto-scoped: #useideem (from git org)'" \
+  grep -qE 'Auto-scoped: #acme \(from git org' /tmp/airc-it-auto-h.log \
+    && pass "auto-scope banner: 'Auto-scoped: #acme (from git org)'" \
     || fail "auto-scope banner MISSING (got: $(head -3 /tmp/airc-it-auto-h.log | tr '\n' '|'))"
 
-  grep -qE 'Hosting #useideem' /tmp/airc-it-auto-h.log \
-    && pass "host banner reports #useideem (auto-scoped room took effect)" \
-    || fail "host banner not on #useideem (auto-scope didn't propagate to host setup)"
+  grep -qE 'Hosting #acme' /tmp/airc-it-auto-h.log \
+    && pass "host banner reports #acme (auto-scoped room took effect)" \
+    || fail "host banner not on #acme (auto-scope didn't propagate to host setup)"
 
   # Kill that run before testing the opt-out (port + scope reuse).
   for f in /tmp/airc-it-auto-h/state/airc.pid; do
@@ -1940,6 +1976,26 @@ JSON
     && pass "stderr names the offending scope dir" \
     || fail "stderr doesn't surface scope path (user can't tell where their cwd resolved)"
 
+  # Fresh bearer_state is NOT process liveness. In a shared project dir,
+  # another tab or leftover bearer can keep channel health fresh while
+  # this scope's visible Monitor is absent. `status` and `msg` must not
+  # turn that into "airc process running".
+  "${AIRC_PYTHON:-python3}" - <<PY
+import json, time
+with open("$home/bearer_state.general.json", "w") as f:
+    json.dump({"last_recv_ts": time.time(), "kind": "gist"}, f)
+PY
+  local status_out
+  status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
+  echo "$status_out" | grep -qE 'airc process:\s+stale pidfile|airc process:\s+not running' \
+    && pass "fresh bearer_state does not make status claim airc process running" \
+    || fail "fresh bearer_state falsely reported airc process running (got: $status_out)"
+  AIRC_HOME="$home" "$AIRC" msg "fresh bearer state is still void" >"$out" 2>"$err"
+  rc=$?
+  [ "$rc" -ne 0 ] \
+    && pass "fresh bearer_state does not bypass dead-monitor send guard" \
+    || fail "fresh bearer_state bypassed dead-monitor send guard"
+
   # Also test the absent-pidfile path (monitor never started in this scope).
   rm -f "$home/airc.pid"
   AIRC_HOME="$home" "$AIRC" msg "still void" >"$out" 2>"$err"
@@ -1951,10 +2007,19 @@ JSON
     && pass "stderr correctly distinguishes absent vs stale pidfile" \
     || fail "stderr doesn't say 'absent' for missing pidfile"
 
-  # Negative control: with a live PID in the pidfile, send should NOT die
-  # on this check. Use $$ — the test harness's own PID, definitely alive.
-  echo $$ > "$home/airc.pid"
-  AIRC_HOME="$home" "$AIRC" msg "live monitor probe ascii" >"$out" 2>"$err"
+  # Negative control: with an airc-SHAPED live PID in the pidfile, send
+  # should NOT die on this check. Pre-fix used $$ (the test harness's
+  # own PID) — fine under bare kill -0 semantics, but #447 hardened the
+  # check to also verify cmdline shape (PID-reuse defense after sleep/
+  # wake), which CORRECTLY rejects `bash test/integration.sh` as
+  # not-airc-shaped. Now spawn a fake whose argv[0] matches the
+  # /airc[[:space:]]+(connect|join)/ regex via `exec -a`. The actual
+  # binary is sleep, but ps -o command= shows "airc connect …" and
+  # _monitor_alive_with_bearer_fallback accepts it.
+  ( exec -a "airc connect" sleep 60 ) &
+  local fake_airc_pid=$!
+  echo "$fake_airc_pid" > "$home/airc.pid"
+  AIRC_CLIENT_ID="test-client-live-monitor" AIRC_HOME="$home" "$AIRC" msg "live monitor probe ascii" >"$out" 2>"$err"
   rc=$?
   [ "$rc" = "0" ] \
     && pass "live-pid scope: send returns 0 (no false positive on liveness check)" \
@@ -1962,9 +2027,393 @@ JSON
   grep -q 'live monitor probe ascii' "$home/messages.jsonl" \
     && pass "live-pid scope: message appended to local log as expected" \
     || fail "live-pid scope: message NOT in log despite rc=0 (log=$(cat "$home/messages.jsonl" 2>/dev/null))"
+  python3 - <<PY
+import json, sys
+for line in open("$home/messages.jsonl"):
+    obj = json.loads(line)
+    if obj.get("msg") == "live monitor probe ascii":
+        if obj.get("client_id") and obj.get("sig"):
+            sys.exit(0)
+sys.exit(1)
+PY
+  [ "$?" = "0" ] \
+    && pass "client_id send line is valid JSON with sig" \
+    || fail "client_id send line is malformed JSON or missing fields: $(tail -1 "$home/messages.jsonl" 2>/dev/null)"
+  kill "$fake_airc_pid" 2>/dev/null || true
+  wait "$fake_airc_pid" 2>/dev/null || true
+
+  # #511 regression: on Windows/WSL via Claude Code Monitor, ps can show
+  # a pidfile-owned live wrapper as just "/path/to/airc" without preserving
+  # the join/connect argument. That still proves liveness when the PID came
+  # from this scope's pidfile and kill -0 succeeds. Also cover multi-PID
+  # host pidfiles where stale siblings surround the live wrapper.
+  ( exec -a "/home/joel/.local/bin/airc" sleep 60 ) &
+  fake_airc_pid=$!
+  printf '99999 %s\n88888\n' "$fake_airc_pid" > "$home/airc.pid"
+  AIRC_CLIENT_ID="test-client-wsl-monitor" AIRC_HOME="$home" "$AIRC" msg "wsl wrapper live monitor probe" >"$out" 2>"$err"
+  rc=$?
+  [ "$rc" = "0" ] \
+    && pass "WSL-style pidfile-owned airc wrapper satisfies monitor liveness" \
+    || fail "WSL-style airc wrapper incorrectly rejected (rc=$rc, stderr=$(cat "$err"))"
+  grep -q 'wsl wrapper live monitor probe' "$home/messages.jsonl" \
+    && pass "WSL-style live wrapper: message appended to local log" \
+    || fail "WSL-style live wrapper: message NOT in log (log=$(cat "$home/messages.jsonl" 2>/dev/null))"
+  local status_out
+  status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
+  echo "$status_out" | grep -qE "airc process:\s+AIRC background process running for scope \\(PID $fake_airc_pid\\)" \
+    && pass "status reports the verified live PID from a multi-PID pidfile" \
+    || fail "status did not report verified live PID $fake_airc_pid (got: $status_out)"
+  kill "$fake_airc_pid" 2>/dev/null || true
+  wait "$fake_airc_pid" 2>/dev/null || true
 
   rm -f "$out" "$err"
   rm -rf /tmp/airc-it-sdmd
+  cleanup_all
+}
+
+# ── Scenario: monitor_liveness_process_evidence ────────────────────────
+# A project .airc scope can be shared by several Claude/Codex tabs. This
+# scenario keeps monitor liveness honest at the process-evidence layer:
+# fresh bearer_state is channel health only, a formatter for THIS scope
+# counts as a scope monitor, and a formatter for a sibling scope does not.
+scenario_monitor_liveness_process_evidence() {
+  section "monitor_liveness_process_evidence: bearer freshness is not AIRC process liveness"
+  cleanup_all
+
+  local home=/tmp/airc-it-mlpe/state
+  local other=/tmp/airc-it-mlpe/state.other
+  mkdir -p "$home/identity" "$home/peers" "$other/peers"
+  scaffold_identity "$home/identity" 'airc-test-mlpe'
+  cat > "$home/config.json" <<'JSON'
+{ "name": "monitor-liveness-test", "subscribed_channels": ["general"] }
+JSON
+  echo "99999" > "$home/airc.pid"
+  "${AIRC_PYTHON:-python3}" - <<PY
+import json, time
+with open("$home/bearer_state.general.json", "w") as f:
+    json.dump({"last_recv_ts": time.time(), "kind": "gist"}, f)
+PY
+
+  local status_out
+  status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
+  echo "$status_out" | grep -qE 'airc process:\s+stale pidfile|airc process:\s+not running' \
+    && pass "fresh bearer_state alone does not satisfy AIRC process liveness" \
+    || fail "fresh bearer_state falsely satisfied AIRC process liveness (got: $status_out)"
+
+  ( exec -a "python -u -X utf8 -m airc_core.monitor_formatter --peers-dir $other/peers --my-name foreign" sleep 60 ) &
+  local foreign_pid=$!
+  sleep 1
+  status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
+  echo "$status_out" | grep -qE 'airc process:\s+stale pidfile|airc process:\s+not running' \
+    && pass "formatter for sibling scope does not satisfy this scope" \
+    || fail "foreign formatter falsely satisfied this scope (got: $status_out)"
+  kill "$foreign_pid" 2>/dev/null || true
+  wait "$foreign_pid" 2>/dev/null || true
+
+  ( exec -a "python -u -X utf8 -m airc_core.monitor_formatter --peers-dir $home/peers --my-name local" sleep 60 ) &
+  local local_pid=$!
+  local seen=0 i
+  for i in $(seq 1 10); do
+    sleep 1
+    status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
+    echo "$status_out" | grep -qE "airc process:\s+AIRC formatter running for scope .*formatter PID $local_pid" && { seen=1; break; }
+  done
+  [ "$seen" = "1" ] \
+    && pass "scope-owned monitor_formatter satisfies scope monitor liveness" \
+    || fail "scope-owned formatter did not satisfy monitor liveness (got: $status_out)"
+  kill "$local_pid" 2>/dev/null || true
+  wait "$local_pid" 2>/dev/null || true
+
+  rm -rf /tmp/airc-it-mlpe
+  cleanup_all
+}
+
+# ── Scenario: attach_starts_background_transport ──────────────────────
+# Claude/WSL Monitor should be a UI stream, not the owner of transport
+# lifetime. `airc join --attach` starts a scope-local background
+# transport, verifies it, then attaches to messages.jsonl.
+scenario_attach_starts_background_transport() {
+  section "attach_starts_background_transport: UI attach is not the transport owner"
+  cleanup_all
+
+  local home=/tmp/airc-it-attach/state
+  local out=/tmp/airc-it-attach/out.log
+  local err=/tmp/airc-it-attach/err.log
+  mkdir -p /tmp/airc-it-attach
+
+  AIRC_HOME="$home" AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 \
+    "$AIRC" join --attach --no-room --no-gist >"$out" 2>"$err" &
+  local ui_pid=$!
+
+  local seen=0 status_out="" i
+  for i in $(seq 1 20); do
+    status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1 || true)
+    if echo "$status_out" | grep -qE 'airc process:\s+AIRC background process running for scope'; then
+      seen=1
+      break
+    fi
+    if ! kill -0 "$ui_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+
+  [ "$seen" = "1" ] \
+    && pass "attach mode starts a verified scope-local background transport" \
+    || fail "attach mode did not start transport (status=$status_out; stdout=$(cat "$out" 2>/dev/null); stderr=$(cat "$err" 2>/dev/null))"
+  kill -0 "$ui_pid" 2>/dev/null \
+    && pass "attach UI process stays alive after transport starts" \
+    || fail "attach UI process exited early (stdout=$(cat "$out" 2>/dev/null); stderr=$(cat "$err" 2>/dev/null))"
+  local attached=0
+  for i in $(seq 1 10); do
+    if grep -q 'airc: attached to local message stream for this scope' "$out"; then
+      attached=1
+      break
+    fi
+    sleep 1
+  done
+  [ "$attached" = "1" ] \
+    && pass "attach UI stream is active" \
+    || fail "attach UI stream did not announce attachment (stdout=$(cat "$out" 2>/dev/null))"
+
+  kill "$ui_pid" 2>/dev/null || true
+  wait "$ui_pid" 2>/dev/null || true
+  AIRC_HOME="$home" "$AIRC" teardown >/dev/null 2>&1 || true
+  rm -rf /tmp/airc-it-attach
+  cleanup_all
+}
+
+# ── Scenario: attach_spawn_strips_attach_flag ───────────────────────────
+# Regression for #511/#521: the attach UI wrapper recursively starts the
+# transport with AIRC_NO_ATTACH=1. That child must not see --attach as a
+# positional target/name, even if the original UI invocation had --attach.
+scenario_attach_spawn_strips_attach_flag() {
+  section "attach_spawn_strips_attach_flag: recursive transport never persists --attach as identity"
+  cleanup_all
+
+  local home=/tmp/airc-it-attach-strip/state
+  local out=/tmp/airc-it-attach-strip/out.log
+  local err=/tmp/airc-it-attach-strip/err.log
+  mkdir -p /tmp/airc-it-attach-strip
+
+  AIRC_HOME="$home" AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 \
+    "$AIRC" join --attach --no-room --no-gist >"$out" 2>"$err" &
+  local ui_pid=$!
+
+  local name="" status_out="" i
+  for i in $(seq 1 20); do
+    status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1 || true)
+    name=$(printf '%s\n' "$status_out" \
+      | sed -n 's/^  identity:[[:space:]]*//p' \
+      | sed 's/[[:space:]]*(.*$//' \
+      | head -1)
+    [ -n "$name" ] && break
+    sleep 1
+  done
+
+  [ -n "$name" ] \
+    && pass "attach child persisted an identity name" \
+    || fail "attach child did not persist identity (status=$status_out; stdout=$(cat "$out" 2>/dev/null); stderr=$(cat "$err" 2>/dev/null))"
+  [ "$name" != "--attach" ] \
+    && pass "attach flag was not persisted as identity" \
+    || fail "attach flag leaked into identity name (stdout=$(cat "$out" 2>/dev/null); stderr=$(cat "$err" 2>/dev/null))"
+
+  kill "$ui_pid" 2>/dev/null || true
+  wait "$ui_pid" 2>/dev/null || true
+  AIRC_HOME="$home" "$AIRC" teardown >/dev/null 2>&1 || true
+  rm -rf /tmp/airc-it-attach-strip
+  cleanup_all
+}
+
+# ── Scenario: codex_join_detaches_transport ────────────────────────────
+# Public Codex flow is plain `airc join`. The shell dispatch detects Codex
+# and routes through the detach adapter, while the spawned child is guarded
+# from recursively detaching itself.
+scenario_codex_join_detaches_transport() {
+  section "codex_join_detaches_transport: Codex uses plain airc join without recursive detach"
+  cleanup_all
+
+  local root=/tmp/airc-it-codex-join
+  local home="$root/state"
+  local out="$root/out.log"
+  local err="$root/err.log"
+  mkdir -p "$root"
+
+  CODEX_THREAD_ID=airc-it-codex AIRC_HOME="$home" AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 \
+    "$AIRC" join --no-room --no-gist >"$out" 2>"$err"
+  local rc=$?
+
+  [ "$rc" = "0" ] \
+    && pass "codex join command returned success" \
+    || fail "codex join failed rc=$rc stdout=$(cat "$out" 2>/dev/null) stderr=$(cat "$err" 2>/dev/null)"
+  grep -q "airc join: launched Codex-detached transport" "$out" \
+    && pass "codex join used the internal detach adapter" \
+    || fail "codex join did not report detached launch (stdout=$(cat "$out" 2>/dev/null))"
+
+  local running=0 status_out="" i
+  for i in $(seq 1 10); do
+    status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1 || true)
+    if printf '%s\n' "$status_out" | grep -q "airc process:.*running"; then
+      running=1
+      break
+    fi
+    sleep 1
+  done
+  [ "$running" = "1" ] \
+    && pass "codex detached child left one live scope process" \
+    || fail "codex detached child was not running (status=$status_out; stdout=$(cat "$out" 2>/dev/null); stderr=$(cat "$err" 2>/dev/null))"
+
+  AIRC_HOME="$home" "$AIRC" teardown >/dev/null 2>&1 || true
+  rm -rf "$root"
+  cleanup_all
+}
+
+# ── Scenario: gh_secondary_rate_limit_degraded_startup (#479) ──────────
+# GitHub secondary throttling must not prevent monitor startup. On
+# 2026-05-04 Windows/WSL hit this shape: `gh auth status` tripped the
+# secondary limiter, `gh api rate_limit` still worked, and `airc join`
+# died before the monitor could start or any local/cached transport could
+# recover. Rate limiting is degraded transport, not invalid auth.
+scenario_gh_secondary_rate_limit_degraded_startup() {
+  section "gh_secondary_rate_limit_degraded_startup: join starts degraded under gh secondary throttle"
+  cleanup_all
+
+  local root=/tmp/airc-it-gh-secondary
+  local fakebin="$root/bin"
+  local home="$root/state"
+  mkdir -p "$fakebin" "$home" "$root/tmp"
+  rm -f "$root/tmp"/airc-gh-auth-ok-* "$root/tmp"/airc-gh-rate-limit-* "$root/tmp"/airc-gh-backoff-until-* 2>/dev/null || true
+
+  cat > "$fakebin/gh" <<'SH'
+#!/bin/sh
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  echo "github.com: token invalid" >&2
+  echo "gh: API rate limit exceeded for user ID 1" >&2
+  exit 1
+fi
+if [ "$1" = "api" ] && [ "$2" = "rate_limit" ]; then
+  echo '{"resources":{"core":{"remaining":4999}}}'
+  exit 0
+fi
+if [ "$1" = "api" ]; then
+  echo "gh: API rate limit exceeded for user ID 1" >&2
+  exit 1
+fi
+if [ "$1" = "gist" ]; then
+  echo "gh: API rate limit exceeded for user ID 1" >&2
+  exit 1
+fi
+echo "fake gh: unsupported $*" >&2
+exit 1
+SH
+  chmod +x "$fakebin/gh"
+
+  (
+    cd "$root" || exit 1
+    env -i \
+      HOME="$HOME" \
+      PATH="$fakebin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin" \
+      AIRC_HOME="$home" \
+      AIRC_NAME=gh-secondary-test \
+      AIRC_NO_DISCOVERY=1 \
+      AIRC_NO_GENERAL=1 \
+      AIRC_AUTH_CACHE_SEC=-1 \
+      AIRC_RATE_LIMIT_WAIT_SEC=1 \
+      TMPDIR="$root/tmp" \
+      "$AIRC" connect --room gh-secondary-test > "$root/out.log" 2>&1
+  ) &
+  local pid=$!
+  sleep 6
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+
+  local out
+  out=$(cat "$root/out.log" 2>/dev/null)
+  echo "$out" | grep -q 'Continuing in degraded mode' \
+    && pass "join treats gh secondary throttle as degraded, not fatal" \
+    || fail "join did not enter degraded mode under gh secondary throttle ($out)"
+  echo "$out" | grep -q 'gh auth not OK' \
+    && fail "join still hard-failed gh auth under secondary throttle ($out)" \
+    || pass "join did not print fatal gh-auth failure under secondary throttle"
+  echo "$out" | grep -q 'Hosting #gh-secondary-test' \
+    && pass "join proceeded far enough to start the room monitor path" \
+    || fail "join did not proceed to room startup after degraded auth ($out)"
+
+  rm -rf "$root"
+  cleanup_all
+}
+
+# ── Scenario: solo_mesh_warns (transport health != collaboration) ───────
+# A self-healed host can have fresh local transport/bearer state while no
+# peers are actually paired to the mesh. `airc status` / `doctor --health`
+# must not report stale prior collaboration as simply healthy, but a true
+# first user with no remote history should not be blocked.
+scenario_solo_mesh_warns() {
+  section "solo_mesh_warns: status and doctor distinguish local health from collaboration"
+  cleanup_all
+
+  local home=/tmp/airc-it-solo/state
+  mkdir -p "$home/identity" "$home/peers"
+  scaffold_identity "$home/identity" 'airc-test-solo'
+  cat > "$home/config.json" <<'JSON'
+{ "name": "solo-host", "subscribed_channels": ["general"], "channel_gists": {"general": "abc123"} }
+JSON
+  echo general > "$home/room_name"
+  echo abc123 > "$home/room_gist_id"
+
+  local status_out doctor_out
+  status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
+  echo "$status_out" | grep -q 'collaboration: waiting for peers' \
+    && pass "status reports waiting state for first user with no peers" \
+    || fail "status did not report first-user waiting state ($status_out)"
+
+  doctor_out=$(AIRC_HOME="$home" "$AIRC" doctor --health 2>&1)
+  echo "$doctor_out" | grep -q 'waiting for first peer' \
+    && pass "doctor --health treats first-user solo as informational" \
+    || fail "doctor --health did not surface first-user waiting state ($doctor_out)"
+
+  printf '{"from":"remote-agent","to":"all","ts":"%s","channel":"general","msg":"stale remote proof"}\n' \
+    "$(date -u -v-2H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)" >> "$home/messages.jsonl"
+  doctor_out=$(AIRC_HOME="$home" "$AIRC" doctor --health 2>&1 || true)
+  echo "$doctor_out" | grep -q 'may be a solo island' \
+    && pass "doctor --health blocks zero-peer mesh when prior remote traffic went stale" \
+    || fail "doctor --health did not block stale prior remote traffic ($doctor_out)"
+
+  : > "$home/messages.jsonl"
+  printf '{"from":"remote-agent","to":"all","ts":"%s","channel":"general","msg":"recent remote proof"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$home/messages.jsonl"
+  local now_ts; now_ts=$(date +%s)
+  printf '{"kind":"gh","peer_id":"self","last_recv_ts":%s,"last_sender":"remote-agent","events_total":1,"diag":"last event from gh poll","last_heartbeat_ts":%s}\n' \
+    "$((now_ts - 3600))" "$now_ts" > "$home/bearer_state.general.json"
+
+  status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1)
+  echo "$status_out" | grep -q 'collaboration: ok (1 broadcast peer; 0 direct peer records' \
+    && pass "status treats recent signed traffic as broadcast peer presence" \
+    || fail "status did not recognize broadcast peer presence ($status_out)"
+
+  doctor_out=$(AIRC_HOME="$home" "$AIRC" doctor --health 2>&1)
+  echo "$doctor_out" | grep -q '\[ok\] #general — bearer heartbeat' \
+    && pass "doctor treats fresh heartbeat as live even when last message is old" \
+    || fail "doctor did not use heartbeat evidence for bearer health ($doctor_out)"
+  echo "$doctor_out" | grep -q '\[BLOCKED\] #general' \
+    && fail "doctor falsely blocked a heartbeating idle channel ($doctor_out)" \
+    || pass "doctor does not block a heartbeating idle channel"
+  echo "$doctor_out" | grep -q 'recent broadcast peer' \
+    && pass "doctor --health accepts broadcast peer presence as collaboration" \
+    || fail "doctor --health did not accept broadcast peer presence ($doctor_out)"
+
+  peers_out=$(AIRC_HOME="$home" "$AIRC" peers 2>&1)
+  echo "$peers_out" | grep -q 'remote-agent → broadcast room' \
+    && pass "airc peers falls back to recent broadcast-only traffic" \
+    || fail "airc peers hid recent remote traffic when peer records were empty ($peers_out)"
+
+  local whois_out
+  whois_out=$(AIRC_HOME="$home" "$AIRC" whois remote-agent 2>&1)
+  echo "$whois_out" | grep -q 'role: *broadcast peer' \
+    && pass "airc whois returns limited identity for broadcast peer" \
+    || fail "airc whois did not resolve broadcast peer ($whois_out)"
+
+  rm -rf /tmp/airc-it-solo
   cleanup_all
 }
 
@@ -1979,8 +2428,8 @@ JSON
 #   1. Two tabs paired (alpha hosting, beta joined). Beta's CONFIG now
 #      has host_target=alpha's-address.
 #   2. Alpha's process dies (machine restart, crash, kill -9). Alpha's
-#      gist may also be gone (graceful teardown deletes it; ungraceful
-#      leaves it stale).
+#      gist remains as the durable channel identity, but its host lease
+#      may be stale.
 #   3. Beta runs `airc connect` again.
 #
 # Pre-#130: beta's resume path SSH-probed alpha's cached address. If
@@ -2039,24 +2488,21 @@ scenario_connect_after_kill_recovers() {
     && pass "beta's CONFIG has cached host_target (pre-condition)" \
     || { fail "beta's CONFIG has no host_target — pre-condition broken"; cleanup_all; return; }
 
-  # ── Kill alpha hard. SIGKILL bypasses alpha's EXIT trap, so alpha's
-  # gist is left STALE on gh (host process gone, gist still exists).
-  # This is the worst case: a cached pairing pointing at a dead host
-  # whose gist still resolves.
+  # ── Stop alpha. The room gist stays on gh as durable channel identity;
+  # beta must not trust the cached host_target, and must recover through
+  # discovery / same-gist lease refresh instead.
   AIRC_HOME=/tmp/airc-it-cakr-h/state "$AIRC" teardown >/dev/null 2>&1
-  # teardown deletes the gist gracefully — do that for round 1 to
-  # exercise the gist-gone case. (The TCP-unreachable-but-gist-alive
-  # case is exercised by scenario_two_tab_localhost's host-crash branch.)
   sleep 2
   if gh api "gists/$gid_alpha" >/dev/null 2>&1; then
-    fail "alpha's gist not deleted by teardown (test pre-condition)"
-    gh gist delete "$gid_alpha" --yes 2>/dev/null
+    pass "alpha's room gist preserved (durable channel identity)"
   else
-    pass "alpha's gist deleted (gist-gone case set up)"
+    fail "alpha's room gist disappeared; durable identity pre-condition broken"
+    cleanup_all
+    return
   fi
 
   # Beta is now in the same state Joel hit: paired CONFIG with cached
-  # host_target pointing at a dead host, gist gone. Run beta's connect.
+  # host_target pointing at a dead host. Run beta's connect.
   AIRC_HOME=/tmp/airc-it-cakr-j/state "$AIRC" teardown >/dev/null 2>&1
   sleep 1
   local recover_log=/tmp/airc-it-cakr-j-recover.log
@@ -2093,6 +2539,7 @@ scenario_connect_after_kill_recovers() {
   AIRC_HOME=/tmp/airc-it-cakr-j/state "$AIRC" teardown >/dev/null 2>&1
   sleep 1
   rm -f "$recover_log"
+  gh gist delete "$gid_alpha" --yes 2>/dev/null || true
   rm -rf /tmp/airc-it-cakr-h /tmp/airc-it-cakr-j
   cleanup_all
 }
@@ -2956,6 +3403,72 @@ scenario_gh_send_creates_messages_jsonl() {
   cleanup_all
 }
 
+scenario_inbox() {
+  section "inbox cursor tracks unread messages"
+  local root=/tmp/airc-it-inbox
+  local home="$root/state"
+  rm -rf "$root"
+  mkdir -p "$home"
+  echo '{"name":"inbox-test"}' > "$home/config.json"
+  {
+    printf '%s\n' '{"ts":"2026-05-04T10:00:00Z","from":"alpha","msg":"first unread"}'
+    printf '%s\n' '{"ts":"2026-05-04T10:01:00Z","from":"beta","msg":"second unread"}'
+  } > "$home/messages.jsonl"
+
+  local out
+  out=$(AIRC_HOME="$home" "$AIRC" inbox --peek --since 2026-05-04T09:59:00Z 2>&1)
+  printf '%s' "$out" | grep -q 'first unread' \
+    && printf '%s' "$out" | grep -q 'second unread' \
+    && pass "inbox --peek shows unread messages" \
+    || fail "inbox --peek missing expected messages: $out"
+  [ ! -f "$home/inbox_cursor" ] \
+    && pass "inbox --peek does not advance cursor" \
+    || fail "inbox --peek unexpectedly wrote cursor"
+
+  out=$(AIRC_HOME="$home" "$AIRC" inbox --since 2026-05-04T09:59:00Z 2>&1)
+  local cursor; cursor=$(cat "$home/inbox_cursor" 2>/dev/null || true)
+  printf '%s' "$cursor" | grep -q '"offset":[1-9]' \
+    && pass "inbox advances byte cursor after printed messages" \
+    || fail "inbox cursor = '$cursor' (expected byte offset JSON); output: $out"
+
+  out=$(AIRC_HOME="$home" "$AIRC" inbox 2>&1)
+  printf '%s' "$out" | grep -q 'No new airc messages' \
+    && pass "inbox uses saved cursor on next check" \
+    || fail "inbox did not respect saved cursor: $out"
+
+  out=$(AIRC_HOME="$home" "$AIRC" codex-poll 2>&1)
+  [ -z "$out" ] \
+    && pass "codex-poll is quiet when empty" \
+    || fail "codex-poll should be quiet when empty, got: $out"
+
+  printf '%s\n' '{"ts":"2099-05-04T10:01:30Z","from":"inbox-test","client_id":"test-client","msg":"self-only"}' >> "$home/messages.jsonl"
+  printf '%s\n' '{"ts":"2099-05-04T10:01:31Z","from":"inbox-test","client_id":"other-client","msg":"same-nick-peer"}' >> "$home/messages.jsonl"
+  printf '%s\n' '{"ts":"2099-05-04T10:01:32Z","from":"inbox-test","msg":"legacy-same-name-visible"}' >> "$home/messages.jsonl"
+  printf '%s\n' '{"ts":"2099-05-04T10:01:33Z","from":"peer-test","client_id":"peer-client","msg":"peer-only"}' >> "$home/messages.jsonl"
+  out=$(AIRC_CLIENT_ID=test-client AIRC_HOME="$home" "$AIRC" codex-poll 2>&1)
+  printf '%s' "$out" | grep -q 'peer-only' \
+    && printf '%s' "$out" | grep -q 'same-nick-peer' \
+    && printf '%s' "$out" | grep -q 'legacy-same-name-visible' \
+    && ! printf '%s' "$out" | grep -q 'self-only' \
+    && pass "codex-poll excludes same-client self and prints same-nick peers" \
+    || fail "codex-poll self-filter wrong: $out"
+
+  printf '%s\n' '{"ts":"2099-05-04T10:02:00Z","from":"gamma","msg":"third unread"}' >> "$home/messages.jsonl"
+  out=$(AIRC_HOME="$home" "$AIRC" poll 2>&1)
+  cursor=$(cat "$home/inbox_cursor" 2>/dev/null || true)
+  printf '%s' "$out" | grep -q 'third unread' \
+    && printf '%s' "$cursor" | grep -q '"offset":[1-9]' \
+    && pass "poll alias reads only new messages and advances cursor" \
+    || fail "poll alias failed; cursor='$cursor' output: $out"
+
+  printf '%s\n' '{"ts":"2099-05-04T10:03:00Z","from":"peer-test","client_id":"peer-client","msg":"hook-visible"}' >> "$home/messages.jsonl"
+  out=$(printf '{"hook_event_name":"UserPromptSubmit"}' | AIRC_CLIENT_ID=test-client AIRC_HOME="$home" "$AIRC" codex-hook user-prompt-submit 2>&1)
+  printf '%s' "$out" | grep -q '"hookEventName":"UserPromptSubmit"' \
+    && printf '%s' "$out" | grep -q 'hook-visible' \
+    && pass "codex-hook emits UserPromptSubmit context for unread local messages" \
+    || fail "codex-hook did not emit expected UserPromptSubmit JSON: $out"
+}
+
 scenario_host_msg_publishes_to_gist() {
   requires_gh_auth_or_skip "host_msg_publishes_to_gist" || return
   # End-to-end: full `airc msg` from a host actually publishes to the
@@ -3342,6 +3855,126 @@ scenario_custom_room_creates_gist() {
   cleanup_all
 }
 
+scenario_invite_human() {
+  # `airc invite --human` produces a self-contained shell paste-block
+  # a coworker can run in their terminal — including the install
+  # one-liner so the "they don't have airc yet" case works. The block
+  # uses the room's raw gist-id (not the mnemonic) so it works for
+  # coworkers on a DIFFERENT gh account; mnemonic resolution is
+  # same-gh-account-only.
+  #
+  # This scenario tests the END-TO-END user flow Joel calls "Toby's
+  # case for humans" — friend pastes the block, ends up in the room.
+  # We can't actually run the install one-liner in the test (would
+  # touch the real ~/.local/bin/airc and pull from main), but we
+  # CAN extract the connect line and execute its substantive part:
+  # (1) the paste-block has the right shape, and (2) the connect
+  # command in it actually puts a fresh joiner scope into the host's
+  # room.
+  section "invite --human: paste-block onboards a coworker end-to-end"
+  requires_gh_auth_or_skip "invite_human" || return
+  cleanup_all
+
+  local home_h=/tmp/airc-it-ihp-h
+  mkdir -p "$home_h/state"
+  local rname="ihp-room-$$"
+  ( cd "$home_h" && AIRC_HOME="$home_h/state" AIRC_NAME=ihp-host AIRC_PORT=7567 \
+      AIRC_NO_DISCOVERY=1 AIRC_NO_AUTO_ROOM=1 \
+      "$AIRC" connect --room "$rname" --no-general > "$home_h/out.log" 2>&1 & )
+  # Wait up to 60s for the host to publish channel_gists[$rname] —
+  # gist creation hits the gh API and can be slow on first call.
+  # Loop early-exits as soon as the field appears. The host scope
+  # passes AIRC_NO_DISCOVERY=1 so the find_existing convergence-check
+  # is skipped (it can take ~30s per attempt on accounts with many
+  # gists), and we go straight to create_new — should complete in ~3-5s.
+  local host_gid="" i
+  for i in $(seq 1 60); do
+    sleep 1
+    [ -f "$home_h/state/config.json" ] || continue
+    host_gid=$(python3 -c "
+import json
+try:
+    c = json.load(open('$home_h/state/config.json'))
+    print(c.get('channel_gists', {}).get('$rname', ''))
+except Exception:
+    pass
+" 2>/dev/null)
+    [ -n "$host_gid" ] && break
+  done
+
+  if [ -z "$host_gid" ]; then
+    fail "host did not publish a room gist within 60s (channel_gists['$rname'] empty); out.log: $(tail -10 "$home_h/out.log" 2>/dev/null)"
+    cleanup_all; return
+  fi
+  pass "host published room gist: $host_gid (#$rname)"
+
+  trap "[ -n '$host_gid' ] && gh gist delete '$host_gid' --yes 2>/dev/null || true" EXIT
+
+  # Capture invite --human output.
+  local block; block=$(AIRC_HOME="$home_h/state" "$AIRC" invite --human 2>&1)
+
+  # Shape assertions — the block must contain each onboarding step a
+  # human-without-airc-yet would need. Each missing piece is a real
+  # regression in coworker-onboarding UX.
+  printf '%s\n' "$block" | grep -q "curl -fsSL" \
+    && pass "paste-block contains install one-liner" \
+    || fail "paste-block missing install one-liner"
+  printf '%s\n' "$block" | grep -q "airc join" \
+    && pass "paste-block contains 'airc join'" \
+    || fail "paste-block missing 'airc join'"
+  printf '%s\n' "$block" | grep -q "airc msg" \
+    && pass "paste-block contains 'airc msg' (first-message hint)" \
+    || fail "paste-block missing 'airc msg' (recipient won't know how to be heard)"
+  printf '%s\n' "$block" | grep -q "airc part" \
+    && pass "paste-block contains 'airc part' (clean-exit hint)" \
+    || fail "paste-block missing 'airc part'"
+
+  # The join must reference the actual gist-id (cross-account-safe),
+  # NOT the mnemonic (which only resolves on the same gh account).
+  printf '%s\n' "$block" | grep -qE "airc join $host_gid" \
+    && pass "paste-block uses raw gist-id (cross-account safe)" \
+    || fail "paste-block missing the actual gist-id ($host_gid) on the join line"
+
+  # $(whoami) must be LITERAL in the printed block — it expands at
+  # paste-time on the receiver's shell, not at generation-time on
+  # the host's. If the heredoc lost its quoted delimiter, the host's
+  # username would leak instead.
+  printf '%s\n' "$block" | grep -qF '$(whoami)' \
+    && pass "paste-block preserves literal \$(whoami) (resolves on receiver, not host)" \
+    || fail "paste-block has expanded \$(whoami) — would leak host username"
+
+  # The gist-id in the paste-block must be the host's ACTUAL room gist
+  # (extracted to confirm — not a mistake like a stale ID or the long
+  # invite string).
+  local connect_gid; connect_gid=$(printf '%s\n' "$block" | grep -oE "airc join [a-f0-9]{32}" | head -1 | awk '{print $3}')
+  if [ "$connect_gid" = "$host_gid" ]; then
+    pass "paste-block gist-id matches host's published room gist"
+  else
+    fail "paste-block gist-id ($connect_gid) != host's room gist ($host_gid)"
+  fi
+
+  # The gist referenced in the paste-block must actually exist on gh —
+  # if it's a stale ID or a 404, the coworker's `airc connect` will
+  # silently spin or error out and they won't know why.
+  if gh api "gists/$connect_gid" --jq '.id' >/dev/null 2>&1; then
+    pass "paste-block gist actually exists and is reachable on gh"
+  else
+    fail "paste-block gist ($connect_gid) NOT reachable via gh api — the receiver's 'airc connect' would fail"
+  fi
+
+  # The paste-block uses absolute paths (~/.local/bin/airc) rather
+  # than bare 'airc'. PATH may not include ~/.local/bin in the same
+  # shell that just curl|bash'd install.sh, so bare 'airc' would fail
+  # for fresh installs. Absolute paths protect against that.
+  printf '%s\n' "$block" | grep -q "~/.local/bin/airc" \
+    && pass "paste-block uses absolute path (~/.local/bin/airc) so PATH-not-yet-refreshed shells still find airc" \
+    || fail "paste-block missing absolute airc path — would fail in a shell that just installed airc"
+
+  trap - EXIT
+  [ -n "$host_gid" ] && gh gist delete "$host_gid" --yes 2>/dev/null || true
+  cleanup_all
+}
+
 scenario_bearer_local() {
   # LocalBearer used to serve same-machine peers via direct filesystem
   # reads/writes — a "skip the network" optimization correct in the
@@ -3664,9 +4297,35 @@ scenario_e2e_encryption() {
   # test — if this passes, end-to-end encryption works through real
   # paired SSH (the same path coworkers will use).
   #
-  # Skip-guards on the dev venv being available. CI without the venv
-  # falls through cleanly and the rest of the suite runs.
+  # Architectural debt — SKIPPED with explicit reason rather than
+  # silent fall-through.
+  #
+  # Pre-fix: gated on a `.venv-dev` next to $AIRC that install.sh does
+  # not create (install.sh creates `.venv` inside its install dest,
+  # typically $HOME/.airc-src). Result: silently skipping every CI run
+  # despite the suite saying it ran. When the gate is fixed, the test
+  # ITSELF fails because it was written when SSH was a registered
+  # bearer — Phase E / post-3c removed the SSH bearer entirely
+  # (bearer_resolver.available_kinds is gh + LocalBearer only); this
+  # test's send path errors with "no registered bearer can serve
+  # peer_meta={…host_target: 'user@host'…}" and the wire falls back
+  # to plaintext gh-substrate, breaking the "wire is ciphertext"
+  # assertion.
+  #
+  # The fix is a real rewrite — verify envelope encryption end-to-end
+  # via the gh-substrate path (the only one that exists now), not the
+  # legacy SSH-pair path. Until that lands, skipping with the real
+  # reason is honest (per CLAUDE.md "never swallow errors") — the
+  # previous `.venv-dev`-not-found gate was silently hiding this.
+  #
+  # Joel's directive 2026-05-04: "could remedy rather than flaking
+  # out." This is the loud-skip step en route to the rewrite.
   section "e2e encryption: wire is ciphertext, receiver decrypts to plaintext"
+  echo "  (skipped — test uses removed SSH-bearer transport path; needs rewrite to verify envelope encryption via gh substrate. Tracking: airc Phase E test debt.)"
+  return
+
+  # ── Below is the original SSH-bearer-based test, kept for context
+  # ── on the rewrite (preserved verbatim).
 
   local _venv="$(cd "$(dirname "$AIRC")" && pwd)/.venv-dev"
   if [ ! -x "$_venv/bin/python" ] && [ ! -x "$_venv/bin/python3" ]; then
@@ -3898,6 +4557,12 @@ case "$MODE" in
   two_tab_localhost) scenario_two_tab_localhost ;;
   auto_scope)   scenario_auto_scope ;;
   send_dead_monitor_dies) scenario_send_dead_monitor_dies ;;
+  monitor_liveness_process_evidence) scenario_monitor_liveness_process_evidence ;;
+  attach_starts_background_transport) scenario_attach_starts_background_transport ;;
+  attach_spawn_strips_attach_flag) scenario_attach_spawn_strips_attach_flag ;;
+  codex_join_detaches_transport) scenario_codex_join_detaches_transport ;;
+  gh_secondary_rate_limit_degraded_startup) scenario_gh_secondary_rate_limit_degraded_startup ;;
+  solo_mesh_warns) scenario_solo_mesh_warns ;;
   connect_after_kill_recovers) scenario_connect_after_kill_recovers ;;
   general_sidecar_default) scenario_general_sidecar_default ;;
   away) scenario_away ;;
@@ -3913,11 +4578,13 @@ case "$MODE" in
   bearer_local) scenario_bearer_local ;;
   bearer_gh) scenario_bearer_gh ;;
   gh_send_creates_messages_jsonl) scenario_gh_send_creates_messages_jsonl ;;
+  inbox) scenario_inbox ;;
   host_msg_publishes_to_gist) scenario_host_msg_publishes_to_gist ;;
   general_has_shared_gist) scenario_general_has_shared_gist ;;
   channel_gist_prefers_single_channel) scenario_channel_gist_prefers_single_channel ;;
   gist_rotates_under_size_limit) scenario_gist_rotates_under_size_limit ;;
   custom_room_creates_gist) scenario_custom_room_creates_gist ;;
+  invite_human) scenario_invite_human ;;
   ""|all)
     # Default = run everything. The peers_cross_scope + whois_cross_scope
     # scenarios were removed in PR #239 (sidecar walk semantics deleted
@@ -3929,16 +4596,22 @@ case "$MODE" in
     scenario_auth_failure; scenario_room; scenario_events; scenario_get_host
     scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat
     scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope
-    scenario_send_dead_monitor_dies; scenario_connect_after_kill_recovers
+    scenario_send_dead_monitor_dies; scenario_monitor_liveness_process_evidence
+    scenario_attach_starts_background_transport; scenario_attach_spawn_strips_attach_flag; scenario_codex_join_detaches_transport
+    scenario_gh_secondary_rate_limit_degraded_startup
+    scenario_solo_mesh_warns
+    scenario_connect_after_kill_recovers
     scenario_general_sidecar_default; scenario_away
     scenario_list; scenario_quit; scenario_platform_adapters
     scenario_python_units
     scenario_bearer_ssh_send; scenario_bearer_ssh_recv; scenario_bearer_cli_recv
     scenario_bearer_observability; scenario_bearer_local; scenario_bearer_gh
     scenario_e2e_encryption
+    scenario_inbox
     scenario_custom_room_creates_gist
+    scenario_invite_human
     ;;
-  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|all]"; exit 2 ;;
+  *) echo "Usage: $0 [tabs|scope|teardown|reminder|resilience|reconnect|queue|status|auth_failure|room|events|get_host|identity|whois|kick|heartbeat|bounce|two_tab_localhost|auto_scope|send_dead_monitor_dies|monitor_liveness_process_evidence|gh_secondary_rate_limit_degraded_startup|solo_mesh_warns|connect_after_kill_recovers|general_sidecar_default|away|list|quit|platform_adapters|python_units|bearer_ssh_send|bearer_ssh_recv|inbox|invite_human|all]"; exit 2 ;;
 esac
 
 echo

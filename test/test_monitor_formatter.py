@@ -60,6 +60,7 @@ class AutoPongTests(unittest.TestCase):
         # Capture stdout to keep test output clean.
         with mock.patch.object(mf.sys, "stdin", io.StringIO(body)), \
              mock.patch.object(mf.sys, "stdout", io.StringIO()), \
+             mock.patch.object(mf, "current_client_id", return_value="test-client"), \
              mock.patch("subprocess.Popen", _FakePopen):
             mf.run("alice", self._peers)
 
@@ -219,12 +220,83 @@ class HeartbeatSuppressionTests(unittest.TestCase):
         self.assertEqual(out.getvalue(), "", "heartbeat must produce zero stdout output")
 
 
+class MirrorDedupeTests(unittest.TestCase):
+    """Host self-echo and duplicate bearer reads must not append or display
+    the same signed envelope twice."""
+
+    def setUp(self):
+        self._scope = tempfile.mkdtemp(prefix="airc-mf-dedupe-test-")
+        self._peers = os.path.join(self._scope, "peers")
+        os.makedirs(self._peers, exist_ok=True)
+        with open(os.path.join(self._scope, "config.json"), "w") as f:
+            json.dump({"name": "alice", "subscribed_channels": ["general"]}, f)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._scope, ignore_errors=True)
+
+    def _run(self, lines):
+        body = "\n".join(json.dumps(l) for l in lines) + "\n"
+        out = io.StringIO()
+        with mock.patch.object(mf.sys, "stdin", io.StringIO(body)), \
+             mock.patch.object(mf.sys, "stdout", out), \
+             mock.patch.object(mf, "current_client_id", return_value="test-client"):
+            mf.run("alice", self._peers)
+        return out.getvalue()
+
+    def test_duplicate_signature_in_stream_appends_once_and_displays_once(self):
+        msg = {
+            "from": "bob",
+            "to": "all",
+            "ts": "2026-05-05T05:42:03Z",
+            "channel": "general",
+            "msg": "hello once",
+            "client_id": "agent:bob",
+            "sig": "same-signature",
+        }
+        out = self._run([msg, dict(msg)])
+        self.assertEqual(out.count("hello once"), 1)
+        local_log = Path(self._scope) / "messages.jsonl"
+        self.assertEqual(local_log.read_text(encoding="utf-8").count("same-signature"), 1)
+
+    def test_signature_already_in_local_log_is_not_mirrored_or_displayed(self):
+        msg = {
+            "from": "alice",
+            "to": "all",
+            "ts": "2026-05-05T05:42:03Z",
+            "channel": "general",
+            "msg": "self echo",
+            "client_id": "other-tab",
+            "sig": "already-local",
+        }
+        local_log = Path(self._scope) / "messages.jsonl"
+        local_log.write_text(json.dumps(msg) + "\n", encoding="utf-8")
+        out = self._run([msg])
+        self.assertNotIn("self echo", out)
+        self.assertEqual(local_log.read_text(encoding="utf-8").count("already-local"), 1)
+
+    def test_own_client_message_is_mirrored_but_not_displayed(self):
+        msg = {
+            "from": "alice",
+            "to": "all",
+            "ts": "2026-05-05T05:42:03Z",
+            "channel": "general",
+            "msg": "own audit only",
+            "client_id": "test-client",
+            "sig": "own-client-sig",
+        }
+        out = self._run([msg])
+        self.assertNotIn("own audit only", out)
+        local_log = Path(self._scope) / "messages.jsonl"
+        self.assertEqual(local_log.read_text(encoding="utf-8").count("own-client-sig"), 1)
+
+
 class DisplayFilterLoudDropTests(unittest.TestCase):
     """#399 follow-up to #401: when monitor_formatter's display filter
     drops a peer broadcast (channel name truly differs, e.g.
-    'cambriantech' vs subs=['general'] — #401's '#'-prefix tolerance
+    'acme' vs subs=['general'] — #401's '#'-prefix tolerance
     cannot help), emit a stdout warning so Claude Code's Monitor wakes
-    + the operator sees they need `airc subscribe <channel>`.
+    + the operator sees they need `airc join --room <channel>`.
 
     Pre-fix: silent drop produced #399's 9-hour blackout pattern even
     after #401 merged.
@@ -262,14 +334,14 @@ class DisplayFilterLoudDropTests(unittest.TestCase):
         return out.getvalue(), err.getvalue()
 
     def test_cross_channel_drop_emits_stdout_warning(self):
-        msg = {"from": "bob", "to": "all", "channel": "cambriantech",
+        msg = {"from": "bob", "to": "all", "channel": "acme",
                "msg": "should drop", "ts": "2026-05-02T15:00:00Z"}
         out, err = self._run([msg])
         self.assertNotIn("should drop", out,
             "cross-channel msg body must not display when subs filter rejects")
         self.assertIn("WARN display-filtered", out,
             "cross-channel drop must surface to stdout so Monitor wakes")
-        self.assertIn("cambriantech", out,
+        self.assertIn("acme", out,
             "warning must name the dropped channel so operator can subscribe")
         self.assertIn("display-filter drop", err,
             "stderr trace must record evidence for daemon.log debugging")
@@ -284,7 +356,7 @@ class DisplayFilterLoudDropTests(unittest.TestCase):
             "subscribed-channel msg must not trigger drop warning")
 
     def test_addressed_to_me_bypasses_filter(self):
-        msg = {"from": "bob", "to": "alice", "channel": "cambriantech",
+        msg = {"from": "bob", "to": "alice", "channel": "acme",
                "msg": "DM bypasses filter", "ts": "2026-05-02T15:00:00Z"}
         out, err = self._run([msg])
         self.assertIn("DM bypasses filter", out,

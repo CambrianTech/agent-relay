@@ -1,6 +1,6 @@
 ---
 name: airc:repair
-description: Full re-pair of a stale airc mesh — `teardown --flush` + reconnect using the saved invite string. Use when your sends silently fail or `resume` reports stale auth.
+description: Full re-pair of a stale airc mesh when identity/pairing state is corrupt. Most monitor recovery should use `airc join` instead.
 user-invocable: true
 allowed-tools: Bash, Monitor
 argument-hint: "[invite-string]"
@@ -41,10 +41,16 @@ airc teardown --flush
 
 Wipes identity, peer records, saved pairing, messages. State is gone.
 
-### Step 3 — reconnect with the invite
+### Step 3 — join with the invite
 
+Claude Code:
 ```
-Monitor(persistent=true, command="airc connect $INVITE")
+Monitor(persistent=true, description="airc", command="airc join $INVITE")
+```
+
+Codex / non-Monitor runtimes:
+```bash
+airc join "$INVITE"
 ```
 
 Fresh handshake, fresh identity keys get pushed to the host's authorized_keys, clean pair.

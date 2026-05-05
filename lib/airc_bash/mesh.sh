@@ -37,37 +37,54 @@ _mesh_desc() {
 # Singleton lookup: find the mesh gist on the current gh account.
 # Echoes the gist id (one line) or empty.
 #
-# If the listing returns 2+ candidates (race-loser collision, gh
-# replication lag, or an old per-room gist incorrectly tagged), keep
-# the OLDEST by created_at. The oldest is the legitimate winner of
-# any post-publish race because it was created first; any other entry
-# is a duplicate that should be reaped on the next takeover cycle.
+# Production invariant: the gist envelope content is the source of
+# truth, not the human description. Pre-fix this matched only gists
+# whose description was exactly "airc mesh"; meanwhile
+# airc_core.channel_gist.resolve found older "airc room: ..." gists
+# by envelope content. Two discovery systems, two answers, split-brain.
+#
+# Delegate lookup to channel_gist.find_existing so connect, subscribe,
+# send, and rediscovery all use the same canonical channel→gist rule.
+# Optional arg = channel name. Empty falls back to cmd_connect's dynamic
+# room_name, then config's default channel, then #general.
 _mesh_find() {
   command -v gh >/dev/null 2>&1 || return 0
-  local desc; desc=$(_mesh_desc)
-  # gh gist list output: <id>\t<desc>\t<files>\t<visibility>\t<updated>
-  # Filter on EXACT desc match (anchor with ^ and $ in awk).
-  local ids
-  ids=$(gh gist list --limit 50 2>/dev/null \
-    | awk -F'\t' -v d="$desc" '$2 == d { print $1 }')
-  local count; count=$(printf '%s\n' "$ids" | grep -c . || true)
-  case "$count" in
-    0) return 0 ;;
-    1) printf '%s\n' "$ids" ;;
-    *)
-      # Multiple matches — pick the oldest by created_at. Same tiebreaker
-      # cmd_connect's race-loser detection uses; centralized here.
-      local oldest="" oldest_ts=""
-      while IFS= read -r gid; do
-        [ -z "$gid" ] && continue
-        local ts; ts=$(gh api "gists/$gid" --jq '.created_at' 2>/dev/null || echo "")
-        if [ -z "$oldest_ts" ] || [ "$ts" \< "$oldest_ts" ]; then
-          oldest="$gid"; oldest_ts="$ts"
-        fi
-      done <<< "$ids"
-      [ -n "$oldest" ] && printf '%s\n' "$oldest"
-      ;;
-  esac
+  local channel="${1:-${room_name:-}}"
+  if [ -z "$channel" ] && [ -n "${CONFIG:-}" ] && [ -f "$CONFIG" ]; then
+    channel=$("$AIRC_PYTHON" -m airc_core.config default_channel --config "$CONFIG" 2>/dev/null || true)
+  fi
+  [ -z "$channel" ] && channel="general"
+  if [ -n "${CONFIG:-}" ] && [ -f "$CONFIG" ]; then
+    local configured
+    configured=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist --config "$CONFIG" --channel "$channel" 2>/dev/null || true)
+    if [ -n "$configured" ]; then
+      printf '%s\n' "$configured"
+      return 0
+    fi
+  fi
+  "$AIRC_PYTHON" -m airc_core.channel_gist find --channel "$channel" --require-invite 2>/dev/null || true
+}
+
+# Find the canonical channel gist whether or not it currently has a host
+# invite. This is the durable room identity lookup. Zero-arg discovery
+# uses it to decide whether to host/adopt the existing chain instead of
+# being attracted to a newer invite-bearing solo island.
+_mesh_find_any() {
+  command -v gh >/dev/null 2>&1 || return 0
+  local channel="${1:-${room_name:-}}"
+  if [ -z "$channel" ] && [ -n "${CONFIG:-}" ] && [ -f "$CONFIG" ]; then
+    channel=$("$AIRC_PYTHON" -m airc_core.config default_channel --config "$CONFIG" 2>/dev/null || true)
+  fi
+  [ -z "$channel" ] && channel="general"
+  if [ -n "${CONFIG:-}" ] && [ -f "$CONFIG" ]; then
+    local configured
+    configured=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist --config "$CONFIG" --channel "$channel" 2>/dev/null || true)
+    if [ -n "$configured" ]; then
+      printf '%s\n' "$configured"
+      return 0
+    fi
+  fi
+  "$AIRC_PYTHON" -m airc_core.channel_gist find --channel "$channel" 2>/dev/null || true
 }
 
 # Publish a new mesh gist. Echoes the new gist id, or empty on failure.
@@ -107,9 +124,17 @@ _mesh_update() {
 # assume stale" or "assume fresh" depending on policy.
 _mesh_age_secs() {
   local gist_id="${1:-}"
+  local channel="${2:-${room_name:-}}"
   [ -n "$gist_id" ] || return 0
   command -v gh >/dev/null 2>&1 || return 0
-  local content; content=$(gh api "gists/$gist_id" --jq '.files | to_entries[0].value.content' 2>/dev/null || true)
+  local content
+  if [ -n "$channel" ]; then
+    content=$(gh api "gists/$gist_id" 2>/dev/null \
+      | "$AIRC_PYTHON" -m airc_core.gistparse gist_content --channel "$channel" 2>/dev/null || true)
+  else
+    content=$(gh api "gists/$gist_id" 2>/dev/null \
+      | "$AIRC_PYTHON" -m airc_core.gistparse gist_content 2>/dev/null || true)
+  fi
   [ -z "$content" ] && return 0
   local hb; hb=$(printf '%s' "$content" | "$AIRC_PYTHON" -c '
 import sys, json
@@ -125,9 +150,8 @@ except Exception:
   echo $(( now_epoch - hb_epoch ))
 }
 
-# Race-aware takeover. Inputs: $1 = stale gist id we want to replace.
-# Caller has already PUBLISHED their own replacement (returned id in $2)
-# and is checking whether they actually won the race.
+# Race-aware takeover. Inputs: $1 = stale gist id we want to replace,
+# $2 = caller's newly-published gist id, $3 = channel name.
 #
 # Echoes one of:
 #   "winner"   — caller's gist is the canonical mesh; old stale was
@@ -140,11 +164,10 @@ except Exception:
 #   1. Try to delete the stale gist (idempotent — another tab may have
 #      gotten there first; treat that as success).
 #   2. Light jitter so all racers see the same gh-side state.
-#   3. List all mesh gists. If only ours is left, we won.
-#   4. If multiple, pick the OLDEST by created_at as winner. If that's
-#      ours, we won. Else echo "loser:<winner_id>".
+#   3. Resolve the canonical gist for THIS channel via _mesh_find. If
+#      the resolver says another gist is canonical, yield to it.
 _mesh_take_over() {
-  local stale_id="${1:-}" my_id="${2:-}"
+  local stale_id="${1:-}" my_id="${2:-}" channel="${3:-${room_name:-}}"
   [ -n "$my_id" ] || return 1
   command -v gh >/dev/null 2>&1 || return 1
   if [ -n "$stale_id" ] && [ "$stale_id" != "$my_id" ]; then
@@ -153,26 +176,11 @@ _mesh_take_over() {
   # Jitter: 200..1200ms. Spreads races so all tabs see the same listing.
   local jitter; jitter=$(awk -v r="$RANDOM" 'BEGIN{printf "%.3f", 0.2 + (r%1000)/1000}')
   sleep "$jitter"
-  local desc; desc=$(_mesh_desc)
-  local ids; ids=$(gh gist list --limit 50 2>/dev/null \
-    | awk -F'\t' -v d="$desc" '$2 == d { print $1 }')
-  local count; count=$(printf '%s\n' "$ids" | grep -c . || true)
-  if [ "$count" -le 1 ]; then
+  local winner
+  winner=$(_mesh_find "$channel" 2>/dev/null || true)
+  if [ -z "$winner" ] || [ "$winner" = "$my_id" ]; then
     echo "winner"
     return 0
   fi
-  # Multiple — pick oldest by created_at.
-  local oldest="" oldest_ts=""
-  while IFS= read -r gid; do
-    [ -z "$gid" ] && continue
-    local ts; ts=$(gh api "gists/$gid" --jq '.created_at' 2>/dev/null || echo "")
-    if [ -z "$oldest_ts" ] || [ "$ts" \< "$oldest_ts" ]; then
-      oldest="$gid"; oldest_ts="$ts"
-    fi
-  done <<< "$ids"
-  if [ "$oldest" = "$my_id" ]; then
-    echo "winner"
-  else
-    echo "loser:$oldest"
-  fi
+  echo "loser:$winner"
 }

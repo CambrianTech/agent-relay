@@ -24,6 +24,9 @@ import signal
 import sys
 import time
 
+from airc_core.client_id import current_client_id
+from airc_core.log_append import append_unique_sig
+
 # Inactivity watchdog: if no inbound line arrives in WATCHDOG_SEC,
 # exit with a distinct code so the caller's while-loop reconnects.
 # Why: the outer SSH tail can hang silently — middleboxes drop idle
@@ -145,7 +148,7 @@ def _find_peer_by_host(peers_dir: str, host: str):
 
     #180 fix: only return a name when the host is UNAMBIGUOUS (exactly
     one peer record matches). Same-machine peers share the host field
-    (e.g. multiple Claudes on Joel's box all have host=joel@127.0.0.1),
+    (e.g. multiple agents on one box all have host=user@127.0.0.1),
     so picking one arbitrarily corrupts an unrelated peer's record.
     Ambiguous-host → return None → chain-repair skips, no phantom."""
     if not host or not os.path.isdir(peers_dir):
@@ -265,7 +268,7 @@ def _maybe_emit_drop_warning(subs_norm: set[str]) -> None:
     """Emit one stdout warning per DROP_WARN_INTERVAL_SEC summarizing all
     drops seen in that window. Resets the counter after emit so the
     warning re-fires if drops continue. Stdout (not stderr) so the
-    Monitor surface sees it and the operator can run `airc subscribe`.
+    Monitor surface sees it and the operator can run `airc join --room <channel>`.
 
     Channel names are XML-escaped because they're peer-controlled and
     appear OUTSIDE any sandbox tag. Pre-escape, a peer could send with
@@ -293,7 +296,7 @@ def _maybe_emit_drop_warning(subs_norm: set[str]) -> None:
         # ASCII-only — Windows cp1252 console can't encode unicode marks.
         print(
             f"airc: WARN display-filtered {drops} (subscribed: {subs_str}). "
-            f"To see them: airc subscribe <channel>",
+            f"To see them: airc join --room <channel>",
             flush=True,
         )
     except Exception:
@@ -308,6 +311,25 @@ def run(my_name: str, peers_dir: str) -> int:
     config_path = os.path.join(scope_dir, "config.json")
     local_log = os.path.join(scope_dir, "messages.jsonl")
     offset_path = os.path.join(scope_dir, "monitor_offset")
+    client_id = current_client_id()
+    seen_sigs: set[str] = set()
+
+    def _load_seen_sigs(limit: int = 5000) -> None:
+        try:
+            with open(local_log, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()[-limit:]
+        except Exception:
+            return
+        for raw in lines:
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            sig = obj.get("sig")
+            if isinstance(sig, str) and sig:
+                seen_sigs.add(sig)
+
+    _load_seen_sigs()
 
     # Host vs joiner detection drives the watchdog gate below. host_target
     # empty = we are the host (we publish the room gist; joiners poll us);
@@ -454,9 +476,14 @@ def run(my_name: str, peers_dir: str) -> int:
             # readable content even though the wire was ciphertext.
             line = json.dumps(m)
         msg = m.get("msg", "")
-        # Filter own sends early, including our own [rename] markers. Read
-        # the name fresh so a mid-session rename takes effect immediately.
-        if fr == current_name():
+        sig = m.get("sig")
+        if isinstance(sig, str) and sig and sig in seen_sigs:
+            # Idempotent mirror boundary. Host-mode sends append locally
+            # immediately, then the host's own gist bearer can receive the
+            # exact same signed envelope back from the wire. Duplicate
+            # bearer processes can also replay the same line. The signature
+            # is the stable envelope identity, so if it is already in the
+            # local audit log, skip both mirror and display.
             continue
         # Mirror inbound to local messages.jsonl. Post-3c (gh substrate)
         # the gist is the canonical source of truth for ALL peers — the
@@ -469,10 +496,20 @@ def run(my_name: str, peers_dir: str) -> int:
         # [PONG:uuid] and timed out forever) and any other reader of
         # the local audit trail.
         try:
-            with open(local_log, "a") as f:
-                f.write(line + "\n")
+            result = append_unique_sig(local_log, line)
+            if isinstance(sig, str) and sig:
+                seen_sigs.add(sig)
+            if result == "skipped":
+                continue
         except Exception:
             pass
+        # Filter only this runtime's own sends from display, not from the
+        # audit log. Multiple agents can share one .airc scope and therefore
+        # one nick; filtering by `from` hides same-scope collaborators. New
+        # sends may carry client_id from CODEX_THREAD_ID / CLAUDE_* /
+        # AIRC_CLIENT_ID; old messages without client_id are displayed.
+        if client_id and m.get("client_id") == client_id:
+            continue
         # Rotate every ~100 mirrored lines. Without this, local logs
         # grow forever (Joel's audit 2026-04-28).
         if (offset_counter % 100) == 0:
@@ -563,7 +600,7 @@ def run(my_name: str, peers_dir: str) -> int:
         # pre-Phase-2 messages that don't carry the envelope field.
         line_channel = m.get("channel") or room_name
 
-        # Phase 2C+ (continuum-b741's #9 from QA pass 2026-04-28):
+        # Phase 2C+ (QA pass 2026-04-28):
         # filter display by subscribed_channels. If the user is
         # subscribed to specific channels and this message is on a
         # different channel, skip display. DMs addressed to us bypass
@@ -577,8 +614,8 @@ def run(my_name: str, peers_dir: str) -> int:
             addressed_to_me = bool(to) and to not in ("", "all") and current_name() in to.split(",")
             # Channel-name comparison must be tolerant of leading "#"
             # on either side. Pre-fix: subs read from config might be
-            # ['cambriantech', 'general'] (no #), but envelopes can
-            # carry channel='#cambriantech' (with #) — or vice versa.
+            # ['acme', 'general'] (no #), but envelopes can
+            # carry channel='#acme' (with #) — or vice versa.
             # The strict `line_channel not in subs` check then misfires
             # and silently drops legit broadcasts. b69f filed this as
             # #399: joiner Monitor surfaces substrate events but room
@@ -591,7 +628,7 @@ def run(my_name: str, peers_dir: str) -> int:
             if line_norm and line_norm not in subs_norm and not addressed_to_me:
                 # b69f 2026-05-02: even after #401's '#'-prefix tolerance,
                 # legit drops still happen when the channel NAME differs
-                # (e.g. peer stamps channel='cambriantech', subs=['general'],
+                # (e.g. peer stamps channel='acme', subs=['general'],
                 # both polling the same gist). #401 catches '#general' vs
                 # 'general'; this catches every other shape of name drift.
                 # Make the drop LOUD instead of silent — emit one stdout
@@ -623,7 +660,7 @@ def run(my_name: str, peers_dir: str) -> int:
             else:
                 # PEER-SUPPLIED content. Sandbox-wrap per vuln-A
                 # mitigation (described in docs/fusion-transport.md
-                # "Pairs with" section, identified by continuum-b69f
+                # "Pairs with" section, identified during QA
                 # 2026-05-02; b69f also recommended the per-session
                 # contract notice below).
                 #

@@ -29,6 +29,59 @@
 # (airc_self_heal_gh_auth) so callers control when re-auth is allowed
 # (interactive contexts only).
 
+# ── airc_gh_rate_limit_json_cached — cheap/budgeted rate-limit probe ──
+#
+# `gh api rate_limit` is cheaper than `/user`, but it is still a GitHub
+# request. During an outage humans and agents hammer `airc status` /
+# `doctor --health`, and repeated "health" probes can deepen the same
+# secondary throttle they are trying to diagnose. Cache successful JSON
+# briefly and cache failures even more briefly so observation has a
+# bounded request rate.
+#
+# Env:
+#   AIRC_GH_RATE_CACHE_SEC       success TTL, default 300s
+#   AIRC_GH_RATE_FAIL_CACHE_SEC  failure TTL, default 60s
+#
+# Returns:
+#   0 + prints JSON when fresh cache or live probe succeeds
+#   1 when gh missing, live probe fails, or recent failure backoff active
+airc_gh_rate_limit_json_cached() {
+  command -v gh >/dev/null 2>&1 || return 1
+
+  local _uid; _uid=$(id -u 2>/dev/null || echo nobody)
+  local _base="${TMPDIR:-/tmp}/airc-gh-rate-limit-${_uid}"
+  local _cache_file="${_base}.json"
+  local _fail_file="${_base}.fail"
+  local _ok_ttl="${AIRC_GH_RATE_CACHE_SEC:-300}"
+  local _fail_ttl="${AIRC_GH_RATE_FAIL_CACHE_SEC:-60}"
+  local _now; _now=$(date +%s 2>/dev/null || echo 0)
+
+  if [ -f "$_cache_file" ]; then
+    local _cache_mtime; _cache_mtime=$(file_mtime "$_cache_file" 2>/dev/null || echo 0)
+    if [ "$(( _now - _cache_mtime ))" -lt "$_ok_ttl" ] 2>/dev/null; then
+      cat "$_cache_file" 2>/dev/null && return 0
+    fi
+  fi
+
+  if [ -f "$_fail_file" ]; then
+    local _fail_mtime; _fail_mtime=$(file_mtime "$_fail_file" 2>/dev/null || echo 0)
+    if [ "$(( _now - _fail_mtime ))" -lt "$_fail_ttl" ] 2>/dev/null; then
+      return 1
+    fi
+  fi
+
+  local _json
+  if _json=$(gh api rate_limit 2>/dev/null) && [ -n "$_json" ]; then
+    printf '%s\n' "$_json" > "$_cache_file" 2>/dev/null || true
+    rm -f "$_fail_file" 2>/dev/null || true
+    printf '%s\n' "$_json"
+    return 0
+  fi
+
+  : > "$_fail_file" 2>/dev/null || true
+  return 1
+}
+
 # ── airc_detect_gh_auth_state — echo one of {ok, invalid, rate_limited, not_installed} ──
 #
 # Probes gh's auth state without side-effects. Output goes to STDOUT
@@ -60,7 +113,7 @@ airc_detect_gh_auth_state() {
   # Cache the OK state for AIRC_AUTH_CACHE_SEC seconds to avoid hitting
   # /user (gh auth status's probe target) on every airc-connect startup.
   # Repeated calls trip GitHub's secondary rate limiter — discovered
-  # 2026-05-02 by continuum-b69f when daemon respawn cascade made many
+  # 2026-05-02 when daemon respawn cascade made many
   # calls/min and the secondary throttle locked us out for ~15 min.
   # Core API limit was fine (4766/5000); /user-specific throttle was
   # the actual cause. Caching reduces /user hits from
@@ -110,7 +163,7 @@ airc_detect_gh_auth_state() {
   # (c) Real keyring auth failure (no GH_TOKEN env, keyring is dead).
   #     This is the common Joel-reports-FREQUENT case, and the case
   #     self-heal CAN fix via the browser flow.
-  if gh api rate_limit >/dev/null 2>&1; then
+  if airc_gh_rate_limit_json_cached >/dev/null 2>&1; then
     echo "rate_limited"
   elif [ -n "${GH_TOKEN:-}" ]; then
     # GH_TOKEN takes precedence over the keyring in gh's auth resolution.
@@ -166,7 +219,7 @@ airc_self_heal_gh_auth() {
   # would just hang the process forever.
   if [ ! -t 0 ] || [ ! -t 1 ]; then
     echo "  ✗ Auth broken but stdin/stdout not a TTY — can't run interactive re-auth here." >&2
-    echo "    Re-run an airc CLI command (airc status / airc connect / airc send …)" >&2
+    echo "    Re-run an airc CLI command (airc status / airc join / airc send …)" >&2
     echo "    in your terminal; it will detect the broken auth + trigger the browser." >&2
     return 1
   fi
@@ -210,7 +263,10 @@ airc_self_heal_gh_auth() {
 #
 # Behaviour by detected state:
 #   ok                → return 0; caller proceeds
-#   rate_limited      → emit explanation; return 1 (token is fine, wait)
+#   rate_limited      → emit explanation; return 1 by default (token is
+#                       fine, wait). If AIRC_GH_RATE_LIMIT_NONFATAL=1,
+#                       return 0 after warning so monitor startup can
+#                       continue in degraded/cached transport mode.
 #   invalid           → trigger self-heal browser flow; on success re-detect
 #                       to confirm + return 0; on failure emit fallback +
 #                       return 1 (caller dies with its own message)
@@ -254,6 +310,13 @@ airc_ensure_gh_auth_or_heal() {
       echo "    Your token is fine — wait 5-15 minutes and retry." >&2
       echo "    Context: $context" >&2
       echo "" >&2
+      if [ "${AIRC_GH_RATE_LIMIT_NONFATAL:-0}" = "1" ]; then
+        echo "    Continuing in degraded mode: monitor will start; GH-backed" >&2
+        echo "    discovery/publish operations may queue or fail until the" >&2
+        echo "    secondary throttle clears." >&2
+        echo "" >&2
+        return 0
+      fi
       if [ "${AIRC_BACKGROUND_OK:-0}" = "1" ]; then
         local _wait_secs="${AIRC_RATE_LIMIT_WAIT_SEC:-600}"
         echo "    [daemon mode] sleeping ${_wait_secs}s in-process (avoids respawn cascade)..." >&2

@@ -12,12 +12,12 @@ cmd_doctor() {
   #                            manager this platform uses, so any AI
   #                            reading the output can `proactively fix
   #                            recoverable issues` (per /doctor SKILL.md).
-  #   airc doctor --connect -- pre-flight before `airc connect`. Runs
-  #                            the default health probes PLUS connect-
+  #   airc doctor --join    -- pre-flight before `airc join`. Runs
+  #                            the default health probes PLUS join-
   #                            specific checks (tailscale UP not just
   #                            installed, gist API reachable, port free,
   #                            cached host_target reachable). Issue #80.
-  #                            Use case: airc doctor --connect && airc connect
+  #                            Use case: airc doctor --join && airc join
   #   airc doctor --tests   -- run the integration test suite (the
   #   airc doctor tests        prior default behavior; aliased on the
   #                            dispatch via `tests|test`).
@@ -27,14 +27,14 @@ cmd_doctor() {
       echo "  airc doctor              environment health check (default)"
       echo "  airc doctor --fix        attempt to repair recoverable issues"
       echo "                           (currently: gh auth re-login if invalid)"
-      echo "  airc doctor --connect    pre-flight checks for 'airc connect'"
+      echo "  airc doctor --join       pre-flight checks for 'airc join'"
       echo "  airc doctor --health     LIVE bus health (after join — daemon, gh"
       echo "                           rate-limit headroom, channel last-recv age)"
       echo "  airc doctor --tests      run the integration test suite"
       echo "                           (aliases: tests, test, run, suite)"
       return 0 ;;
     --tests|-t|tests|test|run|suite) shift; _doctor_run_tests "$@"; return ;;
-    --connect|-c|connect)            shift; _doctor_connect_preflight "$@"; return ;;
+    --join|-j|join|--connect|-c|connect) shift; _doctor_connect_preflight "$@"; return ;;
     --health|-H|health)              shift; _doctor_health "$@"; return ;;
     --fix|fix)                       shift; _doctor_fix "$@"; return ;;
   esac
@@ -184,13 +184,29 @@ _doctor_probe_gh_auth() {
   if ! command -v gh >/dev/null 2>&1; then
     return 0  # already reported missing by the gh probe
   fi
-  if gh auth status >/dev/null 2>&1; then
-    printf "  [ok] gh authenticated\n"
-    return 0
-  fi
-  printf "  [MISSING] gh authenticated (gist scope)\n"
-  printf "         Fix: gh auth login -s gist\n"
-  return 1
+  local _state
+  _state="$(airc_detect_gh_auth_state 2>/dev/null || echo invalid)"
+  case "$_state" in
+    ok)
+      printf "  [ok] gh authenticated\n"
+      return 0
+      ;;
+    rate_limited)
+      printf "  [BLOCKED] gh secondary rate limit (abuse detection) — token is fine\n"
+      printf "         Fix: wait 5-15 min; airc caches probes so health checks do not deepen the throttle\n"
+      return 1
+      ;;
+    env_token_invalid)
+      printf "  [BLOCKED] GH_TOKEN is set but invalid\n"
+      printf "         Fix: unset/fix GH_TOKEN, then retry\n"
+      return 1
+      ;;
+    *)
+      printf "  [MISSING] gh authenticated (gist scope)\n"
+      printf "         Fix: gh auth login -s gist\n"
+      return 1
+      ;;
+  esac
 }
 
 # Probe the venv cryptography package — issue #341 follow-up. airc's
@@ -245,17 +261,17 @@ _doctor_probe_tailscale() {
 }
 
 _doctor_connect_preflight() {
-  # Pre-flight check before `airc connect`. Issue #80. Runs the default
-  # prereq probes PLUS connect-specific checks. Output is a checklist
+  # Pre-flight check before `airc join`. Issue #80. Runs the default
+  # prereq probes PLUS join-specific checks. Output is a checklist
   # with fix commands; exit non-zero if any blocking issue. Use case:
   #
-  #   airc doctor --connect && airc connect
+  #   airc doctor --join && airc join
   #
   # Catches the silent-fail classes that produced #78 / #85 / #79
   # cascades for first-time users and surfaced as detective-work bugs.
   echo ""
-  echo "  airc doctor --connect -- pre-flight checks"
-  echo "  ------------------------------------------"
+  echo "  airc doctor --join -- pre-flight checks"
+  echo "  ---------------------------------------"
   echo ""
   local issues=0
   local mgr; mgr=$(_doctor_detect_pkgmgr)
@@ -275,39 +291,46 @@ _doctor_connect_preflight() {
   # gist-scope-less token (Copilot caught this on #87 review).
   if ! _doctor_probe "gh" "$mgr" "Gist substrate (room discovery)"; then
     issues=$((issues+1))
-  elif ! gh auth status >/dev/null 2>&1; then
+  else
+    local _gh_state
+    _gh_state="$(airc_detect_gh_auth_state 2>/dev/null || echo invalid)"
+    if [ "$_gh_state" != "ok" ]; then
     # Distinguish a real auth failure from a GitHub secondary rate limit
     # (abuse detection). The /rate_limit endpoint is reachable during
     # secondary limits, so if it works, the token is fine — the user just
     # needs to wait. `gh auth status` probes /user, which gets 403'd, and
     # gh then misreports the symptom as 'token invalid'. Issue #341.
-    if gh api rate_limit >/dev/null 2>&1; then
+    if [ "$_gh_state" = "rate_limited" ]; then
       printf "  [BLOCKED] gh secondary rate limit (abuse detection) — token is fine\n"
-      printf "         Fix: wait 5-15 min then re-run; cause is too many gh API calls in a short window\n"
+      printf "         Fix: wait 5-15 min; airc caches probes so health checks do not deepen the throttle\n"
+    elif [ "$_gh_state" = "env_token_invalid" ]; then
+      printf "  [BLOCKED] GH_TOKEN is set but invalid\n"
+      printf "         Fix: unset/fix GH_TOKEN, then retry\n"
     else
       printf "  [BLOCKED] gh authenticated\n"
       printf "         Fix: gh auth login -s gist\n"
     fi
     issues=$((issues+1))
-  elif ! gh auth status 2>&1 | grep -qiE '(scopes|token scopes):.*\bgist\b'; then
+    elif ! gh auth status 2>&1 | grep -qiE '(scopes|token scopes):.*\bgist\b'; then
     printf "  [BLOCKED] gh authed but missing 'gist' scope (room substrate needs it)\n"
     printf "         Fix: gh auth refresh -s gist\n"
     issues=$((issues+1))
-  elif ! gh api 'gists?per_page=1' >/dev/null 2>&1; then
+    elif ! gh api 'gists?per_page=1' >/dev/null 2>&1; then
     # Same misdiagnosis risk here — distinguish rate-limit vs other.
-    if gh api rate_limit >/dev/null 2>&1; then
+    if airc_gh_rate_limit_json_cached >/dev/null 2>&1; then
       printf "  [BLOCKED] gh secondary rate limit (abuse detection) — token + scope are fine\n"
-      printf "         Fix: wait 5-15 min then re-run\n"
+      printf "         Fix: wait 5-15 min; airc caches probes so health checks do not deepen the throttle\n"
     else
       printf "  [BLOCKED] gist API not reachable -- network outage or token revoked\n"
       printf "         Fix: check internet; if persistent, run 'gh auth refresh'\n"
     fi
     issues=$((issues+1))
-  else
+    else
     printf "  [ok] gh authed with gist scope, gists API reachable\n"
+    fi
   fi
 
-  # ── Connect-specific: tailscale state. The default doctor only marks
+  # ── Join-specific: tailscale state. The default doctor only marks
   # tailscale as "info" since it's optional for LAN-only mesh. In
   # --connect mode, if there's a saved host_target in tailnet CGNAT
   # range, Tailscale being UP is a HARD requirement.
@@ -339,7 +362,7 @@ _doctor_connect_preflight() {
     _doctor_probe_tailscale "$mgr"  # optional, info-only
   fi
 
-  # ── Connect-specific: AIRC_PORT free or auto-shift available ──
+  # ── Join-specific: AIRC_PORT free or auto-shift available ──
   local target_port="${AIRC_PORT:-7547}"
   if [ -n "$(port_listeners "$target_port")" ]; then
     printf "  [info] port %s busy -- airc will auto-shift to next free port\n" "$target_port"
@@ -347,7 +370,7 @@ _doctor_connect_preflight() {
     printf "  [ok] port %s available for hosting\n" "$target_port"
   fi
 
-  # ── Connect-specific: cached host_target reachable (resume scenario) ──
+  # ── Join-specific: cached host_target reachable (resume scenario) ──
   if [ -n "$prior_host_target" ]; then
     local probe_key="$IDENTITY_DIR/ssh_key"
     if [ -f "$probe_key" ]; then
@@ -365,10 +388,10 @@ _doctor_connect_preflight() {
 
   echo ""
   if [ "$issues" -eq 0 ]; then
-    echo "  ✓ READY -- airc connect should work."
+    echo "  ✓ READY -- airc join should work."
     return 0
   else
-    echo "  ✗ BLOCKED on $issues issue(s) -- fix the items above before 'airc connect'."
+    echo "  ✗ BLOCKED on $issues issue(s) -- fix the items above before 'airc join'."
     return 1
   fi
 }
@@ -434,7 +457,7 @@ _doctor_health() {
   # the cliff that wedged the bus pre-#416/#419.
   if command -v gh >/dev/null 2>&1; then
     local rate_json
-    if rate_json=$(gh api rate_limit 2>/dev/null); then
+    if rate_json=$(airc_gh_rate_limit_json_cached); then
       local core_remaining core_limit
       core_remaining=$(echo "$rate_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['resources']['core']['remaining'])" 2>/dev/null || echo "")
       core_limit=$(echo "$rate_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['resources']['core']['limit'])" 2>/dev/null || echo "")
@@ -458,23 +481,18 @@ _doctor_health() {
     fi
   fi
 
-  # ── Daemon installed-for-this-scope check. Pre-fix probed for a
-  # `daemon.pid` file that the daemon launcher never writes anywhere
-  # (Copilot caught this on PR #422 review — `--health` always reported
-  # "not installed" even when the daemon was running). Use the canonical
-  # detector (`airc_daemon_is_installed_for_scope`) which checks the
-  # registered launchd plist / systemd unit / HKCU Run entry. Liveness
-  # itself (is the launcher actually running and successfully polling?)
-  # is what the per-channel bearer last-recv timestamps below measure
-  # transitively — if the daemon is installed AND bearer last-recv is
-  # fresh, the daemon is alive. Fresh state with no installed daemon =
-  # an interactive `airc connect` is doing the work.
+  # ── Legacy daemon registration check. Daemon is deprecated; surface
+  # stale installed units only so users can remove them. Do not suggest
+  # installing a new background service.
   if command -v airc_daemon_is_installed_for_scope >/dev/null 2>&1 \
      && airc_daemon_is_installed_for_scope "$AIRC_WRITE_DIR" 2>/dev/null; then
-    printf "  [ok] daemon installed for this scope (liveness inferred from per-channel last-recv below)\n"
-  else
-    printf "  [info] daemon not installed (substrate runs in-shell only)\n"
-    printf "         Optional: airc daemon install  (survives sleep/crash, see README → Optional layers)\n"
+    if command -v airc_daemon_is_running_for_scope >/dev/null 2>&1 \
+       && airc_daemon_is_running_for_scope "$AIRC_WRITE_DIR" 2>/dev/null; then
+      printf "  [WARN] legacy daemon loaded for this scope (deprecated; use airc join)\n"
+    else
+      printf "  [WARN] legacy daemon installed for this scope but not loaded (deprecated)\n"
+    fi
+    printf "         Remove: airc daemon uninstall\n"
   fi
 
   # ── Per-channel bearer health. bearer_state.<channel>.json's last_recv_ts
@@ -484,7 +502,7 @@ _doctor_health() {
   # Scope to subscribed_channels ONLY (Codex's first-run report 2026-05-02
   # exposed this — same fix-shape as #406's beacon scoping). Pre-fix the
   # probe globbed every bearer_state.*.json on disk INCLUDING stale files
-  # from prior subscriptions (a #cambriantech the user parted, an old
+  # from prior subscriptions (an #old-project the user parted, an old
   # qa-foo room from a previous test, etc.). Codex correctly identified
   # the noise: "sees stale bearer-state files for older channels". Real
   # fix is to intersect with the current subscribed_channels list — same
@@ -506,8 +524,24 @@ _doctor_health() {
         continue
       fi
       found_state=1
-      local last_recv_ts
-      last_recv_ts=$(python3 -c "import sys,json; d=json.load(open('$state_file')); print(int(d.get('last_recv_ts',0)))" 2>/dev/null || echo 0)
+      local state_ts last_recv_ts last_heartbeat_ts heartbeat_age
+      state_ts=$("$AIRC_PYTHON" -m airc_core.bearer_state "$state_file" 2>/dev/null || echo "0 0")
+      last_recv_ts=${state_ts%% *}
+      last_heartbeat_ts=${state_ts#* }
+      [ "$last_recv_ts" = "$state_ts" ] && last_heartbeat_ts=0
+      heartbeat_age=999999
+      if [ "${last_heartbeat_ts:-0}" -gt 0 ] 2>/dev/null; then
+        heartbeat_age=$((now - last_heartbeat_ts))
+      fi
+      if [ "$heartbeat_age" -lt 120 ]; then
+        if [ "$last_recv_ts" = "0" ]; then
+          printf "  [ok] #%s — bearer heartbeat %ds ago (idle; no messages received yet)\n" "$channel" "$heartbeat_age"
+        else
+          local recv_age=$((now - last_recv_ts))
+          printf "  [ok] #%s — bearer heartbeat %ds ago (last message %ds ago)\n" "$channel" "$heartbeat_age" "$recv_age"
+        fi
+        continue
+      fi
       if [ "$last_recv_ts" = "0" ]; then
         printf "  [WARN] #%s — bearer state has no last_recv_ts (never received?)\n" "$channel"
         warns=$((warns+1))
@@ -522,7 +556,7 @@ _doctor_health() {
           warns=$((warns+1))
         else
           printf "  [BLOCKED] #%s — last bearer recv %ds ago (>30min — bearer is wedged)\n" "$channel" "$age"
-          printf "           Fix: airc teardown && airc join  (re-establishes bearer poll loop)\n"
+          printf "           Fix: airc join  (repairs this scope's AIRC process)\n"
           issues=$((issues+1))
         fi
       fi
@@ -531,6 +565,27 @@ _doctor_health() {
   if [ "$found_state" = "0" ]; then
     printf "  [info] no bearer state files — not joined to any channel yet\n"
     printf "         Fix: airc join  (then re-run airc doctor --health)\n"
+  fi
+
+  # ── Collaboration membership. A local bearer can be healthy while the
+  # mesh is effectively solo after host self-heal / gist rotation. That
+  # is not a healthy collaboration bus: messages may append to a fresh
+  # gist nobody else is polling. Keep this separate from transport
+  # health so users can see "wire is alive, but nobody is connected."
+  local peer_count=0
+  if [ -d "$PEERS_DIR" ]; then
+    peer_count=$(find "$PEERS_DIR" -maxdepth 1 -name '*.json' -type f 2>/dev/null | wc -l | tr -d ' ')
+  fi
+  if [ "${peer_count:-0}" -eq 0 ] 2>/dev/null; then
+    local _collab_rc=0
+    "$AIRC_PYTHON" -m airc_core.collaboration doctor \
+      --home "$AIRC_WRITE_DIR" --my-name "$(get_name)" || _collab_rc=$?
+    case "$_collab_rc" in
+      1) warns=$((warns+1)) ;;
+      2) issues=$((issues+1)) ;;
+    esac
+  else
+    printf "  [ok] collaboration mesh has %s peer record(s)\n" "$peer_count"
   fi
 
   echo

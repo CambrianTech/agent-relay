@@ -1,5 +1,5 @@
 # Sourced by airc. cmd_daemon family — install / status / uninstall /
-# log of the OS auto-restart for `airc connect`.
+# log of the OS auto-restart for `airc join`.
 #
 # Functions exported back to airc's dispatch:
 #   cmd_daemon              — verb router (install|status|uninstall|log)
@@ -27,12 +27,12 @@
 # becomes one .sh file, mirroring the cmd_doctor.sh / cmd_connect.sh
 # extraction pattern.
 
-# ── cmd_daemon: install / manage the OS auto-restart for `airc connect` ────
+# ── cmd_daemon: install / manage the OS auto-restart for `airc join` ────
 # Issue followup to #39 substrate: the channel must auto-resume across machine
 # sleep/wake/crash so users walk away and come back to a live mesh. Without
 # this, every laptop sleep kills airc + the user must remember to restart it.
 #
-# Implementation: install a platform-native autostart that wraps `airc connect`
+# Implementation: install a platform-native autostart that wraps `airc join`
 # with KeepAlive/Restart=always. AIRC_BACKGROUND_OK=1 is set in the env so
 # airc's heartbeat-stdout-pipe-trap doesn't exit-3 under launchd/systemd
 # (which have no notification-consumer reading stdout).
@@ -52,6 +52,22 @@ cmd_daemon() {
   local action="${1:-status}"
   shift 2>/dev/null || true
   case "$action" in
+    -h|--help|help|status|log|logs)
+      echo "airc daemon is deprecated. Use 'airc join' to connect and 'airc quit' to disconnect."
+      echo "If a legacy background registration exists, remove it with: airc daemon uninstall"
+      return 0 ;;
+    uninstall|remove)
+      cmd_daemon_uninstall "$@"
+      return $? ;;
+    install|restart|start|stop|*)
+      die "airc daemon is deprecated. Use 'airc join' to connect. Background service registration is disabled." ;;
+  esac
+}
+
+cmd_daemon_legacy() {
+  local action="${1:-status}"
+  shift 2>/dev/null || true
+  case "$action" in
     -h|--help|help)
       echo "Usage: airc daemon [install|uninstall|restart|status|log]"
       echo "  install     register OS auto-restart (launchd/systemd/schtasks)"
@@ -62,7 +78,7 @@ cmd_daemon() {
       return 0 ;;
     install)   cmd_daemon_install "$@" ;;
     uninstall|remove) cmd_daemon_uninstall "$@" ;;
-    restart)   shift; cmd_daemon_uninstall "$@" >/dev/null && cmd_daemon_install "$@" ;;
+    restart)   cmd_daemon_uninstall "$@" >/dev/null && cmd_daemon_install "$@" ;;
     status)    cmd_daemon_status "$@" ;;
     log|logs)  cmd_daemon_log "$@" ;;
     stop|start)
@@ -102,7 +118,7 @@ _daemon_airc_path() {
 # pointed at $HOME/.airc (empty / wrong room) while the user's actual
 # join state lives at $cwd/.airc. Joel 2026-04-28: "lol obv if it
 # worked you would have a monitor and be online. FAIL" -- caught the
-# scope mismatch on continuum-b69f's box.
+# scope mismatch on a multi-scope machine.
 _daemon_scope() {
   if [ -n "${AIRC_HOME:-}" ]; then
     echo "$AIRC_HOME"
@@ -135,7 +151,7 @@ cmd_daemon_install() {
     darwin) _daemon_install_launchd "$airc_bin" "$scope" ;;
     linux|wsl) _daemon_install_systemd "$airc_bin" "$scope" "$os" ;;
     windows) _daemon_install_schtasks "$airc_bin" "$scope" ;;
-    *) die "Daemon install not supported on $(uname -s). Manual workaround: run 'airc connect' under your platform's preferred autostart mechanism." ;;
+    *) die "Daemon install not supported on $(uname -s). Manual workaround: run 'airc join' under your platform's preferred autostart mechanism." ;;
   esac
 }
 
@@ -155,7 +171,8 @@ _daemon_install_done() {
 _daemon_install_launchd() {
   local airc_bin="$1" scope="$2"
   local plist_dir="$HOME/Library/LaunchAgents"
-  local plist_path="$plist_dir/com.cambriantech.airc.plist"
+  local _service; _service=$(airc_daemon_service_name_for_scope "$scope")
+  local plist_path="$plist_dir/${_service}.plist"
   mkdir -p "$plist_dir"
   cat > "$plist_path" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -163,11 +180,11 @@ _daemon_install_launchd() {
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.cambriantech.airc</string>
+    <string>${_service}</string>
     <key>ProgramArguments</key>
     <array>
         <string>${airc_bin}</string>
-        <string>connect</string>
+        <string>join</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -203,9 +220,16 @@ PLIST
   # the next bootstrap fires → "Input/output error 5" (launchd's
   # "service already loaded" signal). Wait for the PID to actually
   # exit before bootstrapping the new plist.
-  local _service="com.cambriantech.airc"
   local _domain="gui/$(id -u)"
   launchctl bootout "$_domain/$_service" 2>/dev/null || true
+  local _legacy_plist="$plist_dir/com.cambriantech.airc.plist"
+  if [ -f "$_legacy_plist" ]; then
+    local _legacy_scope
+    _legacy_scope=$(plutil -extract EnvironmentVariables.AIRC_HOME raw "$_legacy_plist" 2>/dev/null || true)
+    if [ "$_legacy_scope" = "$scope" ]; then
+      launchctl bootout "$_domain/com.cambriantech.airc" 2>/dev/null || true
+    fi
+  fi
   # Wait up to 3s for launchd to fully unload (poll launchctl list).
   local _i
   for _i in 1 2 3 4 5 6; do
@@ -228,7 +252,7 @@ PLIST
     die "launchctl bootstrap failed — service not loaded after bootstrap call. Check Console.app for com.cambriantech.airc errors."
   fi
   launchctl enable "$_domain/$_service" 2>/dev/null || true
-  _daemon_install_done "Loaded into launchd (gui/$(id -u)/com.cambriantech.airc)" "$scope" \
+  _daemon_install_done "Loaded into launchd (gui/$(id -u)/${_service})" "$scope" \
     "Note: if 'airc canary' / gist push fails under launchd, the gh keychain may not be unlocked at boot. Workaround: 'gh auth status' once after login to unlock; airc daemon picks it up on next restart."
 }
 
@@ -237,7 +261,7 @@ _daemon_install_schtasks() {
   # scope, so per-user autostart at logon without UAC). PRs #200/#202
   # for the why; this function for the how.
   local airc_bin="$1" scope="$2"
-  local entry_name="airc-monitor"
+  local entry_name; entry_name=$(airc_daemon_run_entry_for_scope "$scope")
 
   # Find Git Bash — the launcher .bat needs it to exec airc.
   local bash_exe=""
@@ -266,7 +290,7 @@ _daemon_install_schtasks() {
   cat > "$launcher_bash" <<EOF
 @echo off
 REM AIRC daemon launcher — generated by 'airc daemon install' on Windows.
-REM Runs airc connect under bash, restarting on exit. Logs to daemon.log.
+REM Runs airc join under bash, restarting on exit. Logs to daemon.log.
 REM On intentional re-exec (host-takeover or rejoin-as-joiner), airc
 REM writes airc.reexec-marker — we step aside rather than respawn,
 REM since the new airc bash from the exec is now the daemon.
@@ -279,9 +303,9 @@ REM Pre-fix: stdout went to nowhere (start /MIN cmd window had no
 REM redirect), only daemon.err captured the launcher's own restart
 REM messages — so 'airc daemon log' showed nothing useful, and
 REM "daemon.log doesn't exist" became a real symptom (b69f
-REM 2026-05-02 in #cambriantech). Stderr → daemon.err keeps the
+REM 2026-05-02 in a project room). Stderr → daemon.err keeps the
 REM launcher's restart records separate from the airc event stream.
-"$bash_exe" -c "exec '$airc_bin_unix' connect" 1>> "$scope_win\\daemon.log" 2>> "$scope_win\\daemon.err"
+"$bash_exe" -c "exec '$airc_bin_unix' join" 1>> "$scope_win\\daemon.log" 2>> "$scope_win\\daemon.err"
 REM Did airc just intentionally re-exec? If marker exists and is recent,
 REM the new airc process from the exec is now the running daemon —
 REM exit the launcher loop instead of racing-respawn it.
@@ -296,7 +320,7 @@ if exist "$marker_win" (
     exit /b 0
   )
 )
-echo [%date% %time%] airc connect exited. Restarting in 5s. >> "$scope_win\\daemon.err"
+echo [%date% %time%] airc join exited. Restarting in 5s. >> "$scope_win\\daemon.err"
 timeout /t 5 /nobreak >nul
 goto loop
 EOF
@@ -317,7 +341,8 @@ EOF
 _daemon_install_systemd() {
   local airc_bin="$1" scope="$2" os="$3"
   local unit_dir="$HOME/.config/systemd/user"
-  local unit_path="$unit_dir/airc.service"
+  local unit_name; unit_name=$(airc_daemon_unit_name_for_scope "$scope")
+  local unit_path="$unit_dir/$unit_name"
   if ! command -v systemctl >/dev/null 2>&1; then
     if [ "$os" = "wsl" ]; then
       die "systemctl not found. Enable systemd in WSL: edit /etc/wsl.conf to add [boot]\nsystemd=true, then 'wsl --shutdown' from PowerShell + restart your distro."
@@ -348,7 +373,7 @@ Enable systemd in WSL:
   4. Re-run:    airc daemon install
 
 Until systemd is enabled, airc daemon can't auto-resume on this WSL distro.
-A manual fallback for now:  run 'airc connect' in a tmux/screen session that
+A manual fallback for now:  run 'airc join' in a tmux/screen session that
 won't get killed by your WSL shell exit.
 EOF
       return 1
@@ -365,7 +390,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${airc_bin} connect
+ExecStart=${airc_bin} join
 Restart=always
 RestartSec=5
 Environment="AIRC_BACKGROUND_OK=1"
@@ -378,33 +403,45 @@ WantedBy=default.target
 UNIT
   echo "  Wrote $unit_path"
   systemctl --user daemon-reload || die "systemctl --user daemon-reload failed."
-  systemctl --user enable --now airc.service \
-    || die "systemctl --user enable --now airc.service failed."
-  _daemon_install_done "Loaded into systemd-user (airc.service)" "$scope" \
+  systemctl --user enable --now "$unit_name" \
+    || die "systemctl --user enable --now $unit_name failed."
+  _daemon_install_done "Loaded into systemd-user ($unit_name)" "$scope" \
     "Note: systemd-user units stop at logout unless lingering is enabled. For always-on across logout: sudo loginctl enable-linger \$USER"
 }
 
 cmd_daemon_uninstall() {
   local os; os=$(detect_platform)
+  local scope; scope=$(_daemon_scope)
   case "$os" in
     darwin)
-      local plist_path="$HOME/Library/LaunchAgents/com.cambriantech.airc.plist"
-      launchctl bootout "gui/$(id -u)/com.cambriantech.airc" 2>/dev/null \
+      local service; service=$(airc_daemon_service_name_for_scope "$scope")
+      local plist_path="$HOME/Library/LaunchAgents/${service}.plist"
+      launchctl bootout "gui/$(id -u)/$service" 2>/dev/null \
         && echo "  ✓ Unloaded from launchd" \
         || echo "  (was not loaded)"
       [ -f "$plist_path" ] && rm "$plist_path" && echo "  ✓ Removed $plist_path" \
         || echo "  (no plist on disk)"
+      local legacy_plist="$HOME/Library/LaunchAgents/com.cambriantech.airc.plist"
+      if [ -f "$legacy_plist" ]; then
+        local legacy_scope
+        legacy_scope=$(plutil -extract EnvironmentVariables.AIRC_HOME raw "$legacy_plist" 2>/dev/null || true)
+        if [ "$legacy_scope" = "$scope" ]; then
+          launchctl bootout "gui/$(id -u)/com.cambriantech.airc" 2>/dev/null || true
+          rm "$legacy_plist" && echo "  ✓ Removed legacy $legacy_plist"
+        fi
+      fi
       ;;
     linux|wsl)
-      systemctl --user disable --now airc.service 2>/dev/null \
-        && echo "  ✓ Stopped + disabled airc.service" \
+      local unit_name; unit_name=$(airc_daemon_unit_name_for_scope "$scope")
+      systemctl --user disable --now "$unit_name" 2>/dev/null \
+        && echo "  ✓ Stopped + disabled $unit_name" \
         || echo "  (was not enabled)"
-      local unit_path="$HOME/.config/systemd/user/airc.service"
+      local unit_path="$HOME/.config/systemd/user/$unit_name"
       [ -f "$unit_path" ] && rm "$unit_path" && systemctl --user daemon-reload && echo "  ✓ Removed $unit_path" \
         || echo "  (no unit on disk)"
       ;;
     windows)
-      local entry_name="airc-monitor"
+      local entry_name; entry_name=$(airc_daemon_run_entry_for_scope "$scope")
       if reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" //v "$entry_name" >/dev/null 2>&1; then
         reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" //v "$entry_name" //f >/dev/null 2>&1 \
           && echo "  ✓ Removed HKCU Run entry '$entry_name'" \
@@ -412,12 +449,11 @@ cmd_daemon_uninstall() {
       else
         echo "  (no Run entry '$entry_name' registered)"
       fi
-      # Kill any currently-running daemon-launched airc-connect tree.
+      # Kill any currently-running daemon-launched airc join tree.
       # Match on the launcher .bat path so we don't kill foreground
       # `airc join` running in the user's terminal.
-      local scope; scope=$(_daemon_scope)
       if ps -ef 2>/dev/null | grep 'airc-daemon.bat' | grep -v grep >/dev/null; then
-        ps -ef | grep 'airc-daemon.bat' | grep -v grep | awk '{print $2}' | while read pid; do
+        ps -ef | grep "$scope/airc-daemon.bat" | grep -v grep | awk '{print $2}' | while read pid; do
           kill "$pid" 2>/dev/null || true
         done
         echo "  ✓ Killed running daemon launcher process(es)"
@@ -431,13 +467,24 @@ cmd_daemon_uninstall() {
 
 cmd_daemon_status() {
   local os; os=$(detect_platform)
+  local scope; scope=$(_daemon_scope)
   case "$os" in
     darwin)
-      local plist_path="$HOME/Library/LaunchAgents/com.cambriantech.airc.plist"
+      local service; service=$(airc_daemon_service_name_for_scope "$scope")
+      local plist_path="$HOME/Library/LaunchAgents/${service}.plist"
+      local legacy_plist="$HOME/Library/LaunchAgents/com.cambriantech.airc.plist"
+      if [ ! -f "$plist_path" ] && [ -f "$legacy_plist" ]; then
+        local legacy_scope
+        legacy_scope=$(plutil -extract EnvironmentVariables.AIRC_HOME raw "$legacy_plist" 2>/dev/null || true)
+        if [ "$legacy_scope" = "$scope" ]; then
+          plist_path="$legacy_plist"
+          service="com.cambriantech.airc"
+        fi
+      fi
       if [ -f "$plist_path" ]; then
         echo "  Plist:   $plist_path"
         # launchctl print returns rich state; grep the key fields.
-        local state; state=$(launchctl print "gui/$(id -u)/com.cambriantech.airc" 2>/dev/null \
+        local state; state=$(launchctl print "gui/$(id -u)/$service" 2>/dev/null \
           | grep -E 'state =|pid =|last exit code' | head -3)
         if [ -n "$state" ]; then
           echo "  Loaded:  yes"
@@ -445,38 +492,36 @@ cmd_daemon_status() {
         else
           echo "  Loaded:  no (plist present but not bootstrapped — try 'airc daemon install' to reload)"
         fi
-        local scope; scope=$(_daemon_scope)
         echo "  Logs:    $scope/daemon.log"
       else
         echo "  No daemon installed. Run: airc daemon install"
       fi
       ;;
     linux|wsl)
-      local unit_path="$HOME/.config/systemd/user/airc.service"
+      local unit_name; unit_name=$(airc_daemon_unit_name_for_scope "$scope")
+      local unit_path="$HOME/.config/systemd/user/$unit_name"
       if [ -f "$unit_path" ]; then
         echo "  Unit:    $unit_path"
-        local active; active=$(systemctl --user is-active airc.service 2>/dev/null)
-        local enabled; enabled=$(systemctl --user is-enabled airc.service 2>/dev/null)
+        local active; active=$(systemctl --user is-active "$unit_name" 2>/dev/null)
+        local enabled; enabled=$(systemctl --user is-enabled "$unit_name" 2>/dev/null)
         echo "  Active:  $active"
         echo "  Enabled: $enabled"
-        local scope; scope=$(_daemon_scope)
-        echo "  Logs:    $scope/daemon.log  (journalctl --user -u airc -f for live)"
+        echo "  Logs:    $scope/daemon.log  (journalctl --user -u $unit_name -f for live)"
       else
         echo "  No daemon installed. Run: airc daemon install"
       fi
       ;;
     windows)
-      local entry_name="airc-monitor"
+      local entry_name; entry_name=$(airc_daemon_run_entry_for_scope "$scope")
       if reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" //v "$entry_name" >/dev/null 2>&1; then
         echo "  Type:    HKCU Run-key (per-user logon autostart, no admin)"
         echo "  Entry:   $entry_name"
-        local scope; scope=$(_daemon_scope)
         echo "  Logs:    $scope/daemon.log"
         echo "  Errors:  $scope/daemon.err"
         echo "  Launcher: $scope/airc-daemon.bat"
         # Is the daemon-launched airc actually running right now? The
-        # launcher .bat spawns bash + airc-connect then exits, so we
-        # look for the airc-connect process (PPID=1 = orphaned-into-
+        # launcher .bat spawns bash + airc join then exits, so we
+        # look for the airc join process (PPID=1 = orphaned-into-
         # init, which is what `start /B` produces on Windows). Falling
         # back to airc.pid lookup if that fails.
         # Bug #3 from b69f's 2026-05-02 audit: pre-fix reported RUNNING
@@ -493,7 +538,7 @@ cmd_daemon_status() {
         fi
         local live_pid
         local raw_pid
-        raw_pid=$(ps -ef 2>/dev/null | awk '$3 == 1 && /airc.*connect/ && !/grep/ {print $2; exit}')
+        raw_pid=$(ps -ef 2>/dev/null | awk '$3 == 1 && /airc.*(join|connect)/ && !/grep/ {print $2; exit}')
         if [ -n "$raw_pid" ] && kill -0 "$raw_pid" 2>/dev/null; then
           live_pid="$raw_pid"
         fi

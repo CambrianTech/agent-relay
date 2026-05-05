@@ -38,6 +38,7 @@ quiet-and-empty for malformed input and we preserve that.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import re
 import sys
@@ -92,6 +93,22 @@ def _read_stdin_json():
         return json.loads(raw)
     except (ValueError, TypeError):
         return None
+
+
+def _read_json_text(text: str):
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return None
+
+
+def _heartbeat_epoch(value: object) -> float:
+    if not isinstance(value, str) or not value:
+        return 0.0
+    try:
+        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
 
 
 def _emit(value, default=""):
@@ -169,8 +186,8 @@ def cmd_pick_addr_nonlocal_first(args) -> int:
     entry of any kind" — but the gist's host.addresses[] often has
     `localhost` first (127.0.0.1, the host's loopback). For a different
     machine's joiner, picking that means dialing their OWN loopback,
-    which never reaches the host. Symptom: Joel's Windows peer subscribed
-    to #cambriantech but stuck on a 127.0.0.1 connection because their
+    which never reaches the host. Symptom: a Windows peer subscribed
+    to #acme but stuck on a 127.0.0.1 connection because their
     Windows IP didn't match the host's lan/24 subnet check. With this
     helper, the fallback skips localhost entries; if only localhost
     remains, returns empty so the caller falls through to gh-bearer-only
@@ -234,8 +251,13 @@ def cmd_pick_addr_excluding(args) -> int:
 
 def cmd_gist_content(args) -> int:
     """Stdin is a gh-api response for a gist (`gh api gists/<id>` or the
-    REST equivalent). Extract the first file's `.content`. Replaces:
+    REST equivalent). Extract the relevant file's `.content`. Replaces:
         gh api gists/$id | jq -r '.files | to_entries[0].value.content // empty'
+
+    With --channel, select the freshest envelope whose channels[] contains
+    that channel. Multi-file legacy gists can hold a stale sibling file and
+    a fresh live file; first-file parsing can trigger destructive takeover
+    of the whole gist from the wrong channel's heartbeat.
     """
     data = _read_stdin_json()
     if not isinstance(data, dict):
@@ -243,6 +265,24 @@ def cmd_gist_content(args) -> int:
     files = data.get("files")
     if not isinstance(files, dict) or not files:
         return 0
+    channel = getattr(args, "channel", "") or ""
+    if channel:
+        exact_name = f"airc-room-{channel}.json"
+        matches = []
+        for name, entry in files.items():
+            if not isinstance(entry, dict):
+                continue
+            content = entry.get("content", "")
+            if not content:
+                continue
+            env = _read_json_text(content)
+            channels = env.get("channels") if isinstance(env, dict) else None
+            if isinstance(channels, list) and channel in channels:
+                matches.append((_heartbeat_epoch(env.get("last_heartbeat")), name == exact_name, content))
+        if matches:
+            matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            print(matches[0][2])
+            return 0
     # Files dict: { "<filename>": {"filename":..., "content":...}, ... }
     first_key = next(iter(files))
     entry = files[first_key]
@@ -314,6 +354,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ll.set_defaults(func=cmd_list_lan_entries)
 
     gc = sub.add_parser("gist_content")
+    gc.add_argument("--channel", default="")
     gc.set_defaults(func=cmd_gist_content)
 
     gfo = sub.add_parser("get_first_of")

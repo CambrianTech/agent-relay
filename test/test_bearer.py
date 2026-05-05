@@ -8,7 +8,10 @@ or:  cd test && python -m unittest test_bearer
 from __future__ import annotations
 
 import argparse
+import os
+import stat
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -35,6 +38,7 @@ from airc_core.bearer_gh import GhBearer, GhBearerError  # noqa: E402
 from airc_core import bearer_local  # noqa: E402
 from airc_core import bearer_gh  # noqa: E402
 from airc_core import bearer_cli  # noqa: E402
+from airc_core import gh_backoff  # noqa: E402
 
 
 class BearerInterfaceTests(unittest.TestCase):
@@ -554,6 +558,29 @@ class BearerCliStateFileTests(unittest.TestCase):
         # Bearer's liveness ts was 1714435200 + (2 events × 1s for liveness call) + 1 (init) → check it's reasonable
         self.assertGreater(state["last_recv_ts"], 1714435200.0)
         self.assertEqual(state["kind"], "fake-ssh")
+        self.assertGreaterEqual(state["last_heartbeat_ts"], state["last_recv_ts"])
+
+    def test_heartbeat_touch_does_not_fake_receive(self):
+        import json as _json
+        import os as _os
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json") as f:
+            state_path = f.name
+            _json.dump({
+                "kind": "gh",
+                "peer_id": "alice",
+                "last_recv_ts": 123.0,
+                "events_total": 7,
+            }, f)
+
+        bearer_cli._touch_state_heartbeat(state_path, 456.0)
+
+        with open(state_path) as f:
+            state = _json.load(f)
+        self.assertEqual(state["last_recv_ts"], 123.0)
+        self.assertEqual(state["events_total"], 7)
+        self.assertEqual(state["last_heartbeat_ts"], 456.0)
+        _os.unlink(state_path)
 
     def test_no_state_file_means_no_writes(self):
         events = [ReceivedMessage(
@@ -603,6 +630,206 @@ class BearerCliStateFileTests(unittest.TestCase):
             state = _json.load(f)  # must not raise
         self.assertEqual(state["events_total"], 5)
         _os.unlink(state_path)
+
+
+class BearerCliRecvLockTests(unittest.TestCase):
+    """Per-(scope, gist) bearer-lock prevents multiple bearer_cli
+    processes from polling the same gist concurrently — the duplicate
+    emission Joel diagnosed 2026-05-04 (scope teardown leaked orphan
+    bearers + host-gist-rotation respawned a second one).
+
+    Test contract for _claim_recv_lock / _release_lock:
+      - No --state-file → no lock taken (legacy / test paths unaffected).
+      - Pidfile absent → claim succeeds; pidfile written with our pid+gist.
+      - Pidfile present, PID dead → stale; claim succeeds (overwrites).
+      - Pidfile present, PID alive but for a DIFFERENT gist → stale
+        (host-gist-rotation case); claim succeeds.
+      - Pidfile present, PID alive AND for SAME gist → claim fails;
+        return _LOCK_HELD so caller exits cleanly.
+      - Different channel state-files with the SAME gist contend for the
+        same pidfile; gist is the wire, channel is just the display label.
+      - Pidfile cannot be written → return _LOCK_DISABLED so caller
+        continues without the duplicate-emission guarantee.
+      - Release removes pidfile only when it still contains our pid
+        (don't stomp a successor that took the lock after we ran).
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp(prefix="airc-cli-lock-test-")
+        self._state_file = self._tmpdir + "/bearer_state.general.json"
+        # Pidfile follows the per-gist rule baked into _claim_recv_lock.
+        self._pidfile = self._tmpdir + "/bearer_gist.abc123.pid"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    _MISSING = object()
+
+    def _args(self, state_file=_MISSING, room_gist_id="abc123"):
+        # Explicit-None must pass through (test_no_state_file_means_no_lock
+        # exercises the no-lock path). _MISSING sentinel distinguishes
+        # "use the default scope state-file" from "really mean None."
+        return argparse.Namespace(
+            peer_id="self",
+            host_target=None,
+            identity_key=None,
+            remote_home=None,
+            offset_file=None,
+            state_file=self._state_file if state_file is self._MISSING else state_file,
+            room_gist_id=room_gist_id,
+        )
+
+    def test_no_state_file_means_no_lock(self):
+        # Legacy/test invocations that don't pass --state-file must NOT
+        # take a lock — preserves backwards compat for callers that don't
+        # have a writable scope dir to put the pidfile in.
+        result = bearer_cli._claim_recv_lock(self._args(state_file=None))
+        self.assertEqual(result, bearer_cli._LOCK_DISABLED)
+
+    def test_claim_writes_pidfile_when_absent(self):
+        import os
+        result = bearer_cli._claim_recv_lock(self._args())
+        self.assertIsNotNone(result)
+        pidfile_path, my_pid = result
+        self.assertEqual(pidfile_path, self._pidfile)
+        self.assertEqual(my_pid, os.getpid())
+        self.assertTrue(os.path.exists(self._pidfile))
+        with open(self._pidfile) as f:
+            content = f.read().strip()
+        # Format: "<pid>\t<gist_id>"
+        parts = content.split("\t", 1)
+        self.assertEqual(int(parts[0]), os.getpid())
+        self.assertEqual(parts[1], "abc123")
+
+    def test_claim_takes_over_when_pidfile_pid_is_dead(self):
+        # Stale pidfile from a previous bearer that died ungracefully.
+        # New bearer must take over, not exit because of dead-PID.
+        import os
+        with open(self._pidfile, "w") as f:
+            f.write("99999999\tabc123\n")  # PID that virtually can't exist
+        result = bearer_cli._claim_recv_lock(self._args())
+        self.assertIsNotNone(result, "stale (dead-PID) pidfile must not block claim")
+        # And our PID is now in the file.
+        with open(self._pidfile) as f:
+            content = f.read().strip()
+        self.assertEqual(int(content.split("\t", 1)[0]), os.getpid())
+
+    def test_claim_takes_over_when_other_bearer_is_for_different_gist(self):
+        # Host-gist-rotation case: previous bearer is alive but polling
+        # the OLD gist; new bearer for the NEW gist should claim.
+        import os
+        self._pidfile = self._tmpdir + "/bearer_gist.new_gist_id.pid"
+        my_other_pid = 99999998  # used as "live but not us" stub
+        with open(self._pidfile, "w") as f:
+            f.write(f"{my_other_pid}\told-gist-id\n")
+        with mock.patch.object(bearer_cli, "_pid_alive", return_value=True), \
+             mock.patch.object(bearer_cli, "_bearer_cmdline_matches") as mock_is_ours:
+            # _is_our_bearer should be called with my CURRENT gist; if the
+            # cmdline has the old gist it should report False → stale.
+            mock_is_ours.return_value = False
+            result = bearer_cli._claim_recv_lock(self._args(room_gist_id="new-gist-id"))
+        self.assertIsNotNone(result, "rotated-gist case: stale lock must be reclaimable")
+        with open(self._pidfile) as f:
+            content = f.read().strip()
+        parts = content.split("\t", 1)
+        self.assertEqual(int(parts[0]), os.getpid())
+        self.assertEqual(parts[1], "new-gist-id")
+
+    def test_claim_fails_when_live_bearer_serves_same_gist(self):
+        my_other_pid = 99999997
+        with open(self._pidfile, "w") as f:
+            f.write(f"{my_other_pid}\tabc123\n")
+        with mock.patch.object(bearer_cli, "_pid_alive", return_value=True), \
+             mock.patch.object(bearer_cli, "_bearer_cmdline_matches", return_value=True):
+            result = bearer_cli._claim_recv_lock(self._args(room_gist_id="abc123"))
+        self.assertEqual(result, bearer_cli._LOCK_HELD,
+                         "live bearer for same gist must block claim")
+        # Pidfile contents must be UNCHANGED — we didn't take over.
+        with open(self._pidfile) as f:
+            content = f.read().strip()
+        self.assertTrue(content.startswith(f"{my_other_pid}\t"),
+                        "pidfile must NOT be overwritten when we lose the claim race")
+
+    def test_same_gist_different_channel_state_files_share_one_lock(self):
+        first_pidfile = self._tmpdir + "/bearer_gist.samegist.pid"
+        other_pid = 99999996
+        with open(first_pidfile, "w") as f:
+            f.write(f"{other_pid}\tsamegist\n")
+        self.assertEqual(first_pidfile, self._tmpdir + "/bearer_gist.samegist.pid")
+
+        second_args = self._args(
+            state_file=self._tmpdir + "/bearer_state.acme.json",
+            room_gist_id="samegist",
+        )
+        with mock.patch.object(bearer_cli, "_pid_alive", return_value=True), \
+             mock.patch.object(bearer_cli, "_bearer_cmdline_matches", return_value=True):
+            second = bearer_cli._claim_recv_lock(second_args)
+        self.assertEqual(second, bearer_cli._LOCK_HELD,
+                         "same gist through a second channel must not spawn a duplicate bearer")
+        with open(first_pidfile) as f:
+            content = f.read().strip()
+        self.assertEqual(int(content.split("\t", 1)[0]), other_pid)
+
+    def test_lock_write_failure_does_not_make_recv_exit_as_lock_held(self):
+        # If the pidfile cannot be created, _claim_recv_lock must report
+        # "disabled" rather than "held". cmd_recv should continue without
+        # the dedup guarantee; exiting would make AIRC silently stop
+        # receiving whenever the scope dir has a filesystem hiccup.
+        with mock.patch.object(bearer_cli.os, "open", side_effect=OSError("nope")):
+            result = bearer_cli._claim_recv_lock(self._args())
+        self.assertEqual(result, bearer_cli._LOCK_DISABLED)
+
+    def test_empty_pidfile_is_treated_as_in_progress_not_reclaimed(self):
+        with open(self._pidfile, "w") as f:
+            f.write("")
+        with mock.patch.object(bearer_cli.time, "sleep", return_value=None):
+            result = bearer_cli._claim_recv_lock(self._args(room_gist_id="abc123"))
+        self.assertEqual(result, bearer_cli._LOCK_HELD)
+        with open(self._pidfile) as f:
+            self.assertEqual(f.read(), "")
+
+    def test_live_same_gist_with_unverifiable_cmdline_holds_lock(self):
+        other_pid = 99999995
+        with open(self._pidfile, "w") as f:
+            f.write(f"{other_pid}\tabc123\n")
+        with mock.patch.object(bearer_cli, "_pid_alive", return_value=True), \
+             mock.patch.object(bearer_cli, "_bearer_cmdline_matches", return_value=None):
+            result = bearer_cli._claim_recv_lock(self._args(room_gist_id="abc123"))
+        self.assertEqual(result, bearer_cli._LOCK_HELD)
+        with open(self._pidfile) as f:
+            self.assertEqual(f.read().strip(), f"{other_pid}\tabc123")
+
+    def test_claim_uses_exclusive_create_for_absent_pidfile(self):
+        import os
+        with mock.patch.object(bearer_cli.os, "open", wraps=os.open) as mock_open:
+            result = bearer_cli._claim_recv_lock(self._args())
+        self.assertIsNotNone(result)
+        _path, flags, _mode = mock_open.call_args.args
+        self.assertTrue(flags & os.O_EXCL,
+                        "pidfile claim must use O_EXCL to avoid absent-file races")
+
+    def test_release_removes_pidfile_only_when_we_own_it(self):
+        # Claim, then release.
+        import os
+        result = bearer_cli._claim_recv_lock(self._args())
+        self.assertIsNotNone(result)
+        bearer_cli._release_lock(*result)
+        self.assertFalse(os.path.exists(self._pidfile),
+                         "release must remove our pidfile")
+
+        # Now simulate the case where someone else took the lock after us
+        # (different pid in the file) — release MUST NOT remove it.
+        with open(self._pidfile, "w") as f:
+            f.write("88888888\tother-gist\n")
+        # Try to release with our pid — file should be untouched.
+        bearer_cli._release_lock(self._pidfile, os.getpid())
+        self.assertTrue(os.path.exists(self._pidfile),
+                        "release must NOT stomp a pidfile owned by another bearer")
+        with open(self._pidfile) as f:
+            content = f.read().strip()
+        self.assertEqual(int(content.split("\t", 1)[0]), 88888888)
 
 
 class LocalBearerCanServeTests(unittest.TestCase):
@@ -923,28 +1150,31 @@ class ResolverOrderTests(unittest.TestCase):
 
 
 class GhBearerCanServeTests(unittest.TestCase):
-    """Phase 3b: GhBearer.can_serve must require BOTH room_gist_id
-    AND a working gh auth. Either alone is insufficient — gist id with
-    no auth means we can't actually read/write; auth with no gist id
-    means we have nowhere to send to."""
+    """GhBearer.can_serve is metadata-only.
+
+    Auth/rate/network failures are transport outcomes from send/recv,
+    not resolver gating. Otherwise a bad GH_TOKEN turns a valid
+    room_gist_id into "no registered bearer can serve" and hides the
+    real failure class from users and retry logic.
+    """
 
     def test_serves_with_gist_id_and_gh_auth(self):
-        with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
+        with mock.patch.object(bearer_gh, "_has_gh_auth", side_effect=AssertionError("can_serve must not probe gh auth")):
             self.assertTrue(GhBearer.can_serve({"room_gist_id": "abc123"}))
 
     def test_rejects_without_gist_id(self):
-        with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
+        with mock.patch.object(bearer_gh, "_has_gh_auth", side_effect=AssertionError("can_serve must not probe gh auth")):
             self.assertFalse(GhBearer.can_serve({}))
             self.assertFalse(GhBearer.can_serve({"room_gist_id": ""}))
 
-    def test_rejects_without_gh_auth(self):
+    def test_serves_even_when_gh_auth_probe_would_fail(self):
         with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=False):
-            self.assertFalse(GhBearer.can_serve({"room_gist_id": "abc123"}))
+            self.assertTrue(GhBearer.can_serve({"room_gist_id": "abc123"}))
 
     def test_can_serve_does_not_mutate_meta(self):
         meta = {"room_gist_id": "abc123"}
         before = dict(meta)
-        with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
+        with mock.patch.object(bearer_gh, "_has_gh_auth", side_effect=AssertionError("can_serve must not probe gh auth")):
             GhBearer.can_serve(meta)
         self.assertEqual(meta, before)
 
@@ -955,7 +1185,9 @@ class GhBearerSendTests(unittest.TestCase):
     (the write step) so no real gh API is touched."""
 
     def _bearer(self, meta=None):
-        m = meta or {"room_gist_id": "abc123"}
+        m = {"room_gist_id": "abc123", "disable_local_bus": True}
+        if meta:
+            m.update(meta)
         b = GhBearer(m)
         b.open("alice")
         return b
@@ -1070,7 +1302,7 @@ class GhBearerSendTests(unittest.TestCase):
         self.assertEqual(captured[1], racer_line + my_line)
 
     def test_send_retries_on_409_conflict(self):
-        # continuum-b741 caught HTTP 409 4/5 on a 5-way burst (#299).
+        # HTTP 409 was caught 4/5 on a 5-way burst (#299).
         # First PATCH 409s → loop → second PATCH succeeds → verify ok.
         gets = [
             {"files": {}},
@@ -1112,7 +1344,9 @@ class GhBearerErrorClassificationTests(unittest.TestCase):
     recovery surface."""
 
     def _bearer(self, meta=None):
-        m = meta or {"room_gist_id": "abc123"}
+        m = {"room_gist_id": "abc123", "disable_local_bus": True}
+        if meta:
+            m.update(meta)
         b = GhBearer(m)
         b.open("alice")
         return b
@@ -1200,6 +1434,50 @@ class GhBearerErrorClassificationTests(unittest.TestCase):
             outcome = self._bearer().send("alice", "general", b'{"x":1}')
         self.assertEqual(outcome.kind, "secondary_rate_limit")
 
+    def test_get_secondary_rate_limit_is_classified_without_stderr_spam(self):
+        """Same-machine local bus can deliver while gh is throttled.
+        The expected 403 must not make a successful send look failed."""
+        import io
+        from contextlib import redirect_stderr
+
+        fake = mock.Mock(returncode=1, stdout="", stderr="gh: API rate limit exceeded (HTTP 403)")
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(tempfile, "gettempdir", return_value=tmp), \
+             mock.patch.object(bearer_gh, "_resolve_gh_bin", return_value="gh"), \
+             mock.patch.object(bearer_gh.subprocess, "run", return_value=fake):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                gist, kind = bearer_gh._gh_api_get_classified("abc123")
+
+        self.assertIsNone(gist)
+        self.assertEqual(kind, "secondary_rate_limit")
+        self.assertEqual(err.getvalue(), "")
+
+    def test_secondary_rate_limit_records_shared_backoff(self):
+        fake = mock.Mock(returncode=1, stdout="", stderr="retry-after: 123\ngh: secondary rate limit")
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(tempfile, "gettempdir", return_value=tmp), \
+             mock.patch.object(bearer_gh, "_resolve_gh_bin", return_value="gh"), \
+             mock.patch.object(bearer_gh.subprocess, "run", return_value=fake):
+            gist, kind = bearer_gh._gh_api_get_classified("abc123")
+            backoff_until = gh_backoff.backoff_until()
+
+        self.assertIsNone(gist)
+        self.assertEqual(kind, "secondary_rate_limit")
+        self.assertGreater(backoff_until, bearer_gh._time.time() + 100)
+
+    def test_backoff_active_skips_gh_get(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(tempfile, "gettempdir", return_value=tmp), \
+             mock.patch.object(bearer_gh, "_resolve_gh_bin", return_value="gh"), \
+             mock.patch.object(bearer_gh.subprocess, "run") as run:
+            gh_backoff.record_backoff("retry-after: 120")
+            gist, kind = bearer_gh._gh_api_get_classified("abc123")
+
+        self.assertIsNone(gist)
+        self.assertEqual(kind, "secondary_rate_limit")
+        run.assert_not_called()
+
     def test_send_returns_gone_when_patch_404s(self):
         """Pre-#381 the PATCH 404 case fell into the auth_failure branch
         (the old `if "404" in detail or "permission" in lower` mash-up).
@@ -1244,6 +1522,157 @@ class GhBearerErrorClassificationTests(unittest.TestCase):
         self.assertLess(max_observed, 50.0)
 
 
+class GhBearerLocalBusTests(unittest.TestCase):
+    """Same-machine fallback: gh room ids also address a local bus.
+
+    This is the production escape hatch for local agents when GitHub's
+    REST/gist path is throttled. GitHub remains the rendezvous/control
+    identity, but same-user processes on one machine can exchange the
+    signed envelope through a local append-only room log.
+    """
+
+    def _env(self, root):
+        return mock.patch.dict(os.environ, {"AIRC_LOCAL_BUS_DIR": root, "AIRC_DISABLE_LOCAL_BUS": ""})
+
+    def test_send_reports_delivered_when_gh_is_rate_limited_but_local_bus_wrote(self):
+        with tempfile.TemporaryDirectory() as tmp, self._env(tmp):
+            def _fake_get(_gist_id):
+                bearer_gh._gh_api_get._last_err = "gh: API rate limit exceeded (HTTP 403)"
+                return None
+
+            b = GhBearer({"room_gist_id": "abc123"})
+            b.open("alice")
+            with mock.patch.object(bearer_gh, "_gh_api_get", side_effect=_fake_get):
+                outcome = b.send("alice", "general", b'{"from":"me","channel":"general","msg":"local"}')
+
+            self.assertEqual(outcome.kind, "delivered")
+            self.assertIn("local bus", outcome.detail)
+            path = Path(tmp) / "abc123" / "messages.jsonl"
+            self.assertIn('"msg":"local"', path.read_text(encoding="utf-8"))
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+
+    def test_recv_yields_local_bus_lines_when_gh_get_fails(self):
+        with tempfile.TemporaryDirectory() as tmp, self._env(tmp):
+            path = Path(tmp) / "abc123" / "messages.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text('{"from":"local-peer","channel":"general","msg":"hi"}\n', encoding="utf-8")
+
+            b = GhBearer({"room_gist_id": "abc123", "poll_interval": 0})
+            b.open("alice")
+            with mock.patch.object(bearer_gh, "_gh_api_get", return_value=None):
+                events = []
+                for ev in b.recv_stream():
+                    events.append(ev)
+                    break
+
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].sender_peer_id, "local-peer")
+            self.assertEqual(events[0].channel, "general")
+            self.assertIn("local bus", b.liveness("alice").bearer_diag)
+            b.close()
+
+    def test_recv_dedupes_same_line_from_local_bus_and_gist(self):
+        line = '{"from":"peer","channel":"general","msg":"once"}'
+        with tempfile.TemporaryDirectory() as tmp, self._env(tmp):
+            path = Path(tmp) / "abc123" / "messages.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text(line + "\n", encoding="utf-8")
+
+            b = GhBearer({"room_gist_id": "abc123", "poll_interval": 0})
+            b.open("alice")
+            second = '{"from":"peer","channel":"general","msg":"second"}'
+            with mock.patch.object(
+                bearer_gh, "_gh_api_get",
+                return_value={"files": {"messages.jsonl": {"content": line + "\n" + second + "\n"}}},
+            ):
+                events = []
+                for ev in b.recv_stream():
+                    events.append(ev)
+                    if len(events) >= 2:
+                        b.close()
+                        break
+
+            self.assertEqual([e.bearer_metadata["envelope"]["msg"] for e in events], ["once", "second"])
+
+    def test_recv_does_not_advance_past_partial_local_line(self):
+        with tempfile.TemporaryDirectory() as tmp, self._env(tmp):
+            path = Path(tmp) / "abc123" / "messages.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text('{"from":"peer","channel":"general","msg":"complete"}\n{"from":"peer"', encoding="utf-8")
+
+            b = GhBearer({"room_gist_id": "abc123", "poll_interval": 0})
+            b.open("alice")
+            with mock.patch.object(bearer_gh, "_gh_api_get", return_value=None):
+                events = []
+                for ev in b.recv_stream():
+                    events.append(ev)
+                    b.close()
+                    break
+
+            self.assertEqual([e.bearer_metadata["envelope"]["msg"] for e in events], ["complete"])
+            # The byte offset should stop after the newline-terminated record,
+            # leaving the partial tail to be retried once it is completed.
+            self.assertLess(b._local_byte_offset, path.stat().st_size)
+
+    def test_recv_uses_byte_offset_file_not_legacy_line_offset_file(self):
+        with tempfile.TemporaryDirectory() as tmp, self._env(tmp):
+            bus = Path(tmp) / "abc123" / "messages.jsonl"
+            bus.parent.mkdir(parents=True)
+            bus.write_text('{"from":"peer","channel":"general","msg":"first"}\n', encoding="utf-8")
+            offset = Path(tmp) / "state.offset"
+            offset.write_text("1", encoding="utf-8")
+            (Path(str(offset) + ".local")).write_text("3", encoding="utf-8")
+
+            b = GhBearer({"room_gist_id": "abc123", "poll_interval": 0, "offset_file": str(offset)})
+            b.open("alice")
+            with mock.patch.object(bearer_gh, "_gh_api_get", return_value=None):
+                events = []
+                for ev in b.recv_stream():
+                    events.append(ev)
+                    b.close()
+                    break
+
+            self.assertEqual([e.bearer_metadata["envelope"]["msg"] for e in events], ["first"])
+            self.assertTrue(Path(str(offset) + ".local.bytes").exists())
+            self.assertEqual((Path(str(offset) + ".local")).read_text(encoding="utf-8"), "3")
+
+    def test_recv_does_not_advance_past_invalid_utf8_local_line(self):
+        with tempfile.TemporaryDirectory() as tmp, self._env(tmp):
+            path = Path(tmp) / "abc123" / "messages.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b'{"from":"peer","channel":"general","msg":"ok"}\n\xff\n')
+
+            lines, next_offset = bearer_gh._local_bus_read_from("abc123", 0, {})
+
+            self.assertEqual(lines, [])
+            self.assertEqual(next_offset, 0)
+
+    def test_truthy_env_disables_local_bus(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"AIRC_LOCAL_BUS_DIR": tmp, "AIRC_DISABLE_LOCAL_BUS": "true"}):
+                def _fake_get(_gist_id):
+                    bearer_gh._gh_api_get._last_err = "gh: API rate limit exceeded (HTTP 403)"
+                    return None
+
+                b = GhBearer({"room_gist_id": "abc123"})
+                b.open("alice")
+                with mock.patch.object(bearer_gh, "_gh_api_get", side_effect=_fake_get):
+                    outcome = b.send("alice", "general", b'{"from":"me","channel":"general","msg":"local"}')
+
+            self.assertEqual(outcome.kind, "secondary_rate_limit")
+            self.assertFalse((Path(tmp) / "abc123" / "messages.jsonl").exists())
+
+    def test_seen_payload_cache_is_bounded(self):
+        b = GhBearer({"room_gist_id": "abc123", "disable_local_bus": True})
+        b.open("alice")
+        for i in range(bearer_gh._SEEN_PAYLOAD_MAX + 25):
+            self.assertFalse(b._seen(f"line-{i}"))
+        self.assertLessEqual(len(b._seen_payloads), bearer_gh._SEEN_PAYLOAD_MAX)
+        self.assertFalse(b._seen("line-0"), "oldest entries should be evicted from dedupe cache")
+
+
 class GhBearerRecvTests(unittest.TestCase):
     """GhBearer.recv_stream: poll the gist, yield new lines.
 
@@ -1252,7 +1681,9 @@ class GhBearerRecvTests(unittest.TestCase):
     15s default."""
 
     def _bearer(self, meta=None):
-        m = meta or {"room_gist_id": "abc123", "poll_interval": 0}
+        m = {"room_gist_id": "abc123", "poll_interval": 0, "disable_local_bus": True}
+        if meta:
+            m.update(meta)
         b = GhBearer(m)
         b.open("alice")
         return b
@@ -1328,6 +1759,29 @@ class GhBearerRecvTests(unittest.TestCase):
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].sender_peer_id, "bob")
+
+    def test_recv_secondary_rate_limit_sleeps_through_shared_backoff(self):
+        b = self._bearer({"poll_interval": 15})
+        sleeps = []
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            b.close()
+
+        with mock.patch.object(
+            bearer_gh,
+            "_gh_api_get_classified",
+            return_value=(None, "secondary_rate_limit"),
+        ), mock.patch.object(
+            bearer_gh.gh_backoff,
+            "backoff_until",
+            return_value=bearer_gh._time.time() + 120,
+        ), mock.patch.object(b, "_sleep_or_break", side_effect=fake_sleep):
+            list(b.recv_stream())
+
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreaterEqual(sleeps[0], 60)
+        self.assertGreater(sleeps[0], 100)
 
     def test_recv_resumes_past_offset_file(self):
         import tempfile, os as _os
@@ -1499,16 +1953,16 @@ class ResolverPostPhase3cPlusTests(unittest.TestCase):
         self.assertNotIn("local", kinds)
 
     def test_gh_picked_when_only_room_gist_id(self):
-        # peer_meta has only room_gist_id + gh auth available → GhBearer.
-        with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=True):
+        # peer_meta has only room_gist_id → GhBearer. Actual auth is
+        # classified by the bearer operation, not by resolver selection.
+        with mock.patch.object(bearer_gh, "_has_gh_auth", side_effect=AssertionError("resolver must not probe gh auth")):
             bearer = resolve({"room_gist_id": "abc123"})
         self.assertEqual(bearer.KIND, "gh")
 
-    def test_unreachable_when_no_gh_auth(self):
-        # Without gh auth, nothing can serve.
+    def test_gh_still_picked_when_auth_probe_would_fail(self):
         with mock.patch.object(bearer_gh, "_has_gh_auth", return_value=False):
-            with self.assertRaises(PeerUnreachable):
-                resolve({"room_gist_id": "abc123"})
+            bearer = resolve({"room_gist_id": "abc123"})
+        self.assertEqual(bearer.KIND, "gh")
 
 
 if __name__ == "__main__":

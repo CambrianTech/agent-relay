@@ -6,7 +6,7 @@
 #                     looking process on the machine.
 #   cmd_disconnect  — "leave the room" softly: kill processes, clear
 #                     host-pairing fields, preserve identity + peers +
-#                     message history. Next `airc connect` is a fresh
+#                     message history. Next `airc join` is a fresh
 #                     host instead of resume.
 #
 # External cross-references (call-time): die, ensure_init, get_config_val,
@@ -270,6 +270,37 @@ cmd_teardown() {
     # which the if-block handles cleanly.
     _scope_path_pids=$(pgrep -f "$AIRC_WRITE_DIR" 2>/dev/null | sort -un || true)
     if [ -n "$_scope_path_pids" ]; then
+      # The scope-path match catches Python bearer/formatter children
+      # because their argv includes --state-file/--peers-dir paths. Their
+      # bash `airc join|connect` parents usually do NOT have AIRC_HOME in
+      # argv, only in env, so killing children alone can leave the parent
+      # alive to respawn them. Walk upward through airc-looking wrappers
+      # and reap those parents too.
+      local _scope_reap_pids="$_scope_path_pids"
+      local _sp
+      for _sp in $_scope_path_pids; do
+        local _ancestor _depth
+        _ancestor=$(proc_parent "$_sp" || true)
+        _depth=0
+        while [ -n "$_ancestor" ] && [ "$_ancestor" != "1" ] && [ "$_depth" -lt 6 ]; do
+          local _ancestor_cmd
+          _ancestor_cmd=$(proc_cmdline "$_ancestor" || true)
+          if echo "$_ancestor_cmd" | grep -Eq '(^|[[:space:]])/[^[:space:]]*/airc[[:space:]]+(connect|join)([[:space:]]|$)|(^|[[:space:]])airc[[:space:]]+(connect|join)([[:space:]]|$)|eval .*airc[[:space:]]+(connect|join)'; then
+            _scope_reap_pids="$_scope_reap_pids $_ancestor"
+            _ancestor=$(proc_parent "$_ancestor" || true)
+            _depth=$((_depth + 1))
+          else
+            break
+          fi
+        done
+      done
+      local _rp
+      for _rp in $_scope_reap_pids; do
+        local _rp_kids
+        _rp_kids=$(proc_children "$_rp" | tr '\n' ' ' || true)
+        [ -n "$_rp_kids" ] && _scope_reap_pids="$_scope_reap_pids $_rp_kids"
+      done
+      _scope_path_pids=$(echo "$_scope_reap_pids" | tr ' ' '\n' | sort -un || true)
       # Exclude our own pid + parent (this very teardown subshell) so
       # we don't suicide before completing the cleanup.
       local _self_pid="$$"
@@ -330,7 +361,7 @@ cmd_teardown() {
 cmd_disconnect() {
   # "Leave the room" — kill running processes in scope, then clear only the
   # host-pairing fields from config.json. Your identity (name + keys), peers
-  # list, and message history are all preserved. Next `airc connect` (no
+  # list, and message history are all preserved. Next `airc join` (no
   # args) starts fresh host mode instead of auto-resuming the prior pairing.
   # Use when you want to switch to a different mesh or host a new one, but
   # keep your agent identity stable.
@@ -354,5 +385,5 @@ except Exception:
     pass
 " 2>/dev/null || true
   fi
-  echo "  Disconnected. Identity preserved. Next 'airc connect' starts fresh (not a resume)."
+  echo "  Disconnected. Identity preserved. Next 'airc join' starts fresh."
 }

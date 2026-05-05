@@ -24,6 +24,16 @@ sys.path.insert(0, str(REPO_ROOT / "lib"))
 from airc_core import gistparse  # noqa: E402
 
 
+def _run_gist_content(gist, channel=""):
+    fake_stdin = io.StringIO(json.dumps(gist))
+    fake_args = mock.Mock(channel=channel)
+    out = io.StringIO()
+    with mock.patch("sys.stdin", fake_stdin), redirect_stdout(out):
+        rc = gistparse.cmd_gist_content(fake_args)
+    assert rc == 0
+    return out.getvalue().rstrip("\n")
+
+
 def _run_pick_addr_excluding(addrs, exclude_scopes):
     """Run cmd_pick_addr_excluding with a fake stdin + capture stdout.
     Returns the printed string with trailing newline stripped."""
@@ -34,6 +44,69 @@ def _run_pick_addr_excluding(addrs, exclude_scopes):
         rc = gistparse.cmd_pick_addr_excluding(fake_args)
     assert rc == 0
     return out.getvalue().rstrip("\n")
+
+
+class GistContentTests(unittest.TestCase):
+    """Gist envelope selection must be channel-aware. A legacy gist may
+    contain multiple airc-room-*.json files with different heartbeat ages;
+    choosing the first file can make a live mesh look stale."""
+
+    def test_channel_selects_freshest_matching_envelope(self):
+        stale = {
+            "airc": 1,
+            "kind": "mesh",
+            "channels": ["general", "acme"],
+            "last_heartbeat": "2026-05-04T12:54:15Z",
+            "invite": "stale-host@example",
+        }
+        fresh = {
+            "airc": 1,
+            "kind": "mesh",
+            "channels": ["acme", "general"],
+            "last_heartbeat": "2026-05-04T17:14:09Z",
+            "invite": "fresh-host@example",
+        }
+        gist = {
+            "files": {
+                "airc-room-acme.json": {"content": json.dumps(stale)},
+                "airc-room-general.json": {"content": json.dumps(fresh)},
+            },
+        }
+        out = _run_gist_content(gist, channel="acme")
+        self.assertEqual(json.loads(out)["invite"], "fresh-host@example")
+
+    def test_channel_freshness_uses_timestamp_parse_not_lexicographic_sort(self):
+        malformed = {
+            "airc": 1,
+            "kind": "mesh",
+            "channels": ["general"],
+            "last_heartbeat": "not-a-timestamp-z-wins-lexically",
+            "invite": "malformed-host@example",
+        }
+        fresh = {
+            "airc": 1,
+            "kind": "mesh",
+            "channels": ["general"],
+            "last_heartbeat": "2026-05-04T17:14:09+00:00",
+            "invite": "fresh-host@example",
+        }
+        gist = {
+            "files": {
+                "airc-room-general.json": {"content": json.dumps(malformed)},
+                "airc-room-other.json": {"content": json.dumps(fresh)},
+            },
+        }
+        out = _run_gist_content(gist, channel="general")
+        self.assertEqual(json.loads(out)["invite"], "fresh-host@example")
+
+    def test_without_channel_preserves_first_file_fallback(self):
+        gist = {
+            "files": {
+                "first.json": {"content": '{"which":"first"}'},
+                "second.json": {"content": '{"which":"second"}'},
+            },
+        }
+        self.assertEqual(json.loads(_run_gist_content(gist))["which"], "first")
 
 
 class PickAddrExcludingTests(unittest.TestCase):

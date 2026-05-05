@@ -326,7 +326,7 @@ scenario_clean_install_smoke() {
 
   # help works (smoke for argument parsing)?
   if "$SANDBOX/bin/airc" --help >/dev/null 2>&1 \
-       || "$SANDBOX/bin/airc" connect --help >/dev/null 2>&1; then
+       || "$SANDBOX/bin/airc" join --help >/dev/null 2>&1; then
     pass "airc help paths work"
   else
     fail "airc help paths broken"
@@ -480,11 +480,56 @@ scenario_teardown_kills_env_tagged_orphans() {
   fi
 }
 
+scenario_teardown_kills_scope_parent_chain() {
+  # Regression for Codex/non-Monitor bounce QA, 2026-05-03. In
+  # multi-channel mode the scope path is present on bearer/formatter
+  # children, but the bash `airc connect` parent argv does not include
+  # AIRC_HOME. If airc.pid is missing/stale, killing only the children
+  # leaves the parent alive to respawn them; `airc status` then reports
+  # monitor down while messages can still move.
+  section "teardown_kills_scope_parent_chain: stale pidfile still reaps airc parent"
+  require_gh || return
+
+  local rname="smoke-td-parent-$$"
+  local A_HOME
+  A_HOME=$(mktemp -d -t airc-td-parent.XXXXXX)
+  trap "cleanup_homes '$A_HOME'" RETURN
+
+  spawn_real "$A_HOME" "td-parent-$$" 7614 --room "$rname" --as-host \
+    || { fail "host failed to start"; return; }
+  sleep 3
+
+  local parent_pid
+  parent_pid=$(awk 'NR==1 {print $1; exit}' "$A_HOME/state/airc.pid" 2>/dev/null)
+  [ -n "$parent_pid" ] || { fail "no parent pid recorded"; return; }
+  pass "pre-teardown parent pid: $parent_pid"
+
+  echo "999999" > "$A_HOME/state/airc.pid"
+  AIRC_HOME="$A_HOME/state" "$AIRC" teardown >/dev/null 2>&1 || true
+  sleep 2
+
+  if kill -0 "$parent_pid" 2>/dev/null; then
+    fail "airc parent $parent_pid survived stale-pidfile teardown"
+    ps -p "$parent_pid" -o pid,ppid,command 2>/dev/null || true
+  else
+    pass "stale-pidfile teardown killed airc parent"
+  fi
+
+  local post_count
+  post_count=$(pgrep -f "$A_HOME/state" 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$post_count" = "0" ]; then
+    pass "post-teardown: zero scope-path-tagged procs"
+  else
+    fail "post-teardown: $post_count scope-path-tagged procs still alive"
+    pgrep -f "$A_HOME/state" 2>/dev/null | xargs -I{} ps -p {} -o pid,command 2>/dev/null | head -5
+  fi
+}
+
 scenario_my_scope_in_mesh() {
   # Joel 2026-04-29: 'remember you need to be part of it'. The other
   # scenarios spawn ephemeral test peers in /tmp and never include
   # the user's actual long-running airc scope. This one DOES — it
-  # asserts that the live authenticator-448f scope (whatever scope
+  # asserts that the live local test scope (whatever scope
   # is running in the user's primary cwd) receives messages a fresh
   # test peer sends. If my own scope's monitor is broken, this catches
   # it where the isolated tests can't.
@@ -542,10 +587,10 @@ cleanup_homes_pre() {
 }
 
 scenario_status_agrees_with_send() {
-  # Today's bug Joel called out: 'airc status' said monitor: not running
+  # Today's bug Joel called out: 'airc status' said airc process not running
   # while 'airc msg' worked + landed in gist. The two diagnostics
   # disagreed, which is exactly the silent-broken class CLAUDE.md
-  # forbids. If sends work, status MUST report monitor running.
+  # forbids. If sends work, status MUST report the airc process running.
   section "status_agrees_with_send: if msg lands in gist, status must say running"
   require_gh || return
 
@@ -568,10 +613,10 @@ scenario_status_agrees_with_send() {
   [ "$landed" = "1" ] || { fail "msg didn't land in gist — substrate broken, can't test status"; return; }
 
   local status_out; status_out=$(AIRC_HOME="$A_HOME/state" "$AIRC" status 2>&1)
-  if printf '%s' "$status_out" | grep -qE "monitor: *running"; then
-    pass "msg landed AND status says monitor running (diagnostics agree)"
+  if printf '%s' "$status_out" | grep -qE "airc process:.*running"; then
+    pass "msg landed AND status says airc process running (diagnostics agree)"
   else
-    fail "msg LANDED but status reports monitor not running — diagnostics lie"
+    fail "msg LANDED but status reports airc process not running — diagnostics lie"
     printf '%s' "$status_out" | sed 's/^/    /'
   fi
 }
@@ -682,11 +727,13 @@ case "${1:-all}" in
   stale_config_auto_resyncs)      scenario_stale_config_auto_resyncs ;;
   orphan_loops_self_reap)         scenario_orphan_loops_self_reap ;;
   teardown_kills_env_tagged_orphans) scenario_teardown_kills_env_tagged_orphans ;;
+  teardown_kills_scope_parent_chain) scenario_teardown_kills_scope_parent_chain ;;
   my_scope_in_mesh)               scenario_my_scope_in_mesh ;;
   all)
     scenario_clean_install_smoke
     scenario_orphan_loops_self_reap
     scenario_teardown_kills_env_tagged_orphans
+    scenario_teardown_kills_scope_parent_chain
     scenario_passive_recv
     scenario_round_trip
     scenario_status_agrees_with_send
@@ -697,7 +744,7 @@ case "${1:-all}" in
     scenario_idle_then_recv
     ;;
   *)
-    echo "Usage: $0 [passive_recv|round_trip|idle_then_recv|part_deletes_host_gist|status_agrees_with_send|stale_config_auto_resyncs|orphan_loops_self_reap|teardown_kills_env_tagged_orphans|my_scope_in_mesh|all]"
+    echo "Usage: $0 [passive_recv|round_trip|idle_then_recv|part_deletes_host_gist|status_agrees_with_send|stale_config_auto_resyncs|orphan_loops_self_reap|teardown_kills_env_tagged_orphans|teardown_kills_scope_parent_chain|my_scope_in_mesh|all]"
     exit 2
     ;;
 esac

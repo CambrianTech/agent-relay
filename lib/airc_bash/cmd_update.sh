@@ -117,7 +117,7 @@ cmd_update() {
   # install.sh runs, install.sh sees the stale value and switches our
   # just-completed branch back to the old channel. Net effect: airc
   # version reports the old branch, airc channel reports the new
-  # channel — the disagreement continuum-b741 hit during regression.
+  # channel — the disagreement found during regression.
   #
   # Write order now: (a) cmd_update checks out the requested branch,
   # (b) write .channel = requested, (c) install.sh ff-pulls + sees
@@ -136,7 +136,7 @@ cmd_update() {
     echo "  Updated: ${before} -> ${after} on channel '${channel}'. Skills refreshed."
   fi
 
-  # Stale-running-monitor detection (vhsm-d1f4's gotcha 2026-04-28):
+  # Stale-running-monitor detection (2026-04-28):
   # bash sources its functions in-memory at process start; an airc
   # connect that's been running since BEFORE this update is still
   # executing the old version. We can't auto-restart safely (would
@@ -152,7 +152,7 @@ cmd_update() {
       echo "  ⚠  A running airc monitor (PID ${_pid}) is still on the OLD code."
       echo "     Restart to pick up ${after}:"
       echo ""
-      echo "       airc teardown && airc connect"
+      echo "       airc join"
       echo ""
     fi
   fi
@@ -173,7 +173,7 @@ cmd_channel() {
   local target="${1:-}"
   # Help-flag intercept BEFORE we'd write target to channel_file.
   # First version (#237) just fell through to the no-args path which
-  # prints the current channel info — continuum-b69f's #244 Windows
+  # prints the current channel info — #244 Windows
   # e2e flagged that as inconsistent with the other --help intercepts
   # (no "Usage:" header). Now prints a proper Usage block.
   case "$target" in
@@ -238,7 +238,7 @@ cmd_version() {
   branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
   dirty=""
   [ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ] && dirty=" (dirty)"
-  echo "  airc ${sha}${dirty} on ${branch}"
-  [ -n "$subject" ] && echo "  ${subject}"
-  echo "  install: $dir"
+  printf '  airc %s%s on %s\n' "${sha:-unknown}" "$dirty" "${branch:-unknown}"
+  [ -n "$subject" ] && printf '  %s\n' "$subject"
+  printf '  install: %s\n' "$dir"
 }
