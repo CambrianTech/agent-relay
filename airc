@@ -2324,7 +2324,8 @@ case "${1:-help}" in
   channel) shift; cmd_channel "$@" ;;
   canary) shift; cmd_update --channel canary "$@" ;;
   logs)      shift; cmd_logs "$@" ;;
-  inbox|poll|codex-poll) shift; cmd_inbox "$@" ;;
+  inbox|poll) shift; cmd_inbox "$@" ;;
+  codex-poll) shift; AIRC_INBOX_QUIET_EMPTY=1 AIRC_INBOX_EXCLUDE_SELF=1 cmd_inbox --count 50 "$@" ;;
   status)    shift; cmd_status "$@" ;;
   doctor)            shift; cmd_doctor "$@" ;;
   tests|test)        shift; _doctor_run_tests "$@" ;;

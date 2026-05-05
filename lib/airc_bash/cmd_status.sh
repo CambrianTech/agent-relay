@@ -483,6 +483,8 @@ cmd_inbox() {
   local since=""
   local count="500"
   local peek=0
+  local quiet_empty="${AIRC_INBOX_QUIET_EMPTY:-0}"
+  local exclude_self="${AIRC_INBOX_EXCLUDE_SELF:-0}"
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -498,6 +500,10 @@ cmd_inbox() {
         count="${1#--count=}"; shift ;;
       --peek)
         peek=1; shift ;;
+      --quiet-empty)
+        quiet_empty=1; shift ;;
+      --exclude-self)
+        exclude_self=1; shift ;;
       --reset)
         "$AIRC_PYTHON" -m airc_core.inbox reset \
           --home "$AIRC_WRITE_DIR" --cursor-file "$cursor_file"
@@ -506,7 +512,9 @@ cmd_inbox() {
         echo "Usage: airc inbox [--peek] [--reset] [--since <ts|Ns|Nm|Nh>] [--count N]"
         echo "  Shows unread messages since this scope's last inbox check."
         echo "  Advances a per-scope cursor unless --peek is set."
-        echo "  Alias: airc poll, airc codex-poll"
+        echo "  --quiet-empty suppresses the 'No new airc messages' line."
+        echo "  --exclude-self hides messages from this identity."
+        echo "  Alias: airc poll, airc codex-poll (quiet + exclude-self by default)"
         return 0 ;;
       *) die "Unknown inbox option: $1" ;;
     esac
@@ -525,6 +533,10 @@ cmd_inbox() {
   local inbox_args=(read --home "$AIRC_WRITE_DIR" --cursor-file "$cursor_file" --count "$count")
   [ -n "$since" ] && inbox_args+=(--since "$since")
   [ "$peek" -eq 1 ] && inbox_args+=(--peek)
+  [ "$quiet_empty" = "1" ] && inbox_args+=(--quiet-empty)
+  if [ "$exclude_self" = "1" ]; then
+    inbox_args+=(--exclude-self --my-name "$(get_name)")
+  fi
   if ! out=$("$AIRC_PYTHON" -m airc_core.inbox "${inbox_args[@]}" 2>&1); then
     printf '%s\n' "$out" >&2
     return 1
