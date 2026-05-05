@@ -220,6 +220,62 @@ class HeartbeatSuppressionTests(unittest.TestCase):
         self.assertEqual(out.getvalue(), "", "heartbeat must produce zero stdout output")
 
 
+class MirrorDedupeTests(unittest.TestCase):
+    """Host self-echo and duplicate bearer reads must not append or display
+    the same signed envelope twice."""
+
+    def setUp(self):
+        self._scope = tempfile.mkdtemp(prefix="airc-mf-dedupe-test-")
+        self._peers = os.path.join(self._scope, "peers")
+        os.makedirs(self._peers, exist_ok=True)
+        with open(os.path.join(self._scope, "config.json"), "w") as f:
+            json.dump({"name": "alice", "subscribed_channels": ["general"]}, f)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._scope, ignore_errors=True)
+
+    def _run(self, lines):
+        body = "\n".join(json.dumps(l) for l in lines) + "\n"
+        out = io.StringIO()
+        with mock.patch.object(mf.sys, "stdin", io.StringIO(body)), \
+             mock.patch.object(mf.sys, "stdout", out), \
+             mock.patch.object(mf, "current_client_id", return_value="test-client"):
+            mf.run("alice", self._peers)
+        return out.getvalue()
+
+    def test_duplicate_signature_in_stream_appends_once_and_displays_once(self):
+        msg = {
+            "from": "bob",
+            "to": "all",
+            "ts": "2026-05-05T05:42:03Z",
+            "channel": "general",
+            "msg": "hello once",
+            "client_id": "agent:bob",
+            "sig": "same-signature",
+        }
+        out = self._run([msg, dict(msg)])
+        self.assertEqual(out.count("hello once"), 1)
+        local_log = Path(self._scope) / "messages.jsonl"
+        self.assertEqual(local_log.read_text(encoding="utf-8").count("same-signature"), 1)
+
+    def test_signature_already_in_local_log_is_not_mirrored_or_displayed(self):
+        msg = {
+            "from": "alice",
+            "to": "all",
+            "ts": "2026-05-05T05:42:03Z",
+            "channel": "general",
+            "msg": "self echo",
+            "client_id": "other-tab",
+            "sig": "already-local",
+        }
+        local_log = Path(self._scope) / "messages.jsonl"
+        local_log.write_text(json.dumps(msg) + "\n", encoding="utf-8")
+        out = self._run([msg])
+        self.assertNotIn("self echo", out)
+        self.assertEqual(local_log.read_text(encoding="utf-8").count("already-local"), 1)
+
+
 class DisplayFilterLoudDropTests(unittest.TestCase):
     """#399 follow-up to #401: when monitor_formatter's display filter
     drops a peer broadcast (channel name truly differs, e.g.
