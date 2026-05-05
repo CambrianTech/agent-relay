@@ -133,6 +133,36 @@ _join_show_status_and_inbox() {
   cmd_inbox --count 50 2>&1 | sed 's/^/  /' || true
 }
 
+_join_transport_health_ok() {
+  [ -f "$CONFIG" ] || return 1
+  "$AIRC_PYTHON" -m airc_core.transport_health check \
+    --home "$AIRC_WRITE_DIR" \
+    --config "$CONFIG" \
+    --quiet >/dev/null 2>&1
+}
+
+_join_restart_scope_processes() {
+  local _pids=""
+  if [ -f "$AIRC_WRITE_DIR/airc.pid" ]; then
+    _pids="$_pids $(cat "$AIRC_WRITE_DIR/airc.pid" 2>/dev/null | tr '\n' ' ')"
+  fi
+  _pids="$_pids $(_airc_scope_monitor_formatter_pids "$AIRC_WRITE_DIR" 2>/dev/null | tr '\n' ' ')"
+  local _pidfile
+  for _pidfile in "$AIRC_WRITE_DIR"/bearer_gist.*.pid; do
+    [ -f "$_pidfile" ] || continue
+    _pids="$_pids $(cat "$_pidfile" 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
+  done
+  local _p _c
+  for _p in $_pids; do
+    case "$_p" in ''|*[!0-9]*) continue ;; esac
+    kill "$_p" 2>/dev/null || true
+    for _c in $(proc_children "$_p" 2>/dev/null); do
+      kill "$_c" 2>/dev/null || true
+    done
+  done
+  rm -f "$AIRC_WRITE_DIR/airc.pid" "$AIRC_WRITE_DIR"/bearer_gist.*.pid 2>/dev/null || true
+}
+
 _join_attach_local_stream() {
   echo ""
   echo "  Attaching this terminal to the local AIRC stream."
@@ -413,15 +443,15 @@ cmd_connect() {
       done <<< "$_map_lines"
     fi
     if [ "$_repair_running_monitor" = "1" ]; then
-      local _repair_pids; _repair_pids=$(cat "$_early_pidfile" 2>/dev/null | tr '\n' ' ')
       echo "  airc join: restarting this scope's AIRC process to leave the solo island."
-      for _p in $_repair_pids; do
-        kill "$_p" 2>/dev/null || true
-        for _c in $(proc_children "$_p" 2>/dev/null); do
-          kill "$_c" 2>/dev/null || true
-        done
-      done
-      rm -f "$_early_pidfile" 2>/dev/null || true
+      _join_restart_scope_processes
+      sleep 1
+    elif ! _join_transport_health_ok; then
+      echo "  airc join: AIRC process exists but transport is degraded; restarting this scope's AIRC process."
+      "$AIRC_PYTHON" -m airc_core.transport_health check \
+        --home "$AIRC_WRITE_DIR" \
+        --config "$CONFIG" 2>/dev/null | sed 's/^/    /' || true
+      _join_restart_scope_processes
       sleep 1
     else
     local _early_pids; _early_pids=$(cat "$_early_pidfile" 2>/dev/null | tr '\n' ' ')
