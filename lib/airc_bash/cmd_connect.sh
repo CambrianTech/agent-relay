@@ -138,6 +138,9 @@ _join_attach_local_stream() {
   echo "  Attaching this terminal to the local AIRC stream."
   echo "  Background AIRC owns transport; this process only displays new peer messages."
   local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
+  local _join_event_args=(join --home "$AIRC_WRITE_DIR" --name "$(get_name)")
+  [ -n "$_client_id" ] && _join_event_args+=(--client-id "$_client_id")
+  "$AIRC_PYTHON" -m airc_core.system_event "${_join_event_args[@]}" >/dev/null 2>&1 || true
   if [ -n "$_client_id" ]; then
     AIRC_CLIENT_ID="$_client_id" exec "$AIRC_PYTHON" -u -m airc_core.log_tail --home "$AIRC_WRITE_DIR" --my-name "$(get_name)"
   else

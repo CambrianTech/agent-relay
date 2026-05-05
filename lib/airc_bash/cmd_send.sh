@@ -262,7 +262,7 @@ cmd_send() {
   [ -n "$escaped_client_id" ] && payload="${payload},\"client_id\":\"$escaped_client_id\""
   payload="${payload}}"
   local sig; sig=$(sign_message "$payload")
-  local full_msg="${payload%}}"
+  local full_msg="${payload%?}"
   full_msg="${full_msg},\"sig\":\"$sig\"}"
 
   local host_target
