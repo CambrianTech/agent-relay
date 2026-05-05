@@ -140,6 +140,21 @@ _join_attach_local_stream() {
   exec "$AIRC_PYTHON" -u -m airc_core.log_tail --home "$AIRC_WRITE_DIR" --my-name "$(get_name)"
 }
 
+_join_parent_chain_looks_like_claude_monitor() {
+  local pid="$$" depth=0 parent="" cmd=""
+  while [ -n "$pid" ] && [ "$pid" != "1" ] && [ "$depth" -lt 12 ]; do
+    cmd=$(proc_cmdline "$pid" 2>/dev/null || true)
+    if printf '%s\n' "$cmd" | grep -Eiq 'claude|anthropic'; then
+      return 0
+    fi
+    parent=$(proc_parent "$pid" 2>/dev/null || true)
+    [ -n "$parent" ] || break
+    pid="$parent"
+    depth=$((depth + 1))
+  done
+  return 1
+}
+
 cmd_connect() {
   # Flag parsing. Issue #37 — host display shapes:
   #   default (gh installed + authed): gist ID + humanhash mnemonic + long invite
@@ -293,6 +308,20 @@ cmd_connect() {
   done
   set -- "${positional[@]+"${positional[@]}"}"
 
+  # Defense against cached older Claude skills: some running sessions
+  # still invoke plain `airc join` inside a Monitor even after the
+  # on-disk skill was updated to `airc join --attach`. In daemon-repair
+  # paths plain join returns after bootstrapping the daemon, which makes
+  # the visible Monitor task end. If the parent chain is Claude Code,
+  # treat the invocation as UI attach mode. Codex/non-Monitor runtimes
+  # keep the documented quick-return behavior unless they explicitly set
+  # AIRC_ATTACH=1.
+  if [ "$attach" = "0" ]; then
+    if [ "${AIRC_ATTACH:-0}" = "1" ] || _join_parent_chain_looks_like_claude_monitor; then
+      attach=1
+    fi
+  fi
+
   # One-shot marker used by child watchdogs to tell the parent "exit
   # with restart semantics", not "fatal crash". Clear stale markers
   # before this connect attempt starts.
@@ -409,7 +438,7 @@ cmd_connect() {
   if [ -z "${AIRC_BACKGROUND_OK:-}" ] \
      && command -v airc_daemon_is_installed_for_scope >/dev/null 2>&1 \
      && airc_daemon_is_installed_for_scope "$AIRC_WRITE_DIR" 2>/dev/null; then
-    echo "  airc join: monitor is not running; repairing this scope's daemon..."
+    echo "  airc join: AIRC process is not running; repairing this scope's daemon..."
     AIRC_HOME="$AIRC_WRITE_DIR" cmd_daemon restart >/dev/null 2>&1 || true
     local _join_repair_i
     for _join_repair_i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
