@@ -574,7 +574,7 @@ else:
     return
   fi
 
-  "$AIRC_PYTHON" -c "
+  AIRC_PEERS_MY_NAME="$(get_name)" "$AIRC_PYTHON" -c "
 import json, os, sys, time, calendar
 
 primary_scope = os.path.expanduser('$AIRC_WRITE_DIR')
@@ -649,6 +649,10 @@ except OSError:
 
 # Render. Each peer once, with room annotations + last-seen marker.
 # Silent >1h gets a (silent) flag so the eye catches it immediately.
+#
+# Track which paired-record names we've already rendered so the
+# broadcast-peer pass below doesn't double-list them.
+rendered = set()
 for (name, host), rooms in sorted(peers_by_id.items()):
     seen = set(); ordered = []
     for r in rooms:
@@ -663,5 +667,24 @@ for (name, host), rooms in sorted(peers_by_id.items()):
     elif last_ts is None:
         silent_flag = ' (no recorded activity)'
     print(f'  {name} → {host}   [{tags}]   last seen {age_str}{silent_flag}')
+    rendered.add(name)
+
+# Also surface broadcast-only peers (no DM-paired record). Pre-fix,
+# stale paired records masked recent peers entirely — codex on Mac saw
+# 'vhsm-d1f4' (an old paired host) but not 'continuum-8e97' even after
+# multiple broadcast messages within the recent window. Mirror the
+# behaviour of the empty-peers-dir fallback path so listings remain
+# consistent regardless of whether stale records exist.
+my_name = os.environ.get('AIRC_PEERS_MY_NAME', '')
+RECENT_WINDOW = 600
+broadcast_only = []
+for who, ts in last_seen.items():
+    if who in rendered: continue
+    if who == my_name or who == 'airc': continue
+    if now - ts >= RECENT_WINDOW: continue
+    broadcast_only.append((who, ts))
+broadcast_only.sort(key=lambda kv: kv[1], reverse=True)
+for who, ts in broadcast_only:
+    print(f'  {who} → broadcast room   [(from signed messages.jsonl)]   last seen {_fmt_age(ts)}')
 "
 }
