@@ -239,7 +239,7 @@ cmd_status() {
   local pidfile="$AIRC_WRITE_DIR/airc.pid"
   if [ "$(_monitor_alive_with_bearer_fallback "$pidfile")" = "yes" ]; then
     if [ -f "$pidfile" ]; then
-      local first_alive; first_alive=$(_airc_pidfile_live_monitor_pids "$pidfile" | head -1)
+      local first_alive; first_alive=$(_airc_pidfile_first_live_monitor_pid "$pidfile")
       # Distinguish "alive per kill -0" (we have a verified PID) from
       # "alive per formatter process only" (kill -0 blind against the
       # pidfile, but the scope's monitor_formatter is visible by argv).
