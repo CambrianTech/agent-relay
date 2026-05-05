@@ -11,6 +11,13 @@
 
 set -euo pipefail
 
+AIRC_SELF="${BASH_SOURCE[0]}"
+case "$AIRC_SELF" in
+  */*) AIRC_SELF="$(cd "$(dirname "$AIRC_SELF")" 2>/dev/null && pwd)/$(basename "$AIRC_SELF")" ;;
+  *)   AIRC_SELF="$(command -v "$AIRC_SELF" 2>/dev/null || printf '%s' "$AIRC_SELF")" ;;
+esac
+export AIRC_SELF
+
 # Cross-platform Python invocation. macOS / Linux / WSL all ship `python3`
 # on PATH; Git Bash on Windows typically has `python` only (the launcher
 # from python.org). Resolve once at startup; every `python3 ...` invocation
