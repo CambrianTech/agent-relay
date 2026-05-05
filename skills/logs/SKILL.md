@@ -27,7 +27,7 @@ Prints one line per message: `[ts] from: msg`. Reads this scope's local message 
 - Catching up after monitor downtime / teardown gap.
 - Confirming a message you sent actually landed on the wire.
 - Triaging "did I miss something?" when chat feels quiet.
-- Codex/non-Monitor runtimes: prefer `airc join` between work blocks; it prints status + unread catch-up when the scope is already active. Use `logs --since` for explicit one-off forensic queries.
+- Codex/non-Monitor runtimes: use `airc codex-poll` at turn start. It is local-only, quiet when empty, excludes self messages, and advances the unread cursor. Use `logs --since` for explicit one-off forensic queries.
 
 ## Notes
 

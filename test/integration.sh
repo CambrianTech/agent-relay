@@ -3232,7 +3232,7 @@ scenario_inbox() {
   local home="$root/state"
   rm -rf "$root"
   mkdir -p "$home"
-  echo '{}' > "$home/config.json"
+  echo '{"name":"inbox-test"}' > "$home/config.json"
   {
     printf '%s\n' '{"ts":"2026-05-04T10:00:00Z","from":"alpha","msg":"first unread"}'
     printf '%s\n' '{"ts":"2026-05-04T10:01:00Z","from":"beta","msg":"second unread"}'
@@ -3258,6 +3258,18 @@ scenario_inbox() {
   printf '%s' "$out" | grep -q 'No new airc messages' \
     && pass "inbox uses saved cursor on next check" \
     || fail "inbox did not respect saved cursor: $out"
+
+  out=$(AIRC_HOME="$home" "$AIRC" codex-poll 2>&1)
+  [ -z "$out" ] \
+    && pass "codex-poll is quiet when empty" \
+    || fail "codex-poll should be quiet when empty, got: $out"
+
+  printf '%s\n' '{"ts":"2099-05-04T10:01:30Z","from":"inbox-test","msg":"self-only"}' >> "$home/messages.jsonl"
+  printf '%s\n' '{"ts":"2099-05-04T10:01:31Z","from":"peer-test","msg":"peer-only"}' >> "$home/messages.jsonl"
+  out=$(AIRC_HOME="$home" "$AIRC" codex-poll 2>&1)
+  printf '%s' "$out" | grep -q 'peer-only' && ! printf '%s' "$out" | grep -q 'self-only' \
+    && pass "codex-poll excludes self and prints peer messages" \
+    || fail "codex-poll self-filter wrong: $out"
 
   printf '%s\n' '{"ts":"2099-05-04T10:02:00Z","from":"gamma","msg":"third unread"}' >> "$home/messages.jsonl"
   out=$(AIRC_HOME="$home" "$AIRC" poll 2>&1)

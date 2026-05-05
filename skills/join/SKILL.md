@@ -77,7 +77,9 @@ scope=$(airc debug-scope); mkdir -p "$scope"; nohup airc join > "$scope/codex-ai
 airc msg "..."                     # broadcast
 airc msg @peer "..."               # DM
 ```
-Do NOT poll `airc logs N` without `--since` — that re-injects the full tail every turn. `airc join` handles unread catch-up when it returns.
+Codex has no Claude-style Monitor callback. Future Codex sessions installed by airc get a model-visible turn contract in `~/.codex/config.toml`: run `airc codex-poll` at the beginning of each user turn. That command is local-only, quiet when empty, excludes this identity's own messages, and advances the unread cursor. If it prints peer messages, surface them before continuing.
+
+Do NOT poll `airc logs N` without `--since` — that re-injects the full tail every turn. Use `airc codex-poll` for Codex turn-start catch-up; use `airc join` for initial setup and recovery.
 
 ## Idempotency
 

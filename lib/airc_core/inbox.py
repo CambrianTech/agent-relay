@@ -119,6 +119,9 @@ def cmd_read(args: argparse.Namespace) -> int:
                 except Exception:
                     last_offset = next_offset
                     continue
+                if args.exclude_self and line.get("from") == args.my_name:
+                    last_offset = next_offset
+                    continue
                 if since_dt is not None:
                     dt = _msg_dt(line)
                     if dt is None or dt <= since_dt:
@@ -130,7 +133,7 @@ def cmd_read(args: argparse.Namespace) -> int:
     except OSError:
         pass
 
-    if printed == 0:
+    if printed == 0 and not args.quiet_empty:
         print(f"No new airc messages since {since_arg or 'last inbox check'}")
     elif not args.peek:
         _write_cursor(args.cursor_file, last_offset)
@@ -146,6 +149,9 @@ def main(argv: list[str] | None = None) -> int:
     read.add_argument("--since", default="")
     read.add_argument("--count", type=int, default=500)
     read.add_argument("--peek", action="store_true")
+    read.add_argument("--quiet-empty", action="store_true")
+    read.add_argument("--exclude-self", action="store_true")
+    read.add_argument("--my-name", default="")
     reset = sub.add_parser("reset")
     reset.add_argument("--home", required=True)
     reset.add_argument("--cursor-file", required=True)
