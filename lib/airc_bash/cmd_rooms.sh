@@ -244,6 +244,7 @@ cmd_part() {
     if [ -z "$_ch_gist" ]; then
       die "Not subscribed to #${arg_room} (no channel_gists mapping). Use 'airc list' to see open rooms; 'airc status' for your subscriptions."
     fi
+    cmd_send --internal --system --channel "$arg_room" "$(get_name) left #${arg_room}" >/dev/null 2>&1 || true
     # Delete the gist ONLY if we're hosting it — i.e., it appears
     # under our gh account. Try delete; ignore failure (someone else's
     # gist isn't ours to delete; gh will reject with 404/403).
@@ -263,6 +264,7 @@ cmd_part() {
   # ── Scope-default part (no arg, or arg matches default) ──
   if [ -z "$host_target" ]; then
     # ── Host path ──
+    [ "$room_name" != "(unnamed)" ] && cmd_send --internal --system --channel "$room_name" "$(get_name) left #${room_name}" >/dev/null 2>&1 || true
     if [ -f "$gist_id_file" ]; then
       local gid; gid=$(cat "$gist_id_file")
       if command -v gh >/dev/null 2>&1; then
@@ -283,6 +285,7 @@ cmd_part() {
   else
     # ── Joiner path ──
     echo "  Joiner of #${room_name} parting — host's gist stays open for others."
+    [ "$room_name" != "(unnamed)" ] && cmd_send --internal --system --channel "$room_name" "$(get_name) left #${room_name}" >/dev/null 2>&1 || true
     # Clear our cached gist_id too, matching the comment on the joiner-
     # side cache write site (PR #92 Copilot feedback). Without this, a
     # parted joiner that later reconnects via the same scope would

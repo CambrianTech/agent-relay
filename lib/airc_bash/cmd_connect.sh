@@ -185,14 +185,27 @@ _join_attach_local_stream() {
   echo "  Attaching this terminal to the local AIRC stream."
   echo "  Background AIRC owns transport; this process only displays new peer messages."
   local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
-  local _join_event_args=(join --home "$AIRC_WRITE_DIR" --name "$(get_name)")
-  [ -n "$_client_id" ] && _join_event_args+=(--client-id "$_client_id")
-  "$AIRC_PYTHON" -m airc_core.system_event "${_join_event_args[@]}" >/dev/null 2>&1 || true
   if [ -n "$_client_id" ]; then
     AIRC_CLIENT_ID="$_client_id" exec "$AIRC_PYTHON" -u -m airc_core.log_tail --home "$AIRC_WRITE_DIR" --my-name "$(get_name)"
   else
     exec "$AIRC_PYTHON" -u -m airc_core.log_tail --home "$AIRC_WRITE_DIR" --my-name "$(get_name)"
   fi
+}
+
+_join_emit_join_events() {
+  local _name="$1"
+  [ -z "$_name" ] && return 0
+  [ -f "$CONFIG" ] || return 0
+  local _channels _ch
+  _channels=$("$AIRC_PYTHON" -m airc_core.config read_channels --config "$CONFIG" 2>/dev/null || true)
+  [ -z "$_channels" ] && return 0
+  while IFS= read -r _ch; do
+    [ -z "$_ch" ] && continue
+    local _gid
+    _gid=$("$AIRC_PYTHON" -m airc_core.config get_channel_gist --config "$CONFIG" --channel "$_ch" 2>/dev/null || true)
+    [ -z "$_gid" ] && continue
+    cmd_send --internal --system --channel "$_ch" "$_name joined #$_ch" >/dev/null 2>&1 || true
+  done <<< "$_channels"
 }
 
 _join_spawn_transport_for_attach() {
@@ -1603,6 +1616,7 @@ with open(os.path.join(peers_dir, peer_name + '.json'), 'w') as f:
     ' EXIT INT TERM
 
     spawn_general_sidecar_if_wanted
+    _join_emit_join_events "$my_name"
     echo "  Monitoring for messages..."
     monitor
 
@@ -2228,6 +2242,7 @@ JSON
     ' EXIT INT TERM
 
     spawn_general_sidecar_if_wanted
+    _join_emit_join_events "$name"
     echo "  Monitoring for messages..."
     monitor
     kill $PAIR_PID 2>/dev/null

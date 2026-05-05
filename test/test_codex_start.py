@@ -48,6 +48,7 @@ class CodexStartTests(unittest.TestCase):
             argv, kwargs = calls[0]
             self.assertEqual(argv, ["/usr/local/bin/airc", "join", "--room", "general"])
             self.assertEqual(kwargs["env"]["AIRC_HOME"], str(home.resolve()))
+            self.assertEqual(kwargs["env"]["AIRC_CODEX_START_CHILD"], "1")
             self.assertTrue(kwargs["start_new_session"])
             self.assertTrue(kwargs["close_fds"])
             self.assertEqual(kwargs["stderr"], codex_start.subprocess.STDOUT)

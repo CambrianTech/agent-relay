@@ -2225,6 +2225,49 @@ scenario_attach_spawn_strips_attach_flag() {
   cleanup_all
 }
 
+# ── Scenario: codex_join_detaches_transport ────────────────────────────
+# Public Codex flow is plain `airc join`. The shell dispatch detects Codex
+# and routes through the detach adapter, while the spawned child is guarded
+# from recursively detaching itself.
+scenario_codex_join_detaches_transport() {
+  section "codex_join_detaches_transport: Codex uses plain airc join without recursive detach"
+  cleanup_all
+
+  local root=/tmp/airc-it-codex-join
+  local home="$root/state"
+  local out="$root/out.log"
+  local err="$root/err.log"
+  mkdir -p "$root"
+
+  CODEX_THREAD_ID=airc-it-codex AIRC_HOME="$home" AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 \
+    "$AIRC" join --no-room --no-gist >"$out" 2>"$err"
+  local rc=$?
+
+  [ "$rc" = "0" ] \
+    && pass "codex join command returned success" \
+    || fail "codex join failed rc=$rc stdout=$(cat "$out" 2>/dev/null) stderr=$(cat "$err" 2>/dev/null)"
+  grep -q "airc join: launched Codex-detached transport" "$out" \
+    && pass "codex join used the internal detach adapter" \
+    || fail "codex join did not report detached launch (stdout=$(cat "$out" 2>/dev/null))"
+
+  local running=0 status_out="" i
+  for i in $(seq 1 10); do
+    status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1 || true)
+    if printf '%s\n' "$status_out" | grep -q "airc process:.*running"; then
+      running=1
+      break
+    fi
+    sleep 1
+  done
+  [ "$running" = "1" ] \
+    && pass "codex detached child left one live scope process" \
+    || fail "codex detached child was not running (status=$status_out; stdout=$(cat "$out" 2>/dev/null); stderr=$(cat "$err" 2>/dev/null))"
+
+  AIRC_HOME="$home" "$AIRC" teardown >/dev/null 2>&1 || true
+  rm -rf "$root"
+  cleanup_all
+}
+
 # ── Scenario: gh_secondary_rate_limit_degraded_startup (#479) ──────────
 # GitHub secondary throttling must not prevent monitor startup. On
 # 2026-05-04 Windows/WSL hit this shape: `gh auth status` tripped the
@@ -4517,6 +4560,7 @@ case "$MODE" in
   monitor_liveness_process_evidence) scenario_monitor_liveness_process_evidence ;;
   attach_starts_background_transport) scenario_attach_starts_background_transport ;;
   attach_spawn_strips_attach_flag) scenario_attach_spawn_strips_attach_flag ;;
+  codex_join_detaches_transport) scenario_codex_join_detaches_transport ;;
   gh_secondary_rate_limit_degraded_startup) scenario_gh_secondary_rate_limit_degraded_startup ;;
   solo_mesh_warns) scenario_solo_mesh_warns ;;
   connect_after_kill_recovers) scenario_connect_after_kill_recovers ;;
@@ -4553,7 +4597,7 @@ case "$MODE" in
     scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat
     scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope
     scenario_send_dead_monitor_dies; scenario_monitor_liveness_process_evidence
-    scenario_attach_starts_background_transport; scenario_attach_spawn_strips_attach_flag
+    scenario_attach_starts_background_transport; scenario_attach_spawn_strips_attach_flag; scenario_codex_join_detaches_transport
     scenario_gh_secondary_rate_limit_degraded_startup
     scenario_solo_mesh_warns
     scenario_connect_after_kill_recovers

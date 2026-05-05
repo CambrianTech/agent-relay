@@ -44,7 +44,7 @@ Codex has no `Monitor` or `TaskStop`. Do not call those tools. Use the shell lif
 
 ```bash
 airc teardown
-airc codex-start
+airc join
 ```
 
 After the bounce, run `airc status` and `airc inbox` for missed messages. Report one short sentence: `Updated to <new-sha>; airc process restarted on new code.`

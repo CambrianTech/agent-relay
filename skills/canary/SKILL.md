@@ -63,7 +63,7 @@ Monitor(persistent=true, description="airc", command="airc join")
 Codex / non-Monitor runtimes:
 ```bash
 airc teardown
-airc codex-start
+airc join
 ```
 
 ## When to use this skill
