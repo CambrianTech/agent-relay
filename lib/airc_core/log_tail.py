@@ -17,6 +17,8 @@ import secrets
 import sys
 import time
 
+from airc_core.client_id import current_client_id
+
 
 def _read_channels(config_path: str) -> set[str] | None:
     try:
@@ -43,6 +45,7 @@ def run(home: str, my_name: str) -> int:
     log_path = os.path.join(home, "messages.jsonl")
     config_path = os.path.join(home, "config.json")
     nonce = secrets.token_hex(4)
+    client_id = current_client_id()
     contract_printed = False
     inode = None
     f = _open_at_eof(log_path)
@@ -73,7 +76,7 @@ def run(home: str, my_name: str) -> int:
                 continue
 
             fr = str(msg.get("from") or "?")
-            if fr == my_name:
+            if client_id and msg.get("client_id") == client_id:
                 continue
             channel = str(msg.get("channel") or "").lstrip("#")
             subscribed = _read_channels(config_path)

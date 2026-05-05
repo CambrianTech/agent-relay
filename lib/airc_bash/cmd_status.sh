@@ -535,7 +535,8 @@ cmd_inbox() {
   [ "$peek" -eq 1 ] && inbox_args+=(--peek)
   [ "$quiet_empty" = "1" ] && inbox_args+=(--quiet-empty)
   if [ "$exclude_self" = "1" ]; then
-    inbox_args+=(--exclude-self --my-name "$(get_name)")
+    local _client_id; _client_id=$(airc_client_id 2>/dev/null || true)
+    inbox_args+=(--exclude-self --my-name "$(get_name)" --client-id "$_client_id")
   fi
   if ! out=$("$AIRC_PYTHON" -m airc_core.inbox "${inbox_args[@]}" 2>&1); then
     printf '%s\n' "$out" >&2

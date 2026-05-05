@@ -24,6 +24,8 @@ import signal
 import sys
 import time
 
+from airc_core.client_id import current_client_id
+
 # Inactivity watchdog: if no inbound line arrives in WATCHDOG_SEC,
 # exit with a distinct code so the caller's while-loop reconnects.
 # Why: the outer SSH tail can hang silently — middleboxes drop idle
@@ -308,6 +310,7 @@ def run(my_name: str, peers_dir: str) -> int:
     config_path = os.path.join(scope_dir, "config.json")
     local_log = os.path.join(scope_dir, "messages.jsonl")
     offset_path = os.path.join(scope_dir, "monitor_offset")
+    client_id = current_client_id()
 
     # Host vs joiner detection drives the watchdog gate below. host_target
     # empty = we are the host (we publish the room gist; joiners poll us);
@@ -454,9 +457,12 @@ def run(my_name: str, peers_dir: str) -> int:
             # readable content even though the wire was ciphertext.
             line = json.dumps(m)
         msg = m.get("msg", "")
-        # Filter own sends early, including our own [rename] markers. Read
-        # the name fresh so a mid-session rename takes effect immediately.
-        if fr == current_name():
+        # Filter only this runtime's own sends. Multiple agents can share
+        # one .airc scope and therefore one nick; filtering by `from`
+        # hides same-scope collaborators. New sends may carry client_id
+        # from CODEX_THREAD_ID / CLAUDE_* / AIRC_CLIENT_ID; old messages
+        # without client_id are displayed rather than silently dropped.
+        if client_id and m.get("client_id") == client_id:
             continue
         # Mirror inbound to local messages.jsonl. Post-3c (gh substrate)
         # the gist is the canonical source of truth for ALL peers — the
