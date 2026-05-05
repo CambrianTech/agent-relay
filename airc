@@ -399,13 +399,10 @@ _reexec_into() {
 # rejoin theirs, else take over the same gist in-place as host. Always
 # exec's via _reexec_into; does not return.
 #
-# User intent preservation across re-exec: pre-2026-04-29 this wiped
-# room_name + reexec'd with NO ARGS, which silently dropped the user's
-# `--room <name>` flag — auto-scope then took over and the user landed
-# on a different (cwd-derived) room than they asked for. Now we save
-# the explicit --room intent into AIRC_ROOM_INTENT before wiping local
-# state, restore it via env across the exec, and the post-exec arg
-# parser respects it as if the user had passed `--room` again.
+# User intent preservation across re-exec: save the explicit --room
+# intent into AIRC_ROOM_INTENT and keep config.json intact. Deleting
+# config before re-exec can leave a live transport scope that every
+# command reports as "Not initialized" if the re-exec is interrupted.
 _self_heal_stale_host() {
   local stale_id="$1"
   local jitter; jitter=$(awk -v r="$RANDOM" 'BEGIN{printf "%.3f", 0.1 + (r%1500)/1000}')
@@ -415,7 +412,6 @@ _self_heal_stale_host() {
   # explicit --room flag was used; anywhere else it's empty and we
   # reexec without the override (auto-scope decides as usual).
   local _saved_intent="${ROOM_INTENT_FOR_REEXEC:-${resolved_room_name:-${room_name:-}}}"
-  rm -f "$CONFIG" "$AIRC_WRITE_DIR/room_name"
   if [ -n "$_saved_intent" ]; then
     export AIRC_ROOM_INTENT="$_saved_intent"
   fi
@@ -583,6 +579,17 @@ _validate_peer_name() {
 }
 
 ensure_init() {
+  if [ -d "$AIRC_WRITE_DIR" ]; then
+    local _repair_out
+    if _repair_out=$("$AIRC_PYTHON" -m airc_core.scope_repair repair-config \
+        --home "$AIRC_WRITE_DIR" \
+        --config "$CONFIG" \
+        --default-name "$(derive_name)" \
+        --host "$(get_host)" 2>&1); then
+      [ -n "$_repair_out" ] && echo "  airc: $_repair_out" >&2
+      [ -f "$CONFIG" ] && return 0
+    fi
+  fi
   [ -f "$CONFIG" ] && return 0
   die "Not initialized ($AIRC_WRITE_DIR). Run: airc join"
 }
