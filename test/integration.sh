@@ -2183,6 +2183,48 @@ scenario_attach_starts_background_transport() {
   cleanup_all
 }
 
+# ── Scenario: attach_spawn_strips_attach_flag ───────────────────────────
+# Regression for #511/#521: the attach UI wrapper recursively starts the
+# transport with AIRC_NO_ATTACH=1. That child must not see --attach as a
+# positional target/name, even if the original UI invocation had --attach.
+scenario_attach_spawn_strips_attach_flag() {
+  section "attach_spawn_strips_attach_flag: recursive transport never persists --attach as identity"
+  cleanup_all
+
+  local home=/tmp/airc-it-attach-strip/state
+  local out=/tmp/airc-it-attach-strip/out.log
+  local err=/tmp/airc-it-attach-strip/err.log
+  mkdir -p /tmp/airc-it-attach-strip
+
+  AIRC_HOME="$home" AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 \
+    "$AIRC" join --attach --no-room --no-gist >"$out" 2>"$err" &
+  local ui_pid=$!
+
+  local name="" status_out="" i
+  for i in $(seq 1 20); do
+    status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1 || true)
+    name=$(printf '%s\n' "$status_out" \
+      | sed -n 's/^  identity:[[:space:]]*//p' \
+      | sed 's/[[:space:]]*(.*$//' \
+      | head -1)
+    [ -n "$name" ] && break
+    sleep 1
+  done
+
+  [ -n "$name" ] \
+    && pass "attach child persisted an identity name" \
+    || fail "attach child did not persist identity (status=$status_out; stdout=$(cat "$out" 2>/dev/null); stderr=$(cat "$err" 2>/dev/null))"
+  [ "$name" != "--attach" ] \
+    && pass "attach flag was not persisted as identity" \
+    || fail "attach flag leaked into identity name (stdout=$(cat "$out" 2>/dev/null); stderr=$(cat "$err" 2>/dev/null))"
+
+  kill "$ui_pid" 2>/dev/null || true
+  wait "$ui_pid" 2>/dev/null || true
+  AIRC_HOME="$home" "$AIRC" teardown >/dev/null 2>&1 || true
+  rm -rf /tmp/airc-it-attach-strip
+  cleanup_all
+}
+
 # ── Scenario: gh_secondary_rate_limit_degraded_startup (#479) ──────────
 # GitHub secondary throttling must not prevent monitor startup. On
 # 2026-05-04 Windows/WSL hit this shape: `gh auth status` tripped the
@@ -4474,6 +4516,7 @@ case "$MODE" in
   send_dead_monitor_dies) scenario_send_dead_monitor_dies ;;
   monitor_liveness_process_evidence) scenario_monitor_liveness_process_evidence ;;
   attach_starts_background_transport) scenario_attach_starts_background_transport ;;
+  attach_spawn_strips_attach_flag) scenario_attach_spawn_strips_attach_flag ;;
   gh_secondary_rate_limit_degraded_startup) scenario_gh_secondary_rate_limit_degraded_startup ;;
   solo_mesh_warns) scenario_solo_mesh_warns ;;
   connect_after_kill_recovers) scenario_connect_after_kill_recovers ;;
@@ -4510,7 +4553,7 @@ case "$MODE" in
     scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat
     scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope
     scenario_send_dead_monitor_dies; scenario_monitor_liveness_process_evidence
-    scenario_attach_starts_background_transport
+    scenario_attach_starts_background_transport; scenario_attach_spawn_strips_attach_flag
     scenario_gh_secondary_rate_limit_degraded_startup
     scenario_solo_mesh_warns
     scenario_connect_after_kill_recovers
