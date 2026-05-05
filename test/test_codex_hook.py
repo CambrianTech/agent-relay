@@ -56,7 +56,7 @@ class CodexHookTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             payload = json.loads(out.getvalue())
             context = payload["hookSpecificOutput"]["additionalContext"]
-            self.assertIn("AIRC digest: 1 unread unique message", context)
+            self.assertIn("AIRC: 1 unread", context)
             self.assertIn("peer: hello", context)
             self.assertNotIn("me: self", context)
             self.assertTrue(cursor.exists())
@@ -88,11 +88,11 @@ class CodexHookTests(unittest.TestCase):
                     )
             self.assertEqual(rc, 0)
             context = json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"]
-            self.assertIn("AIRC digest: 2 unread unique message", context)
-            self.assertIn("Showing latest 1", context)
+            self.assertIn("AIRC: 2 unread", context)
+            self.assertIn("latest 1 shown", context)
             self.assertIn("newest", context)
             self.assertNotIn("duplicate", context)
-            self.assertIn("If the digest is insufficient", context)
+            self.assertIn("more: airc inbox --peek --count 50", context)
 
     def test_user_prompt_hook_is_silent_when_empty(self):
         tmp, home, cursor = self._scope()
