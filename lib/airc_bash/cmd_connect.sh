@@ -178,6 +178,46 @@ _join_attach_local_stream() {
   fi
 }
 
+_join_spawn_transport_for_attach() {
+  local _log="$AIRC_WRITE_DIR/airc-transport.log"
+  mkdir -p "$AIRC_WRITE_DIR"
+  echo ""
+  echo "  Starting scope-local AIRC transport in the background."
+  echo "  This terminal will attach to the local message stream."
+  (
+    AIRC_NO_ATTACH=1 AIRC_BACKGROUND_OK=1 "$AIRC_SELF" join "$@"
+  ) >>"$_log" 2>&1 &
+  local _transport_pid=$!
+  echo "  transport PID: $_transport_pid"
+  echo "  transport log: $_log"
+
+  local _pidfile="$AIRC_WRITE_DIR/airc.pid"
+  local _i
+  for _i in $(seq 1 30); do
+    if [ "$(_monitor_alive_with_bearer_fallback "$_pidfile")" = "yes" ]; then
+      _join_show_status_and_inbox
+      _join_attach_local_stream
+      return 0
+    fi
+    if ! kill -0 "$_transport_pid" 2>/dev/null; then
+      echo "  airc join: transport exited before it became healthy." >&2
+      if [ -s "$_log" ]; then
+        echo "  last transport log lines:" >&2
+        tail -25 "$_log" | sed 's/^/    /' >&2
+      fi
+      return 1
+    fi
+    sleep 1
+  done
+
+  echo "  airc join: transport did not become healthy within 30s." >&2
+  if [ -s "$_log" ]; then
+    echo "  last transport log lines:" >&2
+    tail -25 "$_log" | sed 's/^/    /' >&2
+  fi
+  return 1
+}
+
 _join_parent_chain_looks_like_claude_monitor() {
   local pid="$$" depth=0 parent="" cmd=""
   while [ -n "$pid" ] && [ "$pid" != "1" ] && [ "$depth" -lt 12 ]; do
@@ -194,6 +234,7 @@ _join_parent_chain_looks_like_claude_monitor() {
 }
 
 cmd_connect() {
+  local _orig_args=("$@")
   # Flag parsing. Issue #37 — host display shapes:
   #   default (gh installed + authed): gist ID + humanhash mnemonic + long invite
   #   default (no gh OR gh not authed): long invite only (today's behavior)
@@ -345,13 +386,14 @@ cmd_connect() {
     esac
   done
   set -- "${positional[@]+"${positional[@]}"}"
+  [ "${AIRC_NO_ATTACH:-0}" = "1" ] && attach=0
 
   # Plain `airc join` is the public UX. If the parent chain is Claude
   # Code, treat it as UI attach mode so a Monitor invocation remains a
   # visible event stream when transport is already alive. Codex/non-
   # Monitor runtimes keep the quick-return behavior unless they
   # explicitly set AIRC_ATTACH=1.
-  if [ "$attach" = "0" ]; then
+  if [ "$attach" = "0" ] && [ "${AIRC_NO_ATTACH:-0}" != "1" ]; then
     if [ "${AIRC_ATTACH:-0}" = "1" ] || _join_parent_chain_looks_like_claude_monitor; then
       attach=1
     fi
@@ -685,6 +727,19 @@ cmd_connect() {
     # Stale pidfile (no live airc processes — either dead, or PIDs were
     # reused by the OS for unrelated procs). Safe to clean.
     rm -f "$stale_pidfile"
+  fi
+
+  # UI attach mode should not make the Claude/WSL Monitor shell own the
+  # transport lifetime. On Windows WSL2, Claude Code launches Monitor
+  # commands through `wsl bash -lc ...`; that wrapper can disappear and
+  # take foreground shell subprocesses with it even after airc printed
+  # "Monitoring for messages...". Start the transport as a scope-local
+  # background owner, verify it, then attach this UI process to the
+  # local message stream. This is not an OS daemon; it is the same
+  # project-scope airc process `airc quit`/`airc teardown` manage.
+  if [ "$attach" = "1" ] && [ "${AIRC_NO_ATTACH:-0}" != "1" ]; then
+    _join_spawn_transport_for_attach "${_orig_args[@]}"
+    return $?
   fi
 
   # No resume code path. (#130, 2026-04-26.)

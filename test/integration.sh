@@ -2128,6 +2128,61 @@ PY
   cleanup_all
 }
 
+# ── Scenario: attach_starts_background_transport ──────────────────────
+# Claude/WSL Monitor should be a UI stream, not the owner of transport
+# lifetime. `airc join --attach` starts a scope-local background
+# transport, verifies it, then attaches to messages.jsonl.
+scenario_attach_starts_background_transport() {
+  section "attach_starts_background_transport: UI attach is not the transport owner"
+  cleanup_all
+
+  local home=/tmp/airc-it-attach/state
+  local out=/tmp/airc-it-attach/out.log
+  local err=/tmp/airc-it-attach/err.log
+  mkdir -p /tmp/airc-it-attach
+
+  AIRC_HOME="$home" AIRC_NO_DISCOVERY=1 AIRC_NO_GENERAL=1 \
+    "$AIRC" join --attach --no-room --no-gist >"$out" 2>"$err" &
+  local ui_pid=$!
+
+  local seen=0 status_out="" i
+  for i in $(seq 1 20); do
+    status_out=$(AIRC_HOME="$home" "$AIRC" status 2>&1 || true)
+    if echo "$status_out" | grep -qE 'airc process:\s+AIRC background process running for scope'; then
+      seen=1
+      break
+    fi
+    if ! kill -0 "$ui_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+
+  [ "$seen" = "1" ] \
+    && pass "attach mode starts a verified scope-local background transport" \
+    || fail "attach mode did not start transport (status=$status_out; stdout=$(cat "$out" 2>/dev/null); stderr=$(cat "$err" 2>/dev/null))"
+  kill -0 "$ui_pid" 2>/dev/null \
+    && pass "attach UI process stays alive after transport starts" \
+    || fail "attach UI process exited early (stdout=$(cat "$out" 2>/dev/null); stderr=$(cat "$err" 2>/dev/null))"
+  local attached=0
+  for i in $(seq 1 10); do
+    if grep -q 'airc: attached to local message stream for this scope' "$out"; then
+      attached=1
+      break
+    fi
+    sleep 1
+  done
+  [ "$attached" = "1" ] \
+    && pass "attach UI stream is active" \
+    || fail "attach UI stream did not announce attachment (stdout=$(cat "$out" 2>/dev/null))"
+
+  kill "$ui_pid" 2>/dev/null || true
+  wait "$ui_pid" 2>/dev/null || true
+  AIRC_HOME="$home" "$AIRC" teardown >/dev/null 2>&1 || true
+  rm -rf /tmp/airc-it-attach
+  cleanup_all
+}
+
 # ── Scenario: gh_secondary_rate_limit_degraded_startup (#479) ──────────
 # GitHub secondary throttling must not prevent monitor startup. On
 # 2026-05-04 Windows/WSL hit this shape: `gh auth status` tripped the
@@ -4418,6 +4473,7 @@ case "$MODE" in
   auto_scope)   scenario_auto_scope ;;
   send_dead_monitor_dies) scenario_send_dead_monitor_dies ;;
   monitor_liveness_process_evidence) scenario_monitor_liveness_process_evidence ;;
+  attach_starts_background_transport) scenario_attach_starts_background_transport ;;
   gh_secondary_rate_limit_degraded_startup) scenario_gh_secondary_rate_limit_degraded_startup ;;
   solo_mesh_warns) scenario_solo_mesh_warns ;;
   connect_after_kill_recovers) scenario_connect_after_kill_recovers ;;
@@ -4454,6 +4510,7 @@ case "$MODE" in
     scenario_identity; scenario_whois; scenario_kick; scenario_heartbeat
     scenario_bounce; scenario_two_tab_localhost; scenario_auto_scope
     scenario_send_dead_monitor_dies; scenario_monitor_liveness_process_evidence
+    scenario_attach_starts_background_transport
     scenario_gh_secondary_rate_limit_degraded_startup
     scenario_solo_mesh_warns
     scenario_connect_after_kill_recovers
